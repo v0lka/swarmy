@@ -1,0 +1,16 @@
+# Module guardrails of the built-in `crawler` module (arch §8.7, §6.6).
+# Declarative predicates only; the pipeline enforces them pre-tool-call.
+rules:
+  - id: max-crawl-depth
+    applies_to: ["http_get"]
+    condition:
+      # Fires when the URL carries six or more path segments — deeper than
+      # the crawl depth budget of the passive recon prompt (agent-side
+      # politeness is backed by this deterministic deny).
+      url_matches: "^https?://[^/]+(?:/[^/?#]+){6,}"
+    action: block
+    severity: low
+    message: >-
+      Crawl depth budget exceeded: the URL has six or more path segments.
+      Stay within the shallow passive-recon perimeter; record the deep path
+      in a memory note instead of fetching it.

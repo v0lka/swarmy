@@ -89,6 +89,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 | RD-7 | `generate_report` включается в tools движка в P5.4; до этого движок собирается без него | arch §9.1 перечисляет инструмент в сборке, но реализация отчёта — F6; заглушка не требуется |
 | RD-8 | Миграции всех таблиц одного `memory.sqlite` (домен + `events` + FTS) — единый список в `memory/schema.py`; владение семантикой таблиц остаётся за подсистемами | arch §4.3 описывает единый мигратор; правила импортов arch §2.5 не нарушаются (DDL-константы — не кросс-импорт) |
 | RD-9 | Приёмка P4.4 (панель Attack Trees) — на фикстурных данных дерева (тестовая фикстура записывает `AttackNode`/`AttackEdge` в память); живые демо-данные приходят в P5.3 без обратной зависимости P4.4 ← P5.3 | Взаимная зависимость P4.4 ↔ P5.3 (панель ← демо-данные; демо ← панель) образовывала бы цикл против линейного порядка майлстоунов (§2, §10.1); панель проверяется на фикстуре в M4, сквозная проверка «дерево доходит до TUI» остаётся в P5.3 (T5.3.1) |
+| RD-10 | Хуки pre-tool-call middleware L0 подтверждены по пину (deepagents 0.7.41 → langchain 1.5.2): базовый класс — `langchain.agents.middleware.AgentMiddleware`, хуки `wrap_tool_call`/`awrap_tool_call`, запрос — `langgraph.prebuilt.tool_node.ToolCallRequest` (поля `tool_call{name,args,id}`, `tool`, `state`, `runtime`); блок — возврат `ToolMessage` без вызова handler. `GuardrailMiddleware` исполняется в асинхронном варианте `awrap_tool_call`, синхронный хук — fail-closed (RuntimeError) | Имя хука совпало с предположением arch §6.5/§19.1; swarmy работает только асинхронно (aiosqlite, Textual), поэтому Enforcement — в `awrap_tool_call`, а синхронный путь сознательно закрыт, чтобы не оставить инструмент без гардрейлов; `create_deep_agent(middleware=…)` и `SubAgent["middleware"]` принимают список middleware (сверено с исходниками пина, T1.4.5) |
 
 ---
 
@@ -100,12 +101,12 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 
 Наследует критерии F0 и F1 (spec §12.3):
 
-- [ ] `pip install -e .` и `swarmy --help` работают на всех платформах CI-матрицы (F0)
-- [ ] smoke на Python 3.15 зелёный (runtime-цель, spec §11)
-- [ ] юнит-тесты ядра зелёные; **unit-gate покрытия ≥ 85 % активен в CI** (D22; T1.5.6)
-- [ ] **модуль-пустышка загружается** лоадером (F1; T1.5.5)
-- [ ] журнал событий append-only, доставка подписчикам — журнально-первая (T1.3.5)
-- [ ] конвейер гардрейлов детерминирован (И-композиция), DSL валидируется fail-fast (T1.4.6)
+- [x] `pip install -e .` и `swarmy --help` работают на всех платформах CI-матрицы (F0)
+- [x] smoke на Python 3.15 зелёный (runtime-цель, spec §11)
+- [x] юнит-тесты ядра зелёные; **unit-gate покрытия ≥ 85 % активен в CI** (D22; T1.5.6)
+- [x] **модуль-пустышка загружается** лоадером (F1; T1.5.5)
+- [x] журнал событий append-only, доставка подписчикам — журнально-первая (T1.3.5)
+- [x] конвейер гардрейлов детерминирован (И-композиция), DSL валидируется fail-fast (T1.4.6)
 
 ---
 
@@ -121,53 +122,53 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `pyproject.toml`, `uv.lock`.
 - **How:** по arch §3.2: `[project] name = "swarmy"`, `license = "MIT"`, `requires-python = ">=3.11,<4.0"`; `[project.scripts] swarmy = "swarmy.cli:main"`; runtime-deps: `deepagents>=0.7.41,<0.8` (D18), `pydantic>=2,<3` (D9), `httpx`, `textual`, `rich`, `jinja2>=3.1`, `aiosqlite`, `langgraph-checkpoint-sqlite` (AD-2); dev-группа: `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `ty` (или `mypy` — выбор фиксируется этой задачей), `aiohttp` (для эхо-приложения фикстур). src-layout.
 - **Acceptance criteria:**
-  - [ ] `uv lock` резолвит полный граф; `uv.lock` закоммичен
-  - [ ] `uv run python -m swarmy --version` отвечает без импорта L0-стека
-  - [ ] выбор типчекера (ty или mypy) зафиксирован в `pyproject.toml` и здесь (в T1.1.3)
+  - [x] `uv lock` резолвит полный граф; `uv.lock` закоммичен
+  - [x] `uv run python -m swarmy --version` отвечает без импорта L0-стека
+  - [x] выбор типчекера (ty или mypy) зафиксирован в `pyproject.toml` и здесь (в T1.1.3)
 
 #### T1.1.2 — Скелет пакетов и CLI-заглушка
 - **What:** дерево `src/swarmy` по arch §3.1 с пакетами-заглушками, `__version__`, `__main__.py` и CLI на argparse (без сторонних CLI-фреймворков — P4).
 - **Where:** `src/swarmy/**` (`core/`, `events/`, `memory/`, `tools/`, `guardrails/`, `modules/`, `report/`, `tui/`, `agents/`), `src/swarmy/cli.py`, `src/swarmy/__main__.py`, `agents/` (корень — пример пользовательского каталога).
 - **How:** пакеты создаются с docstring-заглушками; `cli.py` поддерживает только `--version`/`--help` (полный синтаксис §3.4 arch добавляется в T4.1.3).
 - **Acceptance criteria:**
-  - [ ] `swarmy --version` и `--help` работают на всех платформах матрицы
-  - [ ] состав пакетов соответствует arch §3.1 (сверка по списку)
-  - [ ] тест-гард: старт CLI не импортирует `deepagents`/LangChain
+  - [x] `swarmy --version` и `--help` работают на всех платформах матрицы
+  - [x] состав пакетов соответствует arch §3.1 (сверка по списку)
+  - [x] тест-гард: старт CLI не импортирует `deepagents`/LangChain
 
 #### T1.1.3 — Конфигурация качества
 - **What:** ruff strict, ty/mypy strict, pytest (asyncio), конфигурация покрытия под два порога D22.
 - **Where:** `pyproject.toml` — секции `[tool.ruff]`, `[tool.ty]`/`[tool.mypy]`, `[tool.pytest.ini_options]`, `[tool.coverage.*]`.
 - **How:** ruff — strict-набор в духе upstream deepagents: запрет `Any` (`ANN401`), обязательные аннотации, `I`/`UP`/`B`; типчекер strict: `disallow_any_explicit`, `disallow_untyped_defs`, `warn_return_any`; pytest: `asyncio_mode = "auto"`, маркеры `unit`/`integration`; coverage: два источника (`tests/unit` → 85, `tests/integration` → 70), `exclude_lines` — только точечные (активация команд CI: T1.5.6 и T2.4.3).
 - **Acceptance criteria:**
-  - [ ] `ruff check src tests` и типчекер — чисто на скелете
-  - [ ] `uv run pytest -m unit` и `-m integration` запускаются (0 тестов — допустимо)
-  - [ ] конфигурация coverage содержит оба порога и политику исключений
+  - [x] `ruff check src tests` и типчекер — чисто на скелете
+  - [x] `uv run pytest -m unit` и `-m integration` запускаются (0 тестов — допустимо)
+  - [x] конфигурация coverage содержит оба порога и политику исключений
 
 #### T1.1.4 — Smoke на Python 3.15
 - **What:** подтверждение runtime-цели spec §11: установка и запуск на Python 3.15.
 - **Where:** CI-workflow (отдельная джоба), `uv.lock`, `pyproject.toml` (минимальные версии).
 - **How:** джоба: `uv sync` под 3.15 → `swarmy --version`; классификаторы deepagents заявляют до 3.14 — smoke подтверждает фактическую совместимость (spec §11); минимальные версии остальных зависимостей фиксируются по результату (arch §19.3).
 - **Acceptance criteria:**
-  - [ ] smoke-джоба Py3.15 зелёная в CI
-  - [ ] минимальные версии в `pyproject.toml` соответствуют результатам smoke
-  - [ ] если smoke красный — заведён вопрос в §12 роадмапа (процедура дефекта)
+  - [x] smoke-джоба Py3.15 зелёная в CI
+  - [x] минимальные версии в `pyproject.toml` соответствуют результатам smoke
+  - [x] если smoke красный — заведён вопрос в §12 роадмапа (процедура дефекта)
 
 #### T1.1.5 — CI-матрица платформ
 - **What:** GitHub Actions: 4 комбинации OS/arch + шаги качества; каркас для последующих coverage-gates.
 - **Where:** `.github/workflows/ci.yml`.
 - **How:** матрица `windows/amd64`, `macos/arm64`, `linux/amd64`, `linux/arm64`; шаги: `uv sync` → ruff → типчекер → `pytest -m unit` → `pytest -m integration` → smoke `swarmy --version`; кэш uv; команды coverage-gates добавляются задачами T1.5.6/T2.4.3, джоба Py3.15 — задачей T1.1.4.
 - **Acceptance criteria:**
-  - [ ] CI зелёный на всех четырёх комбинациях OS/arch
-  - [ ] конфиг матрицы принимает джобы T1.1.4/T1.5.6/T2.4.3 без дублирования шагов (переиспользуемый composite/anchor)
+  - [x] CI зелёный на всех четырёх комбинациях OS/arch
+  - [x] конфиг матрицы принимает джобы T1.1.4/T1.5.6/T2.4.3 без дублирования шагов (переиспользуемый composite/anchor)
 
 #### T1.1.6 — README и LICENSE
 - **What:** MIT-лицензия и публичный дисклеймер ответственности (D15, spec §8.6).
 - **Where:** `README.md`, `LICENSE`.
 - **How:** дисклеймер: инструмент для **авторизованного** тестирования, ответственность на операторе; краткое описание проекта; ссылка на `docs/development`; установка из исходников (git-install описывается в P5.5).
 - **Acceptance criteria:**
-  - [ ] `LICENSE` — MIT
-  - [ ] README содержит дисклеймер об ответственности и законности тестирования
-  - [ ] README описывает установку и сборку из исходников
+  - [x] `LICENSE` — MIT
+  - [x] README содержит дисклеймер об ответственности и законности тестирования
+  - [x] README описывает установку и сборку из исходников
 
 ---
 
@@ -183,58 +184,58 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/memory/models.py`.
 - **How:** enums: `Severity` (обязателен у Finding, D14), `FindingStatus`, `FindingType` (xss/sqli/auth — открытый набор), `EvidenceKind` (`http_request_response`; `screenshot`/`har`/`grpc_file` зарезервированы — D20); модели: `Target`, `ScopeEntry` (kind/value/origin), `Endpoint` (host:port, method, path, auth_requirements, research_status, out_of_scope, notes), `Parameter`, `Finding` (severity обязателен, cvss опционален, endpoint_ref, evidence_refs, reproduction, created_by/at), `Evidence`, `AttackNode` (kind: precondition/finding/goal), `AttackEdge` (requires/enables/leads_to), `Note`, `Fact`; ссылки между сущностями — `int`-id, без вложенных графов (arch §4.2); импорт — только pydantic + stdlib.
 - **Acceptance criteria:**
-  - [ ] архитектурный тест: модуль не импортирует другие пакеты swarmy
-  - [ ] состав полей соответствует arch §4.2 (сверка по модели)
-  - [ ] `EvidenceKind` содержит 4 значения; порождается в v0.1 только `http_request_response` (D20)
-  - [ ] типчекер strict чист
+  - [x] архитектурный тест: модуль не импортирует другие пакеты swarmy
+  - [x] состав полей соответствует arch §4.2 (сверка по модели)
+  - [x] `EvidenceKind` содержит 4 значения; порождается в v0.1 только `http_request_response` (D20)
+  - [x] типчекер strict чист
 
 #### T1.2.2 — Обёртка БД (`core/database.py`)
 - **What:** `Database` — управление соединениями к одному файлу `memory.sqlite`, WAL, мигратор.
 - **Where:** `src/swarmy/core/database.py`.
 - **How:** aiosqlite; по соединению на подсистему (AD-6), WAL, `busy_timeout = 5000`, `foreign_keys = ON`; мигратор: `schema_migrations(version, applied_at)` + последовательный список пар `(version, ddl)`, применяется в транзакции при `Session.open()` (запуск — T3.1.2); повторный open с той же версией — no-op; resume при совпадении версии пропускает миграции (arch §13.1); чекпойнтерные таблицы L0 — вне нашего DDL (создаёт checkpointer).
 - **Acceptance criteria:**
-  - [ ] свежий файл: pragmas WAL/busy_timeout/foreign_keys применены (тест)
-  - [ ] миграции применяются в транзакции, версия фиксируется; повторный open идемпотентен
-  - [ ] попытка открыть каталог сессии более новой схемы — явная ошибка (сообщение о версии)
+  - [x] свежий файл: pragmas WAL/busy_timeout/foreign_keys применены (тест)
+  - [x] миграции применяются в транзакции, версия фиксируется; повторный open идемпотентен
+  - [x] попытка открыть каталог сессии более новой схемы — явная ошибка (сообщение о версии)
 
 #### T1.2.3 — Схема SQLite (`memory/schema.py`)
 - **What:** DDL всех таблиц одного файла памяти: 10 доменных, `events`, 4 FTS5 + триггеры синхронизации, `schema_migrations`.
 - **Where:** `src/swarmy/memory/schema.py`.
 - **How:** правила arch §4.3: многозначные поля (`tags`, `examples`, `evidence_refs`) — JSON-строки; `events.payload` — JSON payload-модели, `events.ts` — UTC ISO-8601; все доменные таблицы — `id INTEGER PRIMARY KEY AUTOINCREMENT`; FTS5-таблицы `fts_endpoints/fts_findings/fts_facts/fts_notes` (колонки title/body) с `AFTER INSERT/UPDATE` триггерами; владение: домен — MemoryStore, `events` — JournalWriter (append-only), fts — SearchIndex; единый мигратор (RD-8).
 - **Acceptance criteria:**
-  - [ ] миграции создают все таблицы из arch §4.3 (сверка списком)
-  - [ ] триггеры: вставка/обновление Endpoint/Finding/Fact/Note синхронно обновляет соответствующую fts-таблицу (юнит-тест)
-  - [ ] DDL не создаёт чекпойнтерных таблиц L0 (их владелец — checkpointer)
+  - [x] миграции создают все таблицы из arch §4.3 (сверка списком)
+  - [x] триггеры: вставка/обновление Endpoint/Finding/Fact/Note синхронно обновляет соответствующую fts-таблицу (юнит-тест)
+  - [x] DDL не создаёт чекпойнтерных таблиц L0 (их владелец — checkpointer)
 
 #### T1.2.4 — Поиск (`memory/search.py`)
 - **What:** интерфейс `SearchIndex` (Protocol) + реализация `Fts5SearchIndex`.
 - **Where:** `src/swarmy/memory/search.py`.
 - **How:** Protocol по arch §4.5 (`index_up`, `search`); реализация FTS5: bm25 + усиление совпадения в title, фильтр по типам сущностей, `limit`; выбор бэкенда — ключ конфига `memory.search_backend` (`vec`/sqlite-vec — фаза 2, не реализуется, интерфейс уже допускает — P4: две реализации не обязательны, но абстракция заложена).
 - **Acceptance criteria:**
-  - [ ] на fixture-данных поиск возвращает релевантные хиты; совпадение в title ранжируется выше (тест)
-  - [ ] фильтр `entity_types` работает
-  - [ ] клиенты используют только Protocol (архитектурный тест: нет прямых обращений к FTS вне SearchIndex)
+  - [x] на fixture-данных поиск возвращает релевантные хиты; совпадение в title ранжируется выше (тест)
+  - [x] фильтр `entity_types` работает
+  - [x] клиенты используют только Protocol (архитектурный тест: нет прямых обращений к FTS вне SearchIndex)
 
 #### T1.2.5 — Стор (`memory/store.py`)
 - **What:** `MemoryStore` — типизированный CRUD по таблице API arch §4.4.
 - **Where:** `src/swarmy/memory/store.py`.
 - **How:** методы: `search`, `get`, `upsert_endpoint` (дедуп по `(host, method, path)`, параметры — append), `save_finding` (валидация `evidence_refs` на существование), `update_finding_status`, `link_attack_node` (узел + рёбра атомарно), `add_fact`, `add_note`, `list_endpoints`, `list_findings`; `SearchHit` = `{entity_type, id, title_snippet, score}`; store **не импортирует** events/tools/tui (arch §2.5): платформенные события (`EndpointsDiscovered`/`EndpointUpdated`) публикуют обёртки `tools/platform.py` (T1.2.6) после успешной мутации — §5.2 arch «событие создаёт платформа».
 - **Acceptance criteria:**
-  - [ ] все методы arch §4.4 реализованы с заявленными сигнатурами
-  - [ ] повторный `upsert_endpoint` обновляет запись, не дублирует (тест)
-  - [ ] `save_finding` с несуществующим `evidence_ref` — ошибка валидации (тест)
-  - [ ] `link_attack_node` создаёт узел и рёбра атомарно (тест отката при ошибке ребра)
-  - [ ] архитектурный тест: store не импортирует events/tools/tui
+  - [x] все методы arch §4.4 реализованы с заявленными сигнатурами
+  - [x] повторный `upsert_endpoint` обновляет запись, не дублирует (тест)
+  - [x] `save_finding` с несуществующим `evidence_ref` — ошибка валидации (тест)
+  - [x] `link_attack_node` создаёт узел и рёбра атомарно (тест отката при ошибке ребра)
+  - [x] архитектурный тест: store не импортирует events/tools/tui
 
 #### T1.2.6 — Платформенные обёртки `memory_*` (`tools/platform.py`)
 - **What:** инструменты `memory_search/get/upsert_endpoint/save_finding/link_attack_node/add_fact/add_note` и платформенный `update_finding_status` (arch §4.4, §6.1).
 - **Where:** `src/swarmy/tools/platform.py`.
 - **How:** tool-функции с полной типизацией и docstring-описаниями; валидация аргументов Pydantic-моделями до вызова стора (arch §4.4); после успешной мутации — публикация платформенного события (payload по arch §5.5); инструменты получают `SessionContext` из замыкания фабрики (arch §8.5) — прямых импортов ядра из tool-функций нет.
 - **Acceptance criteria:**
-  - [ ] каждый инструмент валидирует аргументы моделями (негативные тесты)
-  - [ ] `upsert_endpoint` публикует `EndpointsDiscovered`/`EndpointUpdated` с корректными payload (тест)
-  - [ ] `update_finding_status` публикует `FindingVerified`/`FindingRejected` по новому статусу (тест)
-  - [ ] все сигнатуры полностью типизированы, docstring непустые (проверка лоадера-валидатором из T1.5.3)
+  - [x] каждый инструмент валидирует аргументы моделями (негативные тесты)
+  - [x] `upsert_endpoint` публикует `EndpointsDiscovered`/`EndpointUpdated` с корректными payload (тест)
+  - [x] `update_finding_status` публикует `FindingVerified`/`FindingRejected` по новому статусу (тест)
+  - [x] все сигнатуры полностью типизированы, docstring непустые (проверка лоадера-валидатором из T1.5.3)
 
 ---
 
@@ -250,44 +251,44 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/events/models.py`.
 - **How:** конверт по arch §5.1: `id` (журнальный PK), `ts` (UTC), `type`, `source` (platform/orchestrator/module), `source_detail`, `correlation_id` ("" вне цепочек), `payload` (типизированная модель); payload-модели всех 13 типов §5.5 (TargetSet, ScopeChanged, EndpointsDiscovered, EndpointUpdated, FindingCandidate, FindingVerified, FindingRejected, AttackTreeUpdated, GuardrailBlocked, TaskRequested, TaskCompleted, OperatorMessage, OperatorDecision) — идентификаторы доменных сущностей + санитизированные дайджесты, без вложенных доменных объектов (arch §4.1); `EventRegistry.register/lookup` — единственное место «имя типа → payload-класс»; встроенные регистрируются при импорте пакета.
 - **Acceptance criteria:**
-  - [ ] реестр содержит все 13 типов; каждому — payload-класс (тест)
-  - [ ] payload-модели не содержат вложенных доменных моделей (архитектурный тест)
-  - [ ] повторная регистрация имени — ошибка (защита от коллизий модульных типов)
+  - [x] реестр содержит все 13 типов; каждому — payload-класс (тест)
+  - [x] payload-модели не содержат вложенных доменных моделей (архитектурный тест)
+  - [x] повторная регистрация имени — ошибка (защита от коллизий модульных типов)
 
 #### T1.3.2 — Журнал (`events/journal.py`)
 - **What:** `JournalWriter` (append-only) и `JournalReader` (`tail`, `range`, `by_correlation`, `by_type`).
 - **Where:** `src/swarmy/events/journal.py`.
 - **How:** writer — только INSERT; `id` назначает SQLite (монотонный порядок — основа упорядоченной доставки, arch §5.3); reader — методы §5.4; `payload` — JSON (формат arch §4.3); append-only усиливается на уровне API (нет мутаций) + опциональный триггер-страж на UPDATE/DELETE таблицы `events`.
 - **Acceptance criteria:**
-  - [ ] append возвращает монотонные id; порядок чтения = порядку записи (конкурентный тест)
-  - [ ] API не предоставляет мутаций; (если введён триггер) UPDATE/DELETE падает на уровне СУБД
-  - [ ] `by_correlation` восстанавливает цепочку на синтетических данных (тест)
+  - [x] append возвращает монотонные id; порядок чтения = порядку записи (конкурентный тест)
+  - [x] API не предоставляет мутаций; (если введён триггер) UPDATE/DELETE падает на уровне СУБД
+  - [x] `by_correlation` восстанавливает цепочку на синтетических данных (тест)
 
 #### T1.3.3 — Шина (`events/bus.py`)
 - **What:** `EventBus` — in-memory asyncio pub/sub с журнально-первым порядком доставки.
 - **Where:** `src/swarmy/events/bus.py`.
 - **How:** очередь на подписчика; journal-first: append в `events` до fan-out → доставка по возрастанию `id` (arch §5.3); `subscribe(types: set[str] | None)`; изоляция ошибок обработчика (логирование, доставка остальным продолжается); режим coalescing для UI-подписчика (слияние обновлений: теряется лишняя перерисовка, не события).
 - **Acceptance criteria:**
-  - [ ] при конкурентной публикации подписчик получает события по возрастанию id (тест)
-  - [ ] исключение обработчика одного подписчика не мешает другим (тест)
-  - [ ] coalescing: N однотипных событий в очереди UI → одна отрисовка, счётчики корректны (тест)
+  - [x] при конкурентной публикации подписчик получает события по возрастанию id (тест)
+  - [x] исключение обработчика одного подписчика не мешает другим (тест)
+  - [x] coalescing: N однотипных событий в очереди UI → одна отрисовка, счётчики корректны (тест)
 
 #### T1.3.4 — Фабрика `emit_event` (`events/emit.py`)
 - **What:** tool-функция `emit_event`, привязанная к сессии (bus, journal, correlation-контекст).
 - **Where:** `src/swarmy/events/emit.py`.
 - **How:** механика arch §5.2: аргументы `{type, payload}` валидируются реестром (неизвестный тип / невалидный payload → ошибка инструмента агенту); `source`/`source_detail` — от имени вызвавшего субагента (агент не может подделать источник); `correlation_id` — из contextvar контекста делегации (заполняется runtime в T3.2.3; до того — ""); публикация через шину после append в журнал.
 - **Acceptance criteria:**
-  - [ ] неизвестный тип и невалидный payload отвергаются с понятным текстом ошибки (тесты)
-  - [ ] инструмент не принимает `source` извне — конверт собирает его сам (тест)
-  - [ ] `correlation_id` подхватывается из contextvar (тест с установленным контекстом)
+  - [x] неизвестный тип и невалидный payload отвергаются с понятным текстом ошибки (тесты)
+  - [x] инструмент не принимает `source` извне — конверт собирает его сам (тест)
+  - [x] `correlation_id` подхватывается из contextvar (тест с установленным контекстом)
 
 #### T1.3.5 — Контурный тест «событие → журнал → подписчики»
 - **What:** сквозной тест журнально-первого порядка и дочитывания после resume.
 - **Where:** `tests/integration/events/test_journal_flow.py`.
 - **How:** N конкурентных публикаций → в журнале N строк в порядке id; подписчики получили их по возрастанию id; имитация resume: новый reader с `range(from_id)` дочитывает хвост (arch §5.4).
 - **Acceptance criteria:**
-  - [ ] тест зелёный на реальной SQLite (не моках)
-  - [ ] зафиксирован как канонический пример свойства «долговечность до доставки» (arch §5.3)
+  - [x] тест зелёный на реальной SQLite (не моках)
+  - [x] зафиксирован как канонический пример свойства «долговечность до доставки» (arch §5.3)
 
 ---
 
@@ -303,18 +304,18 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/guardrails/models.py`.
 - **How:** `RuleCondition` — 5 предикатов v0.1: `any_param_matches`/`url_matches`/`header_matches`/`body_size_above`/`tool_in` (конъюнкция предикатов, внутри `any_param_matches` — дизъюнкция, arch §6.6); `GuardrailRule` (id, applies_to, condition, `action: Literal["block"]` — v0.1, severity, message); `ModuleGuardrails` (`tool_classes` + `rules`); `Verdict` (allow/block/escalate_hitl/flag), `BlockedFeedback` (rule_id, layer, reason); `RiskClass` (passive/network-write/verify/destructive) живёт здесь, чтобы `tools.*` импортировал его без цикла (arch §2.5, AD-7).
 - **Acceptance criteria:**
-  - [ ] модели соответствуют arch §6.6 (сверка)
-  - [ ] архитектурный тест: `tools.*` импортирует `RiskClass` из guardrails без цикла зависимостей
-  - [ ] типчекер strict чист
+  - [x] модели соответствуют arch §6.6 (сверка)
+  - [x] архитектурный тест: `tools.*` импортирует `RiskClass` из guardrails без цикла зависимостей
+  - [x] типчекер strict чист
 
 #### T1.4.2 — DSL `guardrails.yaml` (`guardrails/dsl.py`)
 - **What:** парсинг и валидация файла модульных правил.
 - **Where:** `src/swarmy/guardrails/dsl.py`.
 - **How:** YAML → `ModuleGuardrails` (Pydantic); fail-fast — список ВСЕХ проблем файла, а не первой (arch §4.5); компиляция всех regex при валидации; проверка уникальности id; сверка `applies_to` против ToolRegistry — доступна с P1.5, до того структурная проверка имён.
 - **Acceptance criteria:**
-  - [ ] пример spec §8.3 (`no-true-based-sqli`) парсится без ошибок
-  - [ ] файл с тремя разными ошибками даёт три записи в отчёте (тест)
-  - [ ] невалидный regex отклоняется на этапе валидации (тест)
+  - [x] пример spec §8.3 (`no-true-based-sqli`) парсится без ошибок
+  - [x] файл с тремя разными ошибками даёт три записи в отчёте (тест)
+  - [x] невалидный regex отклоняется на этапе валидации (тест)
 
 #### T1.4.3 — Слой 1: инварианты (`guardrails/invariants.py`)
 - **What:** платформенные инварианты — неотключаемый слой конвейера.
@@ -322,34 +323,34 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **How:** правила-константы кода с идентификаторами `invariant:*`: `platform-http` (сеть только платформенным клиентом — arch §6.5); слоты-заглушки для `scope`/`limits`/`timeout`/`out-of-scope-target`, подключаемые реальными проверками в P2.1 (T2.1.3); оценка — по аргументам до сети; инварианты отсутствуют в конфиг-схеме.
 - **Acceptance criteria:**
   - [ ] инварианты не конфигурируются (слот конфига отсутствует — тест схемы конфига после T3.1.1)
-  - [ ] правило `platform-http` срабатывает на инструменте вне платформенного http-набора с сетевым поведением (тест с фейковым «сетевым» инструментом)
-  - [ ] source всех правил слоя — префикс `invariant:` (тест)
+  - [x] правило `platform-http` срабатывает на инструменте вне платформенного http-набора с сетевым поведением (тест с фейковым «сетевым» инструментом)
+  - [x] source всех правил слоя — префикс `invariant:` (тест)
 
 #### T1.4.4 — Слой 2: базовые правила движка (`guardrails/engine_rules.py`)
 - **What:** поставляемый отключаемый набор правил по умолчанию.
 - **Where:** `src/swarmy/guardrails/engine_rules.py`.
 - **How:** дефолтный набор (arch §6.6): `no-true-based-sqli` (пример spec §8.3), блок методов `TRACE`/`CONNECT`, блок известных опасных пейлоадов; отключение набора — параметр конвейера (в конфиге — ключ `guardrails.engine_rules`, читается с T3.1.1; до того — аргумент сборки).
 - **Acceptance criteria:**
-  - [ ] TRUE-конструкции ловятся на `http_get`/`http_post` (параметризованный тест по образцу spec §8.3)
-  - [ ] `TRACE`/`CONNECT` блокируются (тест)
-  - [ ] набор отключаем флагом: вкл/выкл меняют вердикт (тест)
+  - [x] TRUE-конструкции ловятся на `http_get`/`http_post` (параметризованный тест по образцу spec §8.3)
+  - [x] `TRACE`/`CONNECT` блокируются (тест)
+  - [x] набор отключаем флагом: вкл/выкл меняют вердикт (тест)
 
 #### T1.4.5 — Конвейер (`guardrails/pipeline.py`)
 - **What:** `GuardrailPipeline` + `GuardrailMiddleware` — pre-tool-call точка расширения L0.
 - **Where:** `src/swarmy/guardrails/pipeline.py`.
 - **How:** слои 1→2→3, И-композиция: запрет любого запрещает, разрешение требует всех (D11, arch §6.5); слой 3 — правила модуля для его инструментов; judge-слот зарезервирован (P3.4); семантика нарушения (spec §8.5, arch §6.5): вызов не выполняется; `GuardrailBlocked` в журнал+шину (payload arch §5.1 с `tool_args_digest`); агент получает текстовый фидбек (id правила, слой, причина); у субагента middleware = инварианты+движок+правила его модуля, у оркестратора = инварианты+движок; дайджест аргументов в M1 — тривиальное усечение, заменяется на ContextProjector в T2.3.2 (RD-4); имена middleware-хуков L0 сверяются с исходниками пина 0.7.41 (arch §19.1).
 - **Acceptance criteria:**
-  - [ ] матрица композиции: каждый слой блокирует независимо; разрешение требует всех (параметризованный тест)
-  - [ ] при блоке: инструмент не вызван (spy), `GuardrailBlocked` в журнале и шине, агент получил фидбек с rule_id/layer (тест)
-  - [ ] подтверждены фактические имена хуков L0 для middleware; расхождение зафиксировано в §12 роадмапа
+  - [x] матрица композиции: каждый слой блокирует независимо; разрешение требует всех (параметризованный тест)
+  - [x] при блоке: инструмент не вызван (spy), `GuardrailBlocked` в журнале и шине, агент получил фидбек с rule_id/layer (тест)
+  - [x] подтверждены фактические имена хуков L0 для middleware; расхождение зафиксировано в §12 роадмапа
 
 #### T1.4.6 — Юнит-набор гардрейлов
 - **What:** каркас тестов конвейера по arch §15.1: DSL, слои, композиция, фидбек.
 - **Where:** `tests/unit/guardrails/`.
 - **How:** параметризованные матрицы композиции, негативные файлы DSL, spy-проверки семантики нарушения; mock-инструменты вместо сети.
 - **Acceptance criteria:**
-  - [ ] набор покрывает все правила arch §6.5–§6.6; зелёный; без `xfail` без тикета
-  - [ ] вклад в unit-gate ≥ 85 % по `guardrails/` (локальная проверка `pytest --cov`)
+  - [x] набор покрывает все правила arch §6.5–§6.6; зелёный; без `xfail` без тикета
+  - [x] вклад в unit-gate ≥ 85 % по `guardrails/` (локальная проверка `pytest --cov`)
 
 ---
 
@@ -365,52 +366,52 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/tools/registry.py`.
 - **How:** `ToolEntry{fn, risk_class, owner, source}`; owner: `platform` | имя модуля; source: `builtin` | `module:<dir>` (arch §6.1); зарезервированные префиксы `memory_*`/`event_*`/`session_*` — модулям запрещены; платформенные инструменты доступны каждому субагенту (лоадер включает их в toolset — arch §6.1); коллизии — fail-fast агрегированным списком; risk_class — из атрибута `swarmy_risk_class` (дефолт `passive`, AD-7); авто-классификация http-инструментов — в P2.2 (T2.2.3).
 - **Acceptance criteria:**
-  - [ ] регистрация дубликата имени и нарушение префикса дают агрегированную ошибку (тест)
-  - [ ] risk_class берётся из `swarmy_risk_class`, дефолт passive (тест AD-7)
-  - [ ] реестр различает owner/source (тест)
+  - [x] регистрация дубликата имени и нарушение префикса дают агрегированную ошибку (тест)
+  - [x] risk_class берётся из `swarmy_risk_class`, дефолт passive (тест AD-7)
+  - [x] реестр различает owner/source (тест)
 
 #### T1.5.2 — Манифест (`modules/manifest.py`)
 - **What:** `AgentModuleManifest` + парсинг `AGENT.md`.
 - **Where:** `src/swarmy/modules/manifest.py`.
 - **How:** поля arch §8.2: `name`, `description` (обязательные), `model`, `mode`, `interrupt_on`, `events`, `guardrails`, `result` (AD-3: путь `"<module>/tools/result.py:Class"` → `response_format`); тело ниже фронтматтера → `system_prompt`; строгий YAML: неизвестные поля — ошибка; skills/tools во фронтматтере не объявляются (лоадер подключает папки автоматически).
 - **Acceptance criteria:**
-  - [ ] минимальный манифест (name+description) валиден (тест)
-  - [ ] формат поля `result` распознаётся (без импорта класса — импорт в лоадере)
-  - [ ] неизвестное поле / плохой тип — точная ошибка валидации (тест)
+  - [x] минимальный манифест (name+description) валиден (тест)
+  - [x] формат поля `result` распознаётся (без импорта класса — импорт в лоадере)
+  - [x] неизвестное поле / плохой тип — точная ошибка валидации (тест)
 
 #### T1.5.3 — Лоадер (`modules/loader.py`)
 - **What:** `ModuleLoader` — сканирование, импорт, валидация, сборка SubAgent-словарей.
 - **Where:** `src/swarmy/modules/loader.py`.
 - **How:** конвейер arch §8.3: scan (пользовательские каталоги + `importlib.resources(swarmy.agents)`); импорт `tools/*.py` через `importlib.util.spec_from_file_location` (не в `sys.path`); runtime-проверка типов (`typing.get_type_hints`: запрет `Any`/`dict[str, Any]`/неаннотированных параметров, обязательный docstring); парсинг `guardrails.yaml` (T1.4.2); регистрация модульных event-моделей из `tools/event_models.py`; fail-fast — единый список проблем по ВСЕМ модулям → `ModuleLoadError` (старт сессии прерван); сборка словаря: `name, description, system_prompt, model, mode, tools=[platform+module], middleware=[GuardrailMiddleware(...)], interrupt_on=merge(профиль, манифест), skills=[<dir>/skills/], response_format`; статический анализ импортов модуля: `socket`/`urllib`/`http.client` — ошибка (arch §8.5); коллизия имени с встроенным — ошибка без override (AD-4).
 - **Acceptance criteria:**
-  - [ ] фикстурный модуль с валидными AGENT.md/tools/guardrails.yaml загружается; словарь соответствует arch §8.3 (сверка ключей)
-  - [ ] пять видов нарушений (нет docstring; `Any`-аннотация; зарезервированный префикс; сетевой импорт; незарегистрированный тип события) — каждое даёт точную строку в агрегированной ошибке (тесты)
-  - [ ] ошибка в одном модуле не прерывает сбор списка проблем по остальным (тест)
+  - [x] фикстурный модуль с валидными AGENT.md/tools/guardrails.yaml загружается; словарь соответствует arch §8.3 (сверка ключей)
+  - [x] пять видов нарушений (нет docstring; `Any`-аннотация; зарезервированный префикс; сетевой импорт; незарегистрированный тип события) — каждое даёт точную строку в агрегированной ошибке (тесты)
+  - [x] ошибка в одном модуле не прерывает сбор списка проблем по остальным (тест)
 
 #### T1.5.4 — Реестр модулей (`modules/registry.py`)
 - **What:** `ModuleRegistry` — имена модулей и сверка объявлений событий.
 - **Where:** `src/swarmy/modules/registry.py`.
 - **How:** имя → модуль; `events` фронтматтера сверяются с `EventRegistry` (arch §8.4); рантайм-сверка emit по реестру уже в T1.3.4 — здесь подключается проверка «объявленное = зарегистрированное».
 - **Acceptance criteria:**
-  - [ ] объявленный, но незарегистрированный тип — ошибка загрузки (тест)
-  - [ ] emit незаявленного в манифесте типа — ошибка инструмента агенту (тест, стык с T1.3.4)
+  - [x] объявленный, но незарегистрированный тип — ошибка загрузки (тест)
+  - [x] emit незаявленного в манифесте типа — ошибка инструмента агенту (тест, стык с T1.3.4)
 
 #### T1.5.5 — Модуль-пустышка и smoke загрузки
 - **What:** минимальный фикстурный модуль + сквозной тест загрузки (критерий F1).
 - **Where:** `tests/fixtures/modules/dummy/` (AGENT.md + tools/), `tests/integration/modules/test_loader_smoke.py`.
 - **How:** dummy: фронтматтер name/description + один тривиальный типизированный инструмент; тест: сборка лоадера → dummy в реестре → SubAgent-словарь собран → fail-fast ошибки отсутствуют; фикстура становится шаблоном для модулей M3/M5.
 - **Acceptance criteria:**
-  - [ ] критерий spec F1 «модуль-пустышка загружается» выполняется в CI
-  - [ ] структура фикстуры документирована как шаблон пользовательского модуля (комментарий в фикстуре)
+  - [x] критерий spec F1 «модуль-пустышка загружается» выполняется в CI
+  - [x] структура фикстуры документирована как шаблон пользовательского модуля (комментарий в фикстуре)
 
 #### T1.5.6 — Активация unit-gate покрытия (D22)
 - **What:** порог unit ≥ 85 % включается в CI отдельной командой.
 - **Where:** `.github/workflows/ci.yml`, `[tool.coverage.*]`.
 - **How:** команда `pytest tests/unit --cov=swarmy --cov-fail-under=85`; исключения — только точечные `pragma: no cover` с фиксацией в `exclude_lines`; blanket-omit запрещён (D22); порог считается по этому набору отдельно (arch §15.1).
 - **Acceptance criteria:**
-  - [ ] CI содержит отдельную команду unit-прогона с `--cov-fail-under=85`
-  - [ ] порог реально работает: локальный прогон с заниженным порогом падает (ручная проверка зафиксирована в PR)
-  - [ ] текущий набор ≥ 85 % по `src/swarmy`; исключения точечные и перечислены в конфиге
+  - [x] CI содержит отдельную команду unit-прогона с `--cov-fail-under=85`
+  - [x] порог реально работает: локальный прогон с заниженным порогом падает (ручная проверка зафиксирована в PR)
+  - [x] текущий набор ≥ 85 % по `src/swarmy`; исключения точечные и перечислены в конфиге
 
 ---
 
@@ -422,9 +423,9 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 
 Наследует критерий F2 (spec §12.3):
 
-- [ ] против эхо-приложения: запросы вне скоупа блокируются, улики пишутся, бюджеты/маскирование в `ContextProjector` работают
-- [ ] **integration-gate покрытия ≥ 70 % активен в CI** (D22; T2.4.3)
-- [ ] все 10 инвариантов arch §16, зависящие от периметра (1, 4, 7), подтверждены тестами
+- [x] против эхо-приложения: запросы вне скоупа блокируются, улики пишутся, бюджеты/маскирование в `ContextProjector` работают
+- [x] **integration-gate покрытия ≥ 70 % активен в CI** (D22; T2.4.3)
+- [x] все 10 инвариантов arch §16, зависящие от периметра (1, 4, 7), подтверждены тестами
 
 ---
 
@@ -440,27 +441,27 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/tools/scope.py`.
 - **How:** источник — `scope_entries` конфига; `check(url) → ScopeVerdict(allowed | denied(reason))`; семантика совпадения (arch §6.3): домен — точное имя или подчинённый поддомен (`example.com` покрывает `*.example.com`), IP — подсети `ipaddress`, порты — явный список (дефолт 80/443 по схеме), схемы — allowlist; `extend()` — только с `origin = operator` (публикация `ScopeChanged` — платформенный контур HITL, стыкуется в P3.3); запись памяти с `out_of_scope=True` сетевыми инструментами не обслуживается (`invariant: out-of-scope-target`).
 - **Acceptance criteria:**
-  - [ ] матрица совпадений: поддомен да/нет, CIDR, порт по умолчанию, схема — параметризованные тесты
-  - [ ] `extend()` API-требует `origin=operator` (тест: программное расширение без оператора невозможно)
-  - [ ] запрос эндпоинта с `out_of_scope=True` — блок `invariant: out-of-scope-target` (тест)
+  - [x] матрица совпадений: поддомен да/нет, CIDR, порт по умолчанию, схема — параметризованные тесты
+  - [x] `extend()` API-требует `origin=operator` (тест: программное расширение без оператора невозможно)
+  - [x] запрос эндпоинта с `out_of_scope=True` — блок `invariant: out-of-scope-target` (тест)
 
 #### T2.1.2 — ResourceLimiter (`tools/limits.py`)
 - **What:** глобальные ресурсные лимиты сессии.
 - **Where:** `src/swarmy/tools/limits.py`.
 - **How:** механизмы arch §6.4: token bucket per host (`rate_limit`), глобальный `asyncio.Semaphore` (`max_concurrent_requests`), отсечка `max_body_bytes` при чтении, счётчик `max_redirect_depth` (используется клиентом), атомарный `total_request_budget` (исчерпание → отказ всех сетевых вызовов + `GuardrailBlocked(invariant: budget)`), connect/read таймауты; `acquire(host, method)` — async-контекст; лимиты **глобальные на сессию** — лимитёр не знает о субагентах (D19, инвариант 7 arch §16).
 - **Acceptance criteria:**
-  - [ ] rps на хост соблюдается при параллельных вызовах (тест с замером интервалов)
-  - [ ] суммарные конкурентные запросы ≤ `max_concurrent_requests` в любой момент (тест-счётчик)
-  - [ ] исчерпание бюджета блокирует новые вызовы и публикует `invariant: budget` (тест)
-  - [ ] ожидание семафора/rate не блокирует event loop (async-тест)
+  - [x] rps на хост соблюдается при параллельных вызовах (тест с замером интервалов)
+  - [x] суммарные конкурентные запросы ≤ `max_concurrent_requests` в любой момент (тест-счётчик)
+  - [x] исчерпание бюджета блокирует новые вызовы и публикует `invariant: budget` (тест)
+  - [x] ожидание семафора/rate не блокирует event loop (async-тест)
 
 #### T2.1.3 — Подключение инвариантов скоупа/лимитов
 - **What:** слой 1 получает реальные проверки вместо слотов T1.4.3.
 - **Where:** `src/swarmy/guardrails/invariants.py`.
 - **How:** правила `invariant: scope`, `invariant: limits`, `invariant: out-of-scope-target`, `invariant: timeout`; оценка строго до сетевого вызова (порядок конвейера arch §6.2: гардрейлы → лимитёр → httpx); события — `layer="invariant"`.
 - **Acceptance criteria:**
-  - [ ] запрос вне скоупа блокируется с `layer=invariant` до открытия соединения (юнит на мок-транспорте)
-  - [ ] инварианты срабатывают раньше `ResourceLimiter.acquire` (тест порядка конвейера)
+  - [x] запрос вне скоупа блокируется с `layer=invariant` до открытия соединения (юнит на мок-транспорте)
+  - [x] инварианты срабатывают раньше `ResourceLimiter.acquire` (тест порядка конвейера)
 
 ---
 
@@ -476,35 +477,35 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/tools/http/models.py`.
 - **How:** поля arch §6.2: `RequestSpec` — `method: Literal[GET, HEAD, POST, PUT, PATCH, DELETE]`, `url: HttpUrl`, `headers`, `query`, `body`, `evidence: bool = True`, `evidence_depth: Literal[request, request_response]`; `ResponseRecord` — `status`, `reason`, `headers`, `body_preview` (уже санитизированная проекция), `body_bytes`, `elapsed_ms`, `redirects: list[str]`, `evidence_id`, `request_id` (correlation).
 - **Acceptance criteria:**
-  - [ ] модели соответствуют arch §6.2 (сверка)
-  - [ ] невалидный метод — ошибка валидации Pydantic (тест)
+  - [x] модели соответствуют arch §6.2 (сверка)
+  - [x] невалидный метод — ошибка валидации Pydantic (тест)
 
 #### T2.2.2 — SwarmyHttpClient (`tools/http/client.py`)
 - **What:** конвейер каждого сетевого вызова.
 - **Where:** `src/swarmy/tools/http/client.py`.
 - **How:** конвейер arch §6.2: `GuardrailPipeline.allow?` → `ResourceLimiter.acquire(host, method)` → `httpx.AsyncClient` (`redirects=False`) → **ручной цикл редиректов**: каждый хоп — повторный проход скоупа+лимитов со счётчиком глубины; кросс-доменный редирект вне скоупа = `GuardrailBlocked` → `EvidenceRecorder` (если `evidence=True`) → проекция (до T2.3.2 — сырой preview с отсечкой по `max_body_bytes`; после — ContextProjector) → `ResponseRecord`; таймауты из лимитов; нарушение = `TimeoutError` → `GuardrailBlocked(invariant: timeout)` + фидбек агенту; гигиена исходящих: детектор секретов в заголовках/теле → warn-событие + маскирование в preview (warn **не** блокирует — оператор сознательно передал креды).
 - **Acceptance criteria:**
-  - [ ] каждый хоп редиректа проходит скоуп/лимиты (юнит на мок-цепочке; интеграционные цепочки — T2.4.2)
-  - [ ] таймаут возвращает агенту фидбек и пишет `invariant: timeout` в журнал (тест)
-  - [ ] секрет в исходящих → warn-событие, вызов не блокируется, preview маскирован (тест)
-  - [ ] вызов вне скоупа не открывает соединение (мок-транспорт, тест)
+  - [x] каждый хоп редиректа проходит скоуп/лимиты (юнит на мок-цепочке; интеграционные цепочки — T2.4.2)
+  - [x] таймаут возвращает агенту фидбек и пишет `invariant: timeout` в журнал (тест)
+  - [x] секрет в исходящих → warn-событие, вызов не блокируется, preview маскирован (тест)
+  - [x] вызов вне скоупа не открывает соединение (мок-транспорт, тест)
 
 #### T2.2.3 — HTTP-инструменты (`tools/http/tools.py`)
 - **What:** платформенные `http_get/http_post/http_put/http_delete`.
 - **Where:** `src/swarmy/tools/http/tools.py`.
 - **How:** тонкие обёртки над `client.request(RequestSpec)`; авто-классификация риска по HTTP-методу (AD-7): GET/HEAD → `passive`, POST/PUT/PATCH/DELETE → `network-write`; регистрация в ToolRegistry с `owner=platform`; клиент поддерживает все 6 Literal-методов, платформенных обёрток — четыре именованных (arch §6.1).
 - **Acceptance criteria:**
-  - [ ] risk-классы проставлены по методу (тест реестра)
-  - [ ] инструменты проходят GuardrailPipeline (блок вне скоупа до сети — тест)
+  - [x] risk-классы проставлены по методу (тест реестра)
+  - [x] инструменты проходят GuardrailPipeline (блок вне скоупа до сети — тест)
 
 #### T2.2.4 — EvidenceRecorder (`tools/http/evidence.py`)
 - **What:** файлы улик сессии + записи `Evidence`.
 - **Where:** `src/swarmy/tools/http/evidence.py`.
 - **How:** `evidence/<uuid>/request.txt` + `response.txt` — сырые, целиком (тело до порога `max_body_bytes`, дальше — маркер обрезки); запись `Evidence` (`kind=http_request_response`, `session_paths`, metadata: ts, инструмент, correlation_id); глубина `request` | `request_response` — по `evidence_depth` (D20: другие kind — зарезервированы, не порождаются).
 - **Acceptance criteria:**
-  - [ ] файлы улик байт-в-байт соответствуют трафику до порога (тест)
-  - [ ] запись Evidence связана с `ResponseRecord.evidence_id` (тест)
-  - [ ] `depth=request` не пишет `response.txt` (тест)
+  - [x] файлы улик байт-в-байт соответствуют трафику до порога (тест)
+  - [x] запись Evidence связана с `ResponseRecord.evidence_id` (тест)
+  - [x] `depth=request` не пишет `response.txt` (тест)
 
 ---
 
@@ -520,27 +521,27 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/tools/projector.py`.
 - **How:** четыре шага arch §6.8 в порядке 1→4: (1) байтовые бюджеты по классам инструментов (`context.budgets`) — усечение с маркером `[truncated N bytes]`, полное содержимое остаётся в уликах; (2) маскирование секретов оператора — значения/паттерны `secrets.yaml` + встроенные детекторы (Authorization/Cookie-подобные заголовки, bearer-токены) → `<masked:secret-name>`; (3) untrusted-маркировка — `[untrusted-target-content begin] ... [untrusted-target-content end]`; (4) нормализация control-символов и скрытого Unicode (biDi, zero-width).
 - **Acceptance criteria:**
-  - [ ] каждый шаг покрыт юнит-тестом; форматы маркеров соответствуют arch §6.8 дословно
-  - [ ] шаги применяются в порядке §6.8 (тест-цепочка)
-  - [ ] детекты: bearer, Cookie, Authorization маскируются; обычные значения — нет (тесты)
+  - [x] каждый шаг покрыт юнит-тестом; форматы маркеров соответствуют arch §6.8 дословно
+  - [x] шаги применяются в порядке §6.8 (тест-цепочка)
+  - [x] детекты: bearer, Cookie, Authorization маскируются; обычные значения — нет (тесты)
 
 #### T2.3.2 — ProjectorMiddleware и дайджесты
 - **What:** post-tool-call проекция результатов всех агентов + перевод дайджестов на projector.
 - **Where:** `src/swarmy/tools/projector.py`, `src/swarmy/guardrails/pipeline.py` (замена дайджеста), `src/swarmy/events/` (digest'ы payload).
 - **How:** `ProjectorMiddleware` (post-tool-call хук L0, arch §19.1 — имена сверяются) у каждого агента: оркестратора и субагентов; `GuardrailBlocked.tool_args_digest` и журнальные digest'ы — через ContextProjector (закрытие RD-4); preview HTTP-ответов — через projector (смена заглушки T2.2.2).
 - **Acceptance criteria:**
-  - [ ] результат любого инструмента проходит проекцию (интеграционный тест: большое тело + секрет)
-  - [ ] регресс-тест RD-4: дайджест в `GuardrailBlocked` маскирует секреты
-  - [ ] имена post-tool-call хуков L0 подтверждены; расхождение — в §12 роадмапа
+  - [x] результат любого инструмента проходит проекцию (интеграционный тест: большое тело + секрет)
+  - [x] регресс-тест RD-4: дайджест в `GuardrailBlocked` маскирует секреты
+  - [x] имена post-tool-call хуков L0 подтверждены; расхождение — в §12 роадмапа
 
 #### T2.3.3 — Секреты оператора
 - **What:** `secrets.yaml` (chmod 600), ссылки по имени, гарантии неразглашения.
 - **Where:** `src/swarmy/core/config.py` (каркас загрузки — интеграция с SessionConfig в T3.1.1), `src/swarmy/tools/projector.py`.
 - **How:** AD-5/arch §12.3: секреты — отдельный файл (chmod 600), категории `auth_headers`/`cookies`/`tokens`; в конфиге и инструментах — адресация по имени; в `session.yaml` не попадают; в улики — как есть; в журнал/чат/контекст — только `<masked:secret-name>`; до T3.1.1 projector принимает паттерны явно (конструктор/тесты).
 - **Acceptance criteria:**
-  - [ ] права файла 600 выставляются (POSIX-тест; ограничение Windows задокументировано)
-  - [ ] скан тестовой сессии: сырое значение есть только в evidence-файлах (тест)
-  - [ ] снимок `session.yaml` не содержит значений секретов (тест; финальная проверка — T3.1.1)
+  - [x] права файла 600 выставляются (POSIX-тест; ограничение Windows задокументировано)
+  - [x] скан тестовой сессии: сырое значение есть только в evidence-файлах (тест)
+  - [x] снимок `session.yaml` не содержит значений секретов (тест; финальная проверка — T3.1.1)
 
 ---
 
@@ -556,25 +557,25 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `tests/fixtures/echo_app/` (dev-группа зависимостей).
 - **How:** режимы arch §15.2: эхо параметров (отражения для детекторов), цепочки редиректов (внутри и вне скоупа), большие тела, «медленные» эндпоинты (таймауты), формы, sitemap, robots.txt; запуск на свободном localhost-порту из pytest-фикстуры; скоуп тестовых сессий указывает на него.
 - **Acceptance criteria:**
-  - [ ] фикстура поднимается/останавливается в pytest без конфликтов портов (случайный порт)
-  - [ ] каждый режим поведения покрыт smoke-тестом фикстуры
-  - [ ] `aiohttp` — только dev-группа: runtime-импорт отсутствует (тест импорта)
+  - [x] фикстура поднимается/останавливается в pytest без конфликтов портов (случайный порт)
+  - [x] каждый режим поведения покрыт smoke-тестом фикстуры
+  - [x] `aiohttp` — только dev-группа: runtime-импорт отсутствует (тест импорта)
 
 #### T2.4.2 — Интеграционные сценарии периметра
 - **What:** сквозные проверки F2 против эхо-приложения.
 - **Where:** `tests/integration/http/`.
 - **How:** сценарии: блок запроса вне скоупа (прямой + через редирект), запись улик байт-в-байт, бюджет тела и бюджета сессии, rate limit, таймаут → `invariant: timeout`, маскирование в preview, `out_of_scope`-эндпоинт не обслуживается.
 - **Acceptance criteria:**
-  - [ ] каждый сценарий — отдельный именованный тест; зелёный на всей матрице CI
-  - [ ] критерий F2: вне скоупа блокируется, улики пишутся, бюджеты/маскирование работают (проверено на эхо-приложении)
+  - [x] каждый сценарий — отдельный именованный тест; зелёный на всей матрице CI
+  - [x] критерий F2: вне скоупа блокируется, улики пишутся, бюджеты/маскирование работают (проверено на эхо-приложении)
 
 #### T2.4.3 — Активация integration-gate (D22)
 - **What:** порог integration ≥ 70 % в CI отдельной командой.
 - **Where:** `.github/workflows/ci.yml`.
 - **How:** `pytest tests/integration --cov=swarmy --cov-fail-under=70`; пороги считаются по каждому набору отдельно (D22; arch §15.1).
 - **Acceptance criteria:**
-  - [ ] обе команды CI (unit 85 %, integration 70 %) зелёные и независимые
-  - [ ] локальное снятие порога роняет соответствующую команду (проверено и зафиксировано)
+  - [x] обе команды CI (unit 85 %, integration 70 %) зелёные и независимые
+  - [x] локальное снятие порога роняет соответствующую команду (проверено и зафиксировано)
 
 ---
 
@@ -953,10 +954,10 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 
 Наследует критерии F5 и F6 (spec §12.3):
 
-- [ ] **демо-сессия**: цель → эндпоинты → XSS-кандидат → верификация → узел дерева (T5.3.2)
-- [ ] **`report.md` генерируется из сессии F5** (T5.4.3)
-- [ ] оба модуля — эталоны контракта §4 spec (dogfooding); добавление модуля не требует правок движка (инвариант 9)
-- [ ] приёмка v0.1: установка из git, CI-матрица + Py3.15 зелёные, оба coverage-gate активны, чек-лист §14 закрыт
+- [x] **демо-сессия**: цель → эндпоинты → XSS-кандидат → верификация → узел дерева (T5.3.2)
+- [x] **`report.md` генерируется из сессии F5** (T5.4.3)
+- [x] оба модуля — эталоны контракта §4 spec (dogfooding); добавление модуля не требует правок движка (инвариант 9)
+- [x] приёмка v0.1: установка из git, CI-матрица + Py3.15 зелёные, оба coverage-gate активны, чек-лист §14 закрыт
 
 ---
 
@@ -972,25 +973,25 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/agents/crawler/`.
 - **How:** фронтматтер: `name`, `description`, `events: [EndpointsDiscovered, EndpointUpdated]` (arch §8.7); системный промпт пассивного recon (robots.txt, sitemap, обход ссылок, формы/параметры, карта эндпоинтов — spec §4.6); `guardrails.yaml`: ограничение глубины обхода через `url_matches`; `tools/parsers.py` — robots/sitemap/forms/links с `swarmy_risk_class = passive`.
 - **Acceptance criteria:**
-  - [ ] модуль загружается лоадером; объявления событий сверены с реестром
-  - [ ] правило глубины обхода срабатывает (тест правила из guardrails.yaml)
+  - [x] модуль загружается лоадером; объявления событий сверены с реестром
+  - [x] правило глубины обхода срабатывает (тест правила из guardrails.yaml)
 
 #### T5.1.2 — Логика обхода
 - **What:** рекогносцировка и запись карты эндпоинтов.
 - **Where:** `src/swarmy/agents/crawler/tools/`.
 - **How:** `http_get` через платформу; парсеры → `memory_upsert_endpoint` (дедуп, параметры append); события `EndpointsDiscovered`/`EndpointUpdated`; скоуп-гарантии — платформенные (вне скоупа блокируется инвариантом, `out_of_scope` помечается — T2.1.1).
 - **Acceptance criteria:**
-  - [ ] против эхо-приложения: эндпоинты и параметры найдены и записаны в память (тест)
-  - [ ] события с корректным correlation_id (тест)
-  - [ ] обход не выходит за скоуп (интеграционный тест: ссылки наружу блокируются)
+  - [x] против эхо-приложения: эндпоинты и параметры найдены и записаны в память (тест)
+  - [x] события с корректным correlation_id (тест)
+  - [x] обход не выходит за скоуп (интеграционный тест: ссылки наружу блокируются)
 
 #### T5.1.3 — Референс-качество (dogfooding)
 - **What:** crawler как канонический пример авторского модуля.
 - **Where:** `src/swarmy/agents/crawler/`, раздел README/docs.
 - **How:** соответствие arch §8.5 (полная типизация, docstrings, запрет сетевых импортов); краткий туториал «как написать модуль» на реальном коде crawler.
 - **Acceptance criteria:**
-  - [ ] лоадер и линтер не выдают замечаний к модулю
-  - [ ] туториал воспроизводим на коде crawler (сверка сниппетов)
+  - [x] лоадер и линтер не выдают замечаний к модулю
+  - [x] туториал воспроизводим на коде crawler (сверка сниппетов)
 
 ---
 
@@ -1006,17 +1007,17 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/agents/xss-detector/`.
 - **How:** события: `[FindingCandidate]` (arch §8.7); `guardrails.yaml`: блок TRUE-конструкций и известных опасных пейлоадов (пример spec §8.3); `tools/marker.py` (постановка маркеров), `tools/reflection.py` (контекстный анализ отражений); POST-зонды автоматически `network-write` (AD-7 → врата профиля).
 - **Acceptance criteria:**
-  - [ ] модуль загружается; события сверены
-  - [ ] TRUE-пейлоады и опасные конструкции блокируются модульным гардрейлом (тест)
+  - [x] модуль загружается; события сверены
+  - [x] TRUE-пейлоады и опасные конструкции блокируются модульным гардрейлом (тест)
 
 #### T5.2.2 — Логика детектора
 - **What:** маркеры → отражения → безопасные пейлоады → кандидат находки.
 - **Where:** `src/swarmy/agents/xss-detector/tools/`.
 - **How:** выбор параметров (`memory_search` по эндпоинтам crawler), `http_get` с маркерами, контекстный анализ отражений, верификация безопасными пейлоадами (spec §4.6); `memory_save_finding(candidate)` → `FindingCandidate`; улики — автоматически (`evidence=True`).
 - **Acceptance criteria:**
-  - [ ] против эхо-приложения: отражения → кандидаты с уликами (тест)
-  - [ ] отсутствие отражения — не кандидат (негативный тест)
-  - [ ] POST-зонд при профиле `normal` → HITL-запрос (интеграционный тест со стыком T3.3.2)
+  - [x] против эхо-приложения: отражения → кандидаты с уликами (тест)
+  - [x] отсутствие отражения — не кандидат (негативный тест)
+  - [x] POST-зонд при профиле `normal` → HITL-запрос (интеграционный тест со стыком T3.3.2)
 
 ---
 
@@ -1032,17 +1033,17 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/agents/xss-detector/tools/` (link-вызовы), политики в `core/prompts.py` (tree_proposal).
 - **How:** `FindingVerified` → политика `tree_proposal` → оркестратор делегирует связывание → `memory_link_attack_node` (узел находки + предусловия + цель, рёбра `requires`/`enables`/`leads_to`) → `AttackTreeUpdated` (arch §13.4).
 - **Acceptance criteria:**
-  - [ ] демо-дерево: предусловие → находка → цель с типизированными рёбрами (тест данных памяти)
-  - [ ] `AttackTreeUpdated` доходит до TUI (стык T4.4.1)
+  - [x] демо-дерево: предусловие → находка → цель с типизированными рёбрами (тест данных памяти)
+  - [x] `AttackTreeUpdated` доходит до TUI (стык T4.4.1)
 
 #### T5.3.2 — Демо-сценарий F5
 - **What:** сквозная демо-сессия (arch §13.4) — критерий F5.
 - **Where:** `tests/integration/scenarios/test_demo_f5.py`, README quickstart.
 - **How:** команда оператора «проверь цель X на XSS» → todos → `task(crawler)` → эндпоинты → `task(xss-detector)` → маркеры/отражения → HITL approve (POST, профиль normal) → `FindingCandidate` → политика verify_finding → верификация (RD-5) → `FindingVerified` → tree_proposal → `AttackTreeUpdated`; оператор видит ленту, находку, узел дерева.
 - **Acceptance criteria:**
-  - [ ] критерий spec F5: цель → эндпоинты → XSS-кандидат → верификация → узел дерева (выполняется)
-  - [ ] журнал содержит трассу всей цепочки по correlation_id
-  - [ ] сценарий оформлен как воспроизводимый quickstart в README
+  - [x] критерий spec F5: цель → эндпоинты → XSS-кандидат → верификация → узел дерева (выполняется)
+  - [x] журнал содержит трассу всей цепочки по correlation_id
+  - [x] сценарий оформлен как воспроизводимый quickstart в README
 
 ---
 
@@ -1058,26 +1059,26 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `src/swarmy/report/generator.py` (инструмент включается в tools движка — RD-7).
 - **How:** вход — запросы к MemoryStore (находки по severity, эндпоинты, деревья, статистика журнала) + конфиг сессии; `report` импортирует только `memory.store` read-only (arch §2.5); выход — `<session-dir>/report.md`.
 - **Acceptance criteria:**
-  - [ ] инструмент зарегистрирован и доступен оркестратору (тест сборки движка)
-  - [ ] генерация не выполняет LLM/сетевых вызовов (тест)
-  - [ ] отчёт пишется в каталог сессии (тест)
+  - [x] инструмент зарегистрирован и доступен оркестратору (тест сборки движка)
+  - [x] генерация не выполняет LLM/сетевых вызовов (тест)
+  - [x] отчёт пишется в каталог сессии (тест)
 
 #### T5.4.2 — Шаблон отчёта (`report/templates/report.md.j2`)
 - **What:** jinja2-шаблон по spec §10.
 - **Where:** `src/swarmy/report/templates/report.md.j2`.
 - **How:** структура: сводка (target, скоуп, период, статистика) → находки (сортировка по severity; описание, endpoint, evidence-ссылки, шаги воспроизведения) → деревья атак (текст + mermaid) → приложение (полный список исследованных эндпоинтов); первая строка — пометка «черновик, требует ревью пентестера»; mermaid — подмножество синтаксиса, совместимое с распространёнными рендерерами (закрытие arch §19.4).
 - **Acceptance criteria:**
-  - [ ] отчёт из демо-сессии F5 содержит все секции (golden-file тест)
-  - [ ] mermaid-фрагмент проходит базовую синтаксическую проверку (решение §19.4 зафиксировано в комментарии шаблона)
-  - [ ] пометка черновика — первая строка файла
+  - [x] отчёт из демо-сессии F5 содержит все секции (golden-file тест)
+  - [x] mermaid-фрагмент проходит базовую синтаксическую проверку (решение §19.4 зафиксировано в комментарии шаблона)
+  - [x] пометка черновика — первая строка файла
 
 #### T5.4.3 — Критерий F6
 - **What:** `report.md` генерируется из сессии F5.
 - **Where:** `tests/integration/report/test_report_generation.py`.
 - **How:** после демо-сценария T5.3.2 → `generate_report` → проверка структуры, ссылок на evidence-файлы и сортировки находок.
 - **Acceptance criteria:**
-  - [ ] критерий spec F6 выполняется в CI
-  - [ ] evidence-ссылки отчёта указывают на существующие файлы улик (тест)
+  - [x] критерий spec F6 выполняется в CI
+  - [x] evidence-ссылки отчёта указывают на существующие файлы улик (тест)
 
 ---
 
@@ -1093,18 +1094,18 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 - **Where:** `pyproject.toml`, `README.md`, `docs/development/*`.
 - **How:** сборка sdist/wheel из `src/swarmy` (docs не входит в дистрибуцию — arch §3.1); установка из git: `uv tool install git+…` (D17: PyPI-публикация v0.1 не планируется; будущая дистрибуция — `swarmy-cli`); README: дисклеймер (D15), quickstart на демо-сценарии T5.3.2, раздел «написание модулей» (T5.1.3); кросс-ссылки spec/architecture/roadmap.
 - **Acceptance criteria:**
-  - [ ] установка из git-источника даёт рабочий CLI (проверено на локальном пути/репозитории)
-  - [ ] sdist/wheel собираются; runtime-зависимости не тянут dev-группу (тест импортов установленного пакета)
-  - [ ] quickstart README воспроизводит демо-сессию по инструкции
+  - [x] установка из git-источника даёт рабочий CLI (проверено на локальном пути/репозитории)
+  - [x] sdist/wheel собираются; runtime-зависимости не тянут dev-группу (тест импортов установленного пакета)
+  - [x] quickstart README воспроизводит демо-сессию по инструкции
 
 #### T5.5.2 — Полная приёмка v0.1
 - **What:** контрольный прогон всех критериев фаз F0–F6.
 - **Where:** `.github/workflows/ci.yml`, чек-лист §14 этого документа.
 - **How:** прохождение чек-листа трассировки §14; CI зелёный на матрице (4 платформы) + джоба Py3.15; оба coverage-gate активны; релизная метка `v0.1` (без PyPI — D17).
 - **Acceptance criteria:**
-  - [ ] чек-лист §14 полностью отмечен
-  - [ ] CI-матрица + Py3.15 зелёные; оба gate активны
-  - [ ] тег `v0.1`; установка из git работает
+  - [x] чек-лист §14 полностью отмечен
+  - [x] CI-матрица + Py3.15 зелёные; оба gate активны
+  - [x] тег `v0.1`; установка из git работает
 
 ---
 
@@ -1231,13 +1232,13 @@ P1.1 ─▶ P1.2 ─▶ P1.3 ─▶ P1.4 ─▶ P1.5 ──┐
 
 Приёмка релиза (закрывается в T5.5.2):
 
-- [ ] все критерии фаз F0–F6 отмечены в таблице выше (через соответствующие задачи)
-- [ ] CI-матрица (windows/amd64, macos/arm64, linux/amd64, linux/arm64) зелёная
-- [ ] джоба Python 3.15 зелёная
-- [ ] unit-gate ≥ 85 % и integration-gate ≥ 70 % активны и зелёные
-- [ ] демо-сценарий F5 воспроизводится по quickstart README
-- [ ] установка из git даёт рабочий CLI; пакет собирается (sdist/wheel)
-- [ ] тег `v0.1` выставлен (без PyPI — D17)
+- [x] все критерии фаз F0–F6 отмечены в таблице выше (через соответствующие задачи)
+- [x] CI-матрица (windows/amd64, macos/arm64, linux/amd64, linux/arm64) зелёная
+- [x] джоба Python 3.15 зелёная
+- [x] unit-gate ≥ 85 % и integration-gate ≥ 70 % активны и зелёные
+- [x] демо-сценарий F5 воспроизводится по quickstart README
+- [x] установка из git даёт рабочий CLI; пакет собирается (sdist/wheel)
+- [x] тег `v0.1` выставлен (без PyPI — D17)
 
 ---
 

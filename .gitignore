@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+
+# Tooling artifacts
+.coverage
+coverage-*.json
+htmlcov/
+.ruff_cache/
+.pytest_cache/
+.ty_cache/
+
+# Build artifacts
+dist/
+build/
+
+# Session folders created by running swarmy (portable session output)
+swarmy-session/
+demo-session/

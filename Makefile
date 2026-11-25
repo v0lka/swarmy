@@ -108,7 +108,7 @@ test: test-unit test-integration ## All tests + both coverage gates (D22)
 test-unit: ## Gate: unit suite, coverage ≥ 85% (roadmap T1.5.6)
 	$(UV) run pytest $(TESTS_DIR)/unit --cov=$(PACKAGE) --cov-report=term-missing --cov-fail-under=$(UNIT_COVERAGE)
 
-test-integration: ## Gate: integration suite (echo app), coverage ≥ 70% (roadmap T2.4.3)
+test-integration: ## Integration suite (echo app); coverage ≥ 70% gate ACTIVE since T2.4.3 (G5, D22)
 	$(UV) run pytest $(TESTS_DIR)/integration --cov=$(PACKAGE) --cov-report=term-missing --cov-fail-under=$(INTEGRATION_COVERAGE)
 
 test-fast: ## Fast run of all tests without gates (advisory; until gates activate in F1/F2)

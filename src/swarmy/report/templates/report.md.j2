@@ -1,0 +1,109 @@
+{# report/templates/report.md.j2 — the deterministic session report (arch §11, T5.4.2).
+
+   Mermaid subset decision (arch §19.4 / risk R8): this template renders
+   trees with ONLY the constructs every widespread renderer accepts —
+   `graph TD` + `-->` edges + `-->|label|` labeled edges + double-quoted
+   node labels with a sanitized character set (see ReportGenerator
+   _mermaid_label). No subgraphs, styling, or HTML labels are emitted, so
+   the block degrades to a syntax error nowhere; the plain-text rendering
+   above each block is the fallback for non-graph viewers.
+#}
+# swarmy session report
+
+Target: {{ target_base_url }}
+
+Scope allowlist: {{ scope_entries | join(", ") }}{% if not scope_entries %} (empty){% endif %}
+
+Period: {{ statistics.period_start }} → {{ statistics.period_end }} (UTC, journal span)
+
+## Summary
+
+| Metric | Value |
+|---|---|
+| Endpoints recorded | {{ endpoints_total }} |
+| Findings total | {{ findings_total }} |
+| Findings verified | {{ verified_total }} |
+| Attack-tree components | {{ nodes_total }} |
+| Journal events | {{ statistics.events_total }} |
+
+Journal events by type:
+
+{% for event_type, count in statistics.events_by_type | dictsort -%}
+- {{ event_type }}: {{ count }}
+{% endfor %}
+
+## Findings
+
+{% if not findings %}
+No findings were recorded in this session.
+{% endif %}
+{% for finding in findings %}
+### [{{ finding.severity | upper }}] {{ finding.title }} ({{ finding.status }})
+
+- **Id:** #{{ finding.finding_id }} · **Type:** {{ finding.type }} · **Status:** {{ finding.status }} · **Severity:** {{ finding.severity }}
+{%- if finding.cvss_vector %}
+- **CVSS vector:** `{{ finding.cvss_vector }}`
+{%- endif %}
+{%- if finding.endpoint_label %}
+- **Endpoint:** {{ finding.endpoint_label }}
+{%- endif %}
+- **Recorded by:** {{ finding.created_by }}
+
+{{ finding.description }}
+
+{% if finding.reproduction %}
+Reproduction steps:
+
+{% for step in finding.reproduction %}
+{{ loop.index }}. {{ step }}
+{% endfor %}
+{% endif %}
+{% if finding.evidence %}
+Evidence (raw artifacts in the session folder):
+
+{% for item in finding.evidence %}
+- [evidence #{{ item.evidence_id }}]({{ item.path }}) — {{ item.kind }}
+{% endfor %}
+{% endif %}
+
+{% endfor %}
+## Attack trees
+
+{% if not trees %}
+No attack-tree nodes were linked in this session.
+{% endif %}
+{% for tree in trees %}
+### Tree component rooted at node {{ tree.root_id }}
+
+Text rendering:
+
+```text
+{% for line in tree.lines %}
+{{ line }}
+{% endfor %}
+```
+
+Mermaid (subset per the template header note):
+
+```mermaid
+{% for line in tree.mermaid %}
+{{ line }}
+{% endfor %}
+```
+
+{% endfor %}
+## Appendix: researched endpoints
+
+{% if not endpoints %}
+No endpoints were recorded in this session.
+{% endif %}
+{% if endpoints %}
+| Id | Method | Path | Host | Status | Out of scope | Parameters |
+|---|---|---|---|---|---|---|
+{% for endpoint in endpoints %}
+| {{ endpoint.endpoint_id }} | {{ endpoint.method }} | {{ endpoint.path }} | {{ endpoint.host }} | {{ endpoint.research_status }} | {{ "yes" if endpoint.out_of_scope else "no" }} | {{ endpoint.parameters }} |
+{% endfor %}
+{% endif %}
+
+---
+*Generated deterministically by swarmy (arch §11) — no LLM-written text. Review before use.*

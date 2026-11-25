@@ -1,0 +1,85 @@
+# swarmy CI — platform matrix + quality gates (arch §15.4, roadmap T1.1.4/T1.1.5/T1.5.6/T2.4.3).
+#
+# The pipeline mirrors `make check` (CI parity): lock-check → sync → ruff → ty →
+# unit (coverage gate ≥85%) → integration (coverage gate ≥70%, echo app) → smoke.
+# A dedicated job smoke-tests the Python 3.15 runtime target (spec §11).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  quality:
+    name: ${{ matrix.os }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # arch §15.4: windows/amd64, macos/arm64, linux/amd64, linux/arm64
+        include:
+          - os: windows-latest
+            arch: amd64
+          - os: macos-latest
+            arch: arm64
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    env:
+      UNIT_COVERAGE: "85"
+      INTEGRATION_COVERAGE: "70"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Lock file is up to date (D18)
+        run: uv lock --check
+
+      - name: Sync environment (project + dev group)
+        run: uv sync
+
+      - name: Lint (ruff strict)
+        run: uv run ruff check src tests
+
+      - name: Type check (ty strict)
+        run: uv run ty check src
+
+      - name: Unit suite with coverage gate (D22)
+        run: uv run pytest tests/unit --cov=swarmy --cov-report=term-missing --cov-fail-under=${{ env.UNIT_COVERAGE }}
+
+      # D22 integration gate (>=70%), active since roadmap task T2.4.3 — kept
+      # independent from the unit gate (per-suite thresholds, arch §15.1).
+      - name: Integration suite with coverage gate (D22)
+        run: uv run pytest tests/integration --cov=swarmy --cov-report=term-missing --cov-fail-under=${{ env.INTEGRATION_COVERAGE }}
+
+      - name: Smoke — CLI responds (F0)
+        run: |
+          uv run python -m swarmy --version
+          uv run python -m swarmy --help
+
+  smoke-py315:
+    # Runtime target (spec §11): deepagents classifiers stop at 3.14; this job
+    # proves actual compatibility (roadmap T1.1.4).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.15"
+
+      - name: Lock file is up to date (D18)
+        run: uv lock --check
+
+      - name: Smoke on Python 3.15 (isolated environment)
+        run: uv run --isolated --python 3.15 python -m swarmy --version

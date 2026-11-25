@@ -1,0 +1,17 @@
+# Module guardrails of the ``dummy`` fixture module (tests/fixtures/modules/dummy/).
+#
+# TEMPLATE NOTE (roadmap T1.5.5): this whole folder is the documented template
+# for user modules — copy ``tests/fixtures/modules/dummy/``, rename the module
+# in AGENT.md, keep tools fully typed with LLM-facing docstrings, and adjust
+# these rules. ``tool_classes`` marks the risk class of the module's own tools
+# (AD-7 group marking, overrides the ``swarmy_risk_class`` attribute).
+tool_classes:
+  dummy_ping: verify
+rules:
+  - id: dummy-no-credentials
+    applies_to: [dummy_ping]
+    condition:
+      any_param_matches: "(?i)(password|secret|token)"
+    action: block
+    severity: medium
+    message: "The dummy tool must never receive credentials or secrets."

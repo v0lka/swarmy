@@ -1,0 +1,29 @@
+# Module guardrails of the built-in `xss-detector` module (arch §8.7; the
+# spec §8.3 example adapted to the detector's mandate: inert payloads only).
+rules:
+  - id: no-true-constructions
+    applies_to: ["http_get", "http_post"]
+    condition:
+      # SQLi-style TRUE probes are out of scope for this module and risk
+      # changing target state (spec §8.3 example).
+      any_param_matches: "(?i)(\\s*(or|and)\\s*'[^']*'\\s*=|\\b1\\s*=\\s*1\\b|\\btrue\\s*=)"
+    action: block
+    severity: high
+    message: >-
+      TRUE-constructions (SQLi-style probes) are forbidden for this detector:
+      they can corrupt target data. Verify reflected XSS with the inert
+      marker payloads of the module only.
+  - id: no-executing-payloads
+    applies_to: ["http_get", "http_post"]
+    condition:
+      # Executing payload constructs: script tags, JS URIs, inline event
+      # handlers, alert/eval calls, document access, fetch/XHR. The detector
+      # proves unescaped reflection with inert context-breaking probes.
+      any_param_matches: "(?i)(<\\s*script|<\\s*img|<\\s*svg|<\\s*iframe|javascript:|\\bon[a-z]+\\s*=|alert\\s*\\(|eval\\s*\\(|document\\s*\\.|fetch\\s*\\(|XMLHttpRequest)"
+    action: block
+    severity: high
+    message: >-
+      Executing payload constructs are forbidden: script tags, javascript:
+      URIs, inline event handlers, alert/eval calls and script-side DOM or
+      network access. Use the safe (non-executing) payloads of
+      `plan_payloads` — reflection alone proves the weakness.

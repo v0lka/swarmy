@@ -14,18 +14,26 @@ and for every module directory:
    ``typing.get_type_hints`` (no ``Any`` / ``dict[str, Any]``, no unannotated
    parameter, no unannotated return) and a non-empty LLM-facing docstring
    (arch §8.5, spec §4.3);
-4. statically scans the tool files' imports — ``socket``, ``urllib`` and
-   ``http.client`` (and their submodules) are forbidden: the platform HTTP
-   client is the only network path (arch §8.5, spec §4.3);
+4. statically scans the tool files' imports and raw-egress call shapes —
+   ``socket``, ``urllib``, ``http.client``, the HTTP-client families
+   ``httpx``/``aiohttp``/``requests`` (F-2) and ``subprocess`` are forbidden,
+   as are the attribute calls ``os.system``/``os.popen`` and asyncio's raw
+   streams ``open_connection``/``start_server``: the platform HTTP client is
+   the only network path (arch §8.5, spec §4.3, SECURITY.md ASI02/ASI05);
+   ``skills/**/*.py`` scripts get the same static scan;
 5. parses ``guardrails.yaml`` into :class:`ModuleGuardrails` (T1.4.2) and
    cross-checks its ``applies_to`` / ``tool_classes`` names against the
    real toolset of this session (platform + module tools);
 6. registers the module's event payload models from
    ``tools/event_models.py`` into the ``EventRegistry`` (arch §8.4) and
-   verifies that every manifest ``events`` entry is registered;
-7. registers all module tools in the :class:`~swarmy.tools.registry.ToolRegistry`
-   (RD-3) — reserved-prefix violations and name collisions are collected
-   there;
+   verifies that every manifest ``events`` entry is registered; the registry
+   is reset to the built-in taxonomy at the start of every ``load()`` so a
+   failed or repeated load cannot poison later loads (F-12, #35);
+7. collects all module tools for the
+   :class:`~swarmy.tools.registry.ToolRegistry` (RD-3) — reserved-prefix
+   violations and name collisions are collected there; the registry writes
+   happen **once, only when every module loaded clean** (never on the abort
+   path), so an aborted load leaves no registered tools behind (#44);
 8. resolves the AD-3 ``result`` reference to a Pydantic class and assembles
    the ``SubAgent`` dict with exactly the arch §8.3 keys, merging the
    strictness-profile gates with the manifest ``interrupt_on`` (arch §7.2).
@@ -72,14 +80,17 @@ from swarmy.guardrails.pipeline import GuardrailMiddleware, GuardrailPipeline
 from swarmy.modules.manifest import (
     ManifestError,
     ParsedAgentModule,
+    Utf8Error,
     parse_agent_module,
     parse_result_spec,
+    read_utf8,
 )
 from swarmy.modules.registry import LoadedModule, ModuleLoadError, ModuleRegistry
 from swarmy.tools.projector import ContextProjector, ProjectorMiddleware
 from swarmy.tools.registry import (
     BUILTIN_SOURCE,
     PLATFORM_OWNER,
+    RESERVED_TOOL_PREFIXES,
     ToolRegistry,
     ToolRegistryError,
     ToolSpec,
@@ -94,6 +105,24 @@ if TYPE_CHECKING:
 
 #: Strictness profiles (arch §7.2): the risk classes each profile gates with
 #: HITL approvals. ``passive`` is never gated (paranoid gates the rest).
+#: Tool-name → budget-class map wired into every production
+#: ``ProjectorMiddleware`` (arch §6.8/§12.1 budgets; Issue #58 ↔ F-6): HTTP
+#: tool envelopes (the full ``ResponseRecord`` JSON the middleware
+#: projects *after* the client's inner body preview) use the
+#: ``http_preview`` budget, the read-model platform tools the
+#: ``memory_result`` budget. Entries extend ``DEFAULT_TOOL_CLASSES``
+#: (``memory_search``/``memory_get``); unknown tools keep the conservative
+#: default budget.
+PLATFORM_TOOL_BUDGET_CLASSES: Final[dict[str, str]] = {
+    "http_get": "http_preview",
+    "http_post": "http_preview",
+    "http_put": "http_preview",
+    "http_delete": "http_preview",
+    "session_info": "memory_result",
+    "generate_report": "memory_result",
+    "update_finding_status": "memory_result",
+}
+
 _PROFILE_GATES: Final[Mapping[str, frozenset[RiskClass]]] = {
     "paranoid": frozenset({RiskClass.NETWORK_WRITE, RiskClass.VERIFY, RiskClass.DESTRUCTIVE}),
     "normal": frozenset({RiskClass.VERIFY, RiskClass.DESTRUCTIVE}),
@@ -101,8 +130,37 @@ _PROFILE_GATES: Final[Mapping[str, frozenset[RiskClass]]] = {
 }
 
 #: Modules that would open raw network paths — forbidden in module tool files
-#: (arch §8.5: network is executed only by the platform HTTP client).
-_FORBIDDEN_NETWORK_ROOTS: Final[tuple[str, ...]] = ("socket", "urllib", "http.client")
+#: (arch §8.5: network is executed only by the platform HTTP client). The
+#: HTTP-client families matter because they are installed in the same venv
+#: the module tools execute in (F-2): ``httpx`` is a runtime dependency of
+#: swarmy itself; ``aiohttp``/``requests`` are the other natural raw-HTTP
+#: escapes of this stack.
+_FORBIDDEN_NETWORK_ROOTS: Final[tuple[str, ...]] = (
+    "socket",
+    "urllib",
+    "http.client",
+    "httpx",
+    "aiohttp",
+    "requests",
+)
+
+#: Process-spawn entry points — forbidden as imports (SECURITY.md ASI05: the
+#: loader's forbidden-import scan is the deterministic enforcement point).
+#: Bare ``os`` is deliberately NOT banned (it has legitimate non-spawn uses);
+#: the ``os.system``/``os.popen`` attribute calls are caught by the AST
+#: usage scan instead.
+_FORBIDDEN_PROCESS_ROOTS: Final[tuple[str, ...]] = ("subprocess",)
+
+#: ``os`` attribute calls that spawn processes (ASI05) — usage-scanned, not
+#: import-banned (bare ``os`` stays legal).
+_OS_SPAWN_ATTRS: Final[frozenset[str]] = frozenset({"system", "popen"})
+
+#: asyncio's raw stream APIs — direct TCP sockets bypassing the platform
+#: client (F-2). Both the ``asyncio.open_connection(...)`` attribute-call
+#: shape and ``from asyncio import open_connection`` are forbidden.
+_ASYNCIO_STREAM_ATTRS: Final[frozenset[str]] = frozenset(
+    {"open_connection", "start_server"}
+)
 
 #: Files inside ``tools/`` that are not tool modules.
 _SKIP_TOOL_FILES: Final[frozenset[str]] = frozenset(
@@ -166,11 +224,24 @@ def _no_platform_tools(module_name: str, declared_event_types: frozenset[str]) -
 
 @dataclass
 class _LoadState:
-    """Mutable state shared by the per-module load steps of one ``load()`` run."""
+    """Mutable state shared by the per-module load steps of one ``load()`` run.
+
+    Registry writes are **deferred** (#44): every step only collects
+    ``ToolSpec`` batches; ``load()`` flushes them into the ``ToolRegistry``
+    once, only after all module problems are clean — an aborted load leaves
+    the registry untouched, so a same-process retry cannot hit stale
+    duplicate registrations.
+    """
 
     tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
-    #: platform tool names are registered once from the first module's toolset
+    #: platform tool names are collected once from the first module's toolset
     platform_registered: bool = False
+    #: deferred batches: platform specs first, then ``(source, specs)`` per module
+    pending_platform_specs: list[ToolSpec] = field(default_factory=list)
+    pending_module_specs: list[tuple[str, list[ToolSpec]]] = field(default_factory=list)
+    #: ``tool_classes`` overrides (AD-7) consulted by ``_build_subagent`` while
+    #: the registry itself is not yet written
+    risk_overrides: dict[str, RiskClass] = field(default_factory=dict)
 
 
 def _builtin_module_dirs(stack: ExitStack) -> list[Path]:
@@ -341,15 +412,18 @@ def _validate_tool(fn: FunctionType, name: str, source: str) -> list[LoadProblem
 
 
 def _forbidden_import_problems(tree: ast.Module, path: Path, source: str) -> list[LoadProblem]:
-    """Static import analysis of one tool file (arch §8.5).
+    """Static import analysis of one Python file (arch §8.5, F-2, ASI05).
 
-    Any import of ``socket`` / ``urllib`` / ``http.client`` (including
-    submodules, plain or ``from``-style) is a load problem: module tools reach
-    the target only through the platform HTTP client.
+    Forbidden: any import of ``socket`` / ``urllib`` / ``http.client`` /
+    ``httpx`` / ``aiohttp`` / ``requests`` (including submodules, plain or
+    ``from``-style) and of ``subprocess``; ``from os import system/popen``
+    and ``from asyncio import open_connection/start_server`` name-for-import
+    forms of the usage-scanned calls. Module tools reach the target only
+    through the platform HTTP client and never spawn processes.
     """
     problems: list[LoadProblem] = []
 
-    def _check(module_name: str) -> None:
+    def _network(module_name: str) -> None:
         if any(
             module_name == root or module_name.startswith(f"{root}.")
             for root in _FORBIDDEN_NETWORK_ROOTS
@@ -358,17 +432,100 @@ def _forbidden_import_problems(tree: ast.Module, path: Path, source: str) -> lis
                 LoadProblem(
                     source,
                     f"{path.name} imports {module_name!r}: module tools must use the "
-                    "platform HTTP client; socket/urllib/http.client are forbidden (arch §8.5)",
+                    "platform HTTP client; socket/urllib/http.client and the "
+                    "httpx/aiohttp/requests families are forbidden (arch §8.5)",
                 )
             )
+
+    def _process(module_name: str) -> None:
+        if any(
+            module_name == root or module_name.startswith(f"{root}.")
+            for root in _FORBIDDEN_PROCESS_ROOTS
+        ):
+            problems.append(
+                LoadProblem(
+                    source,
+                    f"{path.name} imports {module_name!r}: module tools must not spawn "
+                    "processes; subprocess is forbidden (SECURITY.md ASI05)",
+                )
+            )
+
+    def _named_from(module_name: str, names: list[str]) -> None:
+        if module_name == "os":
+            for alias in names:
+                if alias in _OS_SPAWN_ATTRS:
+                    problems.append(
+                        LoadProblem(
+                            source,
+                            f"{path.name} imports os.{alias} from os: process spawning "
+                            "is forbidden in module tools (SECURITY.md ASI05)",
+                        )
+                    )
+        elif module_name == "asyncio":
+            for alias in names:
+                if alias in _ASYNCIO_STREAM_ATTRS:
+                    problems.append(
+                        LoadProblem(
+                            source,
+                            f"{path.name} imports asyncio.{alias}: raw asyncio streams "
+                            "bypass the platform HTTP client and are forbidden (arch §8.5)",
+                        )
+                    )
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                _check(alias.name)
+                _network(alias.name)
+                _process(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            _check(node.module)
+            imported = [alias.name for alias in node.names]
+            _network(node.module)
+            _process(node.module)
+            _named_from(node.module, imported)
     return problems
+
+
+def _forbidden_call_problems(tree: ast.Module, path: Path, source: str) -> list[LoadProblem]:
+    """Static usage analysis of one Python file (F-2, ASI05).
+
+    Forbidden call shapes: ``os.system(...)`` / ``os.popen(...)`` (any
+    ``ast.Call`` whose function is the attribute ``system``/``popen`` of the
+    name ``os``) and ``asyncio.open_connection(...)`` /
+    ``asyncio.start_server(...)``. Bare ``os`` imports stay legal — only the
+    process-spawning attribute uses are rejected; aliased process escapes
+    (``import os as o``) are deliberate evasion, which is D4 module-vetting
+    territory, not the careless-author case this scan addresses.
+    """
+    problems: list[LoadProblem] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        func = node.func
+        if not isinstance(func.value, ast.Name):
+            continue
+        owner = func.value.id
+        if owner == "os" and func.attr in _OS_SPAWN_ATTRS:
+            problems.append(
+                LoadProblem(
+                    source,
+                    f"{path.name} calls os.{func.attr}(): process spawning is "
+                    "forbidden in module tools (SECURITY.md ASI05)",
+                )
+            )
+        elif owner == "asyncio" and func.attr in _ASYNCIO_STREAM_ATTRS:
+            problems.append(
+                LoadProblem(
+                    source,
+                    f"{path.name} calls asyncio.{func.attr}(): raw asyncio streams "
+                    "bypass the platform HTTP client and are forbidden (arch §8.5)",
+                )
+            )
+    return problems
+
+
+def _static_scan_problems(tree: ast.Module, path: Path, source: str) -> list[LoadProblem]:
+    """The full static scan of one Python file: imports + call shapes."""
+    return [*_forbidden_import_problems(tree, path, source), *_forbidden_call_problems(tree, path, source)]
 
 
 def _register_event_models(
@@ -485,6 +642,11 @@ class ModuleLoader:
             ModuleLoadError: with **all** problems of **all** modules when
                 anything fails (fail-fast session start, spec §4.5).
         """
+        # One load = one taxonomy (F-12, #35): reset the process-global
+        # EventRegistry to the built-in types before anything registers, so a
+        # failed or repeated load cannot poison later loads with stale module
+        # types (retry "already registered" ghosts, cross-session collisions).
+        EventRegistry.reset()
         problems: list[LoadProblem] = []
         loaded: list[LoadedModule] = []
         with ExitStack() as stack:
@@ -511,11 +673,36 @@ class ModuleLoader:
                 if module_loaded is not None:
                     loaded.append(module_loaded)
         if problems:
+            # The abort path registers nothing (#44): a failed load leaves the
+            # session ToolRegistry exactly as it was before ``load()``.
             raise ModuleLoadError([str(problem) for problem in problems])
+        self._flush_tool_registrations(state)
         registry = ModuleRegistry()
         for module in loaded:
             registry.register(module)
         return registry
+
+    def _flush_tool_registrations(self, state: _LoadState) -> None:
+        """Write every deferred batch into the ``ToolRegistry`` (RD-3, #44).
+
+        Runs only on the all-clean success path. Batch problems (reserved
+        prefixes, name collisions) still fail the load — aggregated into one
+        :class:`ModuleLoadError` with each problem attributed to its source.
+        """
+        flush_problems: list[LoadProblem] = []
+        try:
+            state.tool_registry.register_many(state.pending_platform_specs)
+        except ToolRegistryError as exc:
+            flush_problems.extend(LoadProblem("platform", problem) for problem in exc.problems)
+        for source, specs in state.pending_module_specs:
+            try:
+                state.tool_registry.register_many(specs)
+            except ToolRegistryError as exc:
+                flush_problems.extend(
+                    LoadProblem(source, problem) for problem in exc.problems
+                )
+        if flush_problems:
+            raise ModuleLoadError([str(problem) for problem in flush_problems])
 
     def _load_module(
         self,
@@ -559,22 +746,28 @@ class ModuleLoader:
         platform_tools = dict(
             self._platform_factory(name, frozenset(manifest.events))
         )
-        self._register_platform_tools(platform_tools, state, problems)
+        self._register_platform_tools(platform_tools, state)
 
         tools_dir = module_dir / "tools"
         module_tools = self._import_tools(tools_dir, source, problems)
+        self._check_reserved_prefixes(module_tools, source, problems)
         self._load_event_models(tools_dir, source, problems)
         self._check_declared_events(manifest, source, problems)
+        self._scan_skill_scripts(module_dir, source, problems)
         guardrails = self._load_guardrails(module_dir, manifest, source, problems)
         if guardrails is not None:
             self._crosscheck_guardrails(guardrails, platform_tools, module_tools, source, problems)
-        self._register_module_tools(manifest, source, module_tools, guardrails, state, problems)
+        self._collect_module_tools(manifest, source, module_tools, guardrails, state)
         response_format = self._resolve_response_format(module_dir, manifest, source, problems)
+        if problems:
+            return problems, None
+        risks = self._resolve_risks(platform_tools, module_tools, state)
+        self._check_manifest_gates(manifest, risks, source, problems)
         if problems:
             return problems, None
         subagent = self._build_subagent(
             module_dir, manifest, parsed, platform_tools, module_tools, guardrails,
-            response_format, state,
+            response_format, risks,
         )
         module = LoadedModule(
             manifest=manifest,
@@ -588,28 +781,25 @@ class ModuleLoader:
         return [], module
 
     def _register_platform_tools(
-        self, platform_tools: dict[str, ModuleTool], state: _LoadState, problems: list[LoadProblem]
+        self, platform_tools: dict[str, ModuleTool], state: _LoadState
     ) -> None:
-        """Register the platform tool names once per load (arch §6.1).
+        """Collect the platform tool names once per load (arch §6.1, #44).
 
         The per-module toolset instances differ (each ``emit_event`` is bound
         to its module); the registry records the name-level facts
         (owner ``"platform"``, source ``"builtin"``) from the first set.
+        The specs are only *collected* here — ``load()`` writes them after
+        every module loaded clean.
         """
         if state.platform_registered:
             return
         state.platform_registered = True
         if not platform_tools:
             return
-        try:
-            state.tool_registry.register_many(
-                [
-                    ToolSpec(name=tool_name, fn=fn, owner=PLATFORM_OWNER, source=BUILTIN_SOURCE)
-                    for tool_name, fn in platform_tools.items()
-                ]
-            )
-        except ToolRegistryError as exc:
-            problems.extend(LoadProblem("platform", problem) for problem in exc.problems)
+        state.pending_platform_specs.extend(
+            ToolSpec(name=tool_name, fn=fn, owner=PLATFORM_OWNER, source=BUILTIN_SOURCE)
+            for tool_name, fn in platform_tools.items()
+        )
 
     def _import_tools(
         self, tools_dir: Path, source: str, problems: list[LoadProblem]
@@ -627,11 +817,16 @@ class ModuleLoader:
                 problems.append(LoadProblem(source, f"{py_file.name}: {problem}"))
                 continue
             try:
-                tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+                tree = ast.parse(read_utf8(py_file), filename=str(py_file))
+            except Utf8Error as exc:
+                # Non-UTF-8 tool files are a collected problem, never a raw
+                # UnicodeDecodeError escaping the aggregation (#57).
+                problems.append(LoadProblem(source, str(exc)))
+                continue
             except SyntaxError as exc:
                 problems.append(LoadProblem(source, f"{py_file.name}: invalid syntax: {exc}"))
                 continue
-            problems.extend(_forbidden_import_problems(tree, py_file, source))
+            problems.extend(_static_scan_problems(tree, py_file, source))
             for tool_name, fn in _tool_functions(module, unique_name):
                 problems.extend(_validate_tool(fn, tool_name, source))
                 tools[tool_name] = fn
@@ -676,13 +871,44 @@ class ModuleLoader:
             return None
         try:
             return parse_module_guardrails(
-                path.read_text(encoding="utf-8"), source=str(path)
+                read_utf8(path), source=str(path)
             )
+        except Utf8Error as exc:
+            # Mirror conversion of #57: a non-UTF-8 guardrails file joins the
+            # module's problem list instead of aborting the aggregation.
+            problems.append(LoadProblem(source, str(exc)))
+            return None
         except GuardrailsDslError as exc:
             problems.extend(
                 LoadProblem(source, problem.message) for problem in exc.problems
             )
             return None
+
+    def _scan_skill_scripts(
+        self, module_dir: Path, source: str, problems: list[LoadProblem]
+    ) -> None:
+        """Statically scan every ``skills/**/*.py`` script (F-2 option b, ASI05).
+
+        Skill scripts execute with operator privileges and are never imported
+        by the loader, so the scan is purely static: the same forbidden-import
+        and raw-egress call-shape rules as ``tools/*.py`` apply. Non-Python
+        scripts are outside the AST scan's reach — the operator vetting rule
+        (SECURITY.md ASI04) covers them; a non-UTF-8 or unparsable ``*.py``
+        script is a collected problem like any other module file.
+        """
+        skills_dir = module_dir / "skills"
+        if not skills_dir.is_dir():
+            return
+        for script in sorted(skills_dir.rglob("*.py")):
+            try:
+                tree = ast.parse(read_utf8(script), filename=str(script))
+            except Utf8Error as exc:
+                problems.append(LoadProblem(source, str(exc)))
+                continue
+            except SyntaxError as exc:
+                problems.append(LoadProblem(source, f"{script.name}: invalid syntax: {exc}"))
+                continue
+            problems.extend(_static_scan_problems(tree, script, source))
 
     def _crosscheck_guardrails(
         self,
@@ -720,26 +946,53 @@ class ModuleLoader:
                     )
                 )
 
-    def _register_module_tools(
+    def _check_reserved_prefixes(
+        self, module_tools: dict[str, ModuleTool], source: str, problems: list[LoadProblem]
+    ) -> None:
+        """Check reserved tool-name prefixes at collect time (arch §6.1).
+
+        Uses the registry's exact wording: the flush (where ``register_many``
+        would catch them) only runs on the all-clean path, so deferring this
+        check would silently drop prefix problems whenever another module
+        also failed.
+        """
+        for tool_name in module_tools:
+            for prefix in RESERVED_TOOL_PREFIXES:
+                if tool_name.startswith(prefix):
+                    problems.append(
+                        LoadProblem(
+                            source,
+                            f"tool name {tool_name!r} uses the reserved platform prefix "
+                            f"{prefix!r} (arch §6.1, spec §4.3)",
+                        )
+                    )
+
+    def _collect_module_tools(
         self,
         manifest: AgentModuleManifest,
         source: str,
         module_tools: dict[str, ModuleTool],
         guardrails: ModuleGuardrails | None,
         state: _LoadState,
-        problems: list[LoadProblem],
     ) -> None:
-        """Register the module's tools in the ToolRegistry (RD-3, arch §6.1).
+        """Collect the module's tools for the ToolRegistry (RD-3, arch §6.1, #44).
 
         ``tool_classes`` from ``guardrails.yaml`` override the attribute risk
-        class (AD-7 group marking); the registry aggregates prefix and
-        collision problems.
+        class (AD-7 group marking); the overrides are parked in
+        ``state.risk_overrides`` for ``_build_subagent`` and land in the
+        registry only when ``load()`` flushes the deferred batches on the
+        all-clean path. Prefix/collision problems surface at flush time,
+        aggregated per source.
         """
         if not module_tools:
             return
         tool_classes = guardrails.tool_classes if guardrails is not None else {}
-        try:
-            state.tool_registry.register_many(
+        for tool_name, risk in tool_classes.items():
+            if tool_name in module_tools:
+                state.risk_overrides[tool_name] = risk
+        state.pending_module_specs.append(
+            (
+                source,
                 [
                     ToolSpec(
                         name=tool_name,
@@ -749,10 +1002,9 @@ class ModuleLoader:
                         risk_class=tool_classes.get(tool_name),
                     )
                     for tool_name, fn in module_tools.items()
-                ]
+                ],
             )
-        except ToolRegistryError as exc:
-            problems.extend(LoadProblem(source, problem) for problem in exc.problems)
+        )
 
     def _resolve_response_format(
         self,
@@ -783,6 +1035,78 @@ class ModuleLoader:
             return None
         return candidate
 
+    def _resolve_risks(
+        self,
+        platform_tools: dict[str, ModuleTool],
+        module_tools: dict[str, ModuleTool],
+        state: _LoadState,
+    ) -> dict[str, RiskClass]:
+        """Resolve ``tool_name → risk class`` for one subagent toolset (AD-7).
+
+        Resolution order: the manifest ``tool_classes`` override, the tool's
+        own ``swarmy_risk_class`` attribute, then the ownership-aware default
+        (F-3, SECURITY.md ASI02): a module-owned tool whose author forgot the
+        declaration defaults to the **most gated** class (``destructive``) so
+        the forgotten declaration fails toward operator approval under every
+        strictness profile — never toward silent execution; the platform's
+        own tools all declare (AD-7) and keep the passive fallback for
+        non-gating readers.
+        """
+        toolset: dict[str, ModuleTool] = {**platform_tools, **module_tools}
+        risks: dict[str, RiskClass] = {}
+        for tool_name, fn in toolset.items():
+            entry_risk: RiskClass | None = state.risk_overrides.get(tool_name)
+            declared = declared_risk_class(fn)[0]
+            default = (
+                RiskClass.PASSIVE if tool_name in platform_tools else RiskClass.DESTRUCTIVE
+            )
+            risks[tool_name] = (
+                entry_risk
+                if entry_risk is not None
+                else (declared if declared is not None else default)
+            )
+        return risks
+
+    def _check_manifest_gates(
+        self,
+        manifest: AgentModuleManifest,
+        risks: dict[str, RiskClass],
+        source: str,
+        problems: list[LoadProblem],
+    ) -> None:
+        """Enforce operator primacy on the manifest ``interrupt_on`` map (F-4).
+
+        The strictness profile's gates are the **operator's** control
+        (SECURITY.md ASI02/ASI09): a module manifest may ADD a gate (``True``
+        for a tool the profile leaves passive) but never REMOVE one — a
+        ``False`` entry for a profile-gated tool would let the module author
+        un-gate its own destructive/verify/network-write calls under
+        ``paranoid``, so it fails the load (fail-fast, arch §8.3/§16.9). An
+        entry naming a tool outside this subagent's toolset also fails: no
+        silent no-ops on the HITL contour. Updates arch §7.1 (the former
+        "module entries win" merge) in the same change.
+        """
+        gates = _PROFILE_GATES[self._strictness]
+        for tool_name, wants_gate in manifest.interrupt_on.items():
+            if tool_name not in risks:
+                problems.append(
+                    LoadProblem(
+                        source,
+                        f"manifest interrupt_on names {tool_name!r}, which is not a tool "
+                        "of this module's toolset (platform or module tools)",
+                    )
+                )
+            elif not wants_gate and risks[tool_name] in gates:
+                problems.append(
+                    LoadProblem(
+                        source,
+                        f"manifest interrupt_on removes the operator gate for {tool_name!r} "
+                        f"(risk class {risks[tool_name].value!r} is gated by the "
+                        f"{self._strictness!r} profile); a module may only add gates, "
+                        "never remove them (SECURITY.md ASI02/ASI09)",
+                    )
+                )
+
     def _build_subagent(
         self,
         module_dir: Path,
@@ -792,26 +1116,21 @@ class ModuleLoader:
         module_tools: dict[str, ModuleTool],
         guardrails: ModuleGuardrails | None,
         response_format: type[BaseModel] | None,
-        state: _LoadState,
+        risks: dict[str, RiskClass],
     ) -> dict[str, object]:
         """Assemble the ``SubAgent`` dict with exactly the arch §8.3 keys."""
         gates = _PROFILE_GATES[self._strictness]
         toolset: dict[str, ModuleTool] = {**platform_tools, **module_tools}
-        risks: dict[str, RiskClass] = {}
-        for tool_name, fn in toolset.items():
-            entry_risk: RiskClass | None = None
-            if tool_name in state.tool_registry:  # registry holds the tool_classes override
-                entry_risk = state.tool_registry.entry(tool_name).risk_class
-            declared = declared_risk_class(fn)[0]  # AD-7 attribute, then passive default
-            risks[tool_name] = (
-                entry_risk
-                if entry_risk is not None
-                else (declared if declared is not None else RiskClass.PASSIVE)
-            )
         interrupt_on: dict[str, bool] = {
             tool_name: risks[tool_name] in gates for tool_name in toolset
         }
-        interrupt_on.update(manifest.interrupt_on)  # manifest merges on top (arch §7.2)
+        # F-4 (operator primacy): the manifest may only ADD gates — entries
+        # for profile-gated tools were validated in ``_check_manifest_gates``
+        # (a manifest ``False`` there fails the load), so what merges here is
+        # either a gate addition (passive tool → gated) or a no-op refinement
+        # of a tool the profile does not gate. Platform-set gates win.
+        for tool_name, wants_gate in manifest.interrupt_on.items():
+            interrupt_on[tool_name] = wants_gate
         skills_dir = module_dir / "skills"
         # One projector per subagent: the session wiring (T3.1.1) supplies
         # config budgets + operator secrets via the factory; the conservative
@@ -837,7 +1156,14 @@ class ModuleLoader:
             "system_prompt": parsed.system_prompt,
             "mode": manifest.mode,
             "tools": list(toolset.values()),  # platform + module tools (arch §6.1)
-            "middleware": [GuardrailMiddleware(pipeline), ProjectorMiddleware(projector)],
+            # The session projector also sanitizes the deny feedback inside
+            # GuardrailMiddleware (the deny bypasses the inner projector,
+            # Issue #39); the tool-class map applies the §6.8 budgets to
+            # HTTP tool envelopes (Issue #58 ↔ F-6).
+            "middleware": [
+                GuardrailMiddleware(pipeline, projector=projector),
+                ProjectorMiddleware(projector, tool_classes=PLATFORM_TOOL_BUDGET_CLASSES),
+            ],
             "interrupt_on": interrupt_on,
             "skills": [str(skills_dir)] if skills_dir.is_dir() else [],
             "response_format": response_format,
@@ -852,6 +1178,7 @@ class ModuleLoader:
 
 
 __all__ = [
+    "PLATFORM_TOOL_BUDGET_CLASSES",
     "LoadProblem",
     "ModuleLoader",
     "ModuleTool",

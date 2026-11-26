@@ -19,8 +19,16 @@ before a pentester reviewed it.
 Mermaid subset (arch §19.4 / R8, decision fixed in the template header):
 only ``graph TD``, double-quoted node labels and ``-->``/``-->|label|``
 edges — the intersection supported by the widespread renderers; node labels
-are sanitized to a safe character set. A plain-text rendering of every tree
-precedes the mermaid block (text render = fallback).
+are sanitized to a safe character set without ``<``/``>`` (raw-HTML vector
+in loose renderers). A plain-text rendering of every tree precedes the
+mermaid block (text render = fallback).
+
+Escaping contract (spec §10; review Issues #40/#18): every target/LLM-derived
+string rendered into ``report.md`` (finding titles, descriptions,
+reproduction steps, endpoint path/host/parameters, tree text) is
+markdown/HTML-neutralized by :func:`_report_safe` in the view models — the
+template interpolates only report-safe text plus structural tokens; the
+draft mark keeps the report a verification aid.
 """
 
 from __future__ import annotations
@@ -70,12 +78,40 @@ _STATUS_RANK: Final[dict[str, int]] = {
 }
 
 #: Characters allowed in mermaid node labels (everything else is stripped).
+#: ``<``/``>`` are deliberately excluded: they buy nothing inside a quoted
+#: label and are the raw-HTML vector in renderers with loose ``htmlLabels``
+#: security (Issue #40).
 _MERMAID_LABEL_RE: Final[re.Pattern[str]] = re.compile(
-    r"[^A-Za-z0-9 .,:;!?%&*+_/<>-]"
+    r"[^A-Za-z0-9 .,:;!?%&*+_/ -]"
 )
 
 #: Maximum rendered length of one mermaid node label.
 _MERMAID_LABEL_MAX: Final[int] = 120
+
+
+def _report_safe(text: str) -> str:
+    """Escape markdown/HTML-sensitive sequences of target/LLM-derived text.
+
+    The report-escaping contract (spec §10; review Issues #40/#18): every
+    finding, tree and endpoint string that may carry target-controlled
+    content is neutralized before it enters ``report.md`` — raw HTML cannot
+    survive (``<``/``>`` become entities), table pipes, code-span backticks
+    and link/image brackets lose their markdown structure, and no line
+    starts with a heading/image marker. Evidence paths stay verbatim (they
+    are session-generated, not target-derived).
+    """
+    escaped = (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("|", "\\|")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+    )
+    return "\n".join(
+        f"\\{line}" if line.startswith(("#", "!")) else line
+        for line in escaped.split("\n")
+    )
 
 
 def _template_text() -> str:
@@ -98,7 +134,13 @@ class EvidenceRef(BaseModel):
 
 
 class FindingView(BaseModel):
-    """Report row of one finding (severity-sorted, evidence-resolved)."""
+    """Report row of one finding (severity-sorted, evidence-resolved).
+
+    ``title``/``description``/``reproduction``/``created_by``/
+    ``endpoint_label``/``cvss_vector`` carry report-safe
+    (markdown/HTML-neutralized) text; ``evidence`` paths stay verbatim
+    session-relative links.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -116,12 +158,12 @@ class FindingView(BaseModel):
 
 
 class EndpointView(BaseModel):
-    """Report row of one endpoint (appendix table; pipes pre-escaped)."""
+    """Report row of one endpoint (appendix table; report-safe text)."""
 
     model_config = ConfigDict(extra="forbid")
 
     endpoint_id: int
-    method: str
+    method: str  # report-safe: escaped even for pre-normalization rows
     path: str
     host: str
     research_status: str
@@ -172,7 +214,7 @@ class ReportGenerator:
         bundled ``report.md.j2`` (overridable for tests)."""
         self._store = store
         self._template: jinja2.Template = jinja2.Environment(
-            autoescape=False,  # markdown output; label text is sanitized below
+            autoescape=False,  # markdown output; text is report-safe (escaped in the view models)
             trim_blocks=True,
             lstrip_blocks=True,
             keep_trailing_newline=True,
@@ -263,12 +305,12 @@ class ReportGenerator:
             type=finding.type.value,
             status=finding.status.value,
             severity=finding.severity.value,
-            cvss_vector=finding.cvss_vector,
-            title=finding.title,
-            description=finding.description,
-            reproduction=finding.reproduction,
-            created_by=finding.created_by,
-            endpoint_label=endpoint_label,
+            cvss_vector=None if finding.cvss_vector is None else _report_safe(finding.cvss_vector),
+            title=_report_safe(finding.title),
+            description=_report_safe(finding.description),
+            reproduction=[_report_safe(step) for step in finding.reproduction],
+            created_by=_report_safe(finding.created_by),
+            endpoint_label=None if endpoint_label is None else _report_safe(endpoint_label),
             evidence=evidence,
         )
 
@@ -278,12 +320,12 @@ class ReportGenerator:
         names = ", ".join(f"{p.name}({p.location})" for p in parameters)
         return EndpointView(
             endpoint_id=endpoint.id,
-            method=endpoint.method,
-            path=endpoint.path,
-            host=endpoint.host,
+            method=_report_safe(endpoint.method),
+            path=_report_safe(endpoint.path),
+            host=_report_safe(endpoint.host),
             research_status=endpoint.research_status,
             out_of_scope=endpoint.out_of_scope,
-            parameters=names.replace("|", "\\|"),
+            parameters=_report_safe(names),
         )
 
     async def _tree_views(self) -> list[AttackTreeView]:
@@ -339,12 +381,13 @@ class ReportGenerator:
             label = _mermaid_label(f"{node.kind}: {node.title}")
             label_of[node_id] = f"N{number}"
             mermaid.append(f'    N{number}["{label}"]')
-            lines.append(f"[N{number}] {node.kind}: {node.title}")
+            lines.append(f"[N{number}] {node.kind}: {_report_safe(node.title)}")
         for edge in edges:
             src_label = label_of.get(edge.src, "?")
             dst_label = label_of.get(edge.dst, "?")
-            lines.append(f"[{src_label}] --{edge.kind}--> [{dst_label}]")
-            mermaid.append(f"    {src_label} -->|{edge.kind}| {dst_label}")
+            edge_kind = _mermaid_label(edge.kind)
+            lines.append(f"[{src_label}] --{edge_kind}--> [{dst_label}]")
+            mermaid.append(f"    {src_label} -->|{edge_kind}| {dst_label}")
         return AttackTreeView(root_id=root, lines=lines, mermaid=mermaid)
 
 

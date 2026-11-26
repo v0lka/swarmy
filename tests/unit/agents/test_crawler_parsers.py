@@ -194,3 +194,50 @@ class TestExtractForms:
         html = '<form action="/f"><input type="text"><input name="ok"></form>'
         report = _of(extract_forms(html, "http://127.0.0.1:1/"))
         assert [item["name"] for item in report["forms"][0]["inputs"]] == ["ok"]
+
+
+class TestErrorReportsAndUrlResolution:
+    """Documented error reports and RFC 3986 query-only refs (#13/#48/#56)."""
+
+    def test_extract_links_invalid_base_url_returns_error_report(self) -> None:
+        """A relative base_url yields the structured error, not a raise (#13)."""
+        report = _of(extract_links('<a href="/x">x</a>', "not-a-absolute-url"))
+        assert report["error"] != ""
+        assert report["links"] == []
+        assert report["count"] == 0
+        assert set(report) == {"links", "count", "skipped", "error"}
+
+    def test_extract_links_error_shape_matches_siblings(self) -> None:
+        """The model carries the documented ``error`` field like the others."""
+        report = _of(extract_links("<not-parseable", "http://127.0.0.1:1/"))
+        assert "error" in report
+
+    def test_query_only_reference_resolves_on_the_page_path(self) -> None:
+        """``?page=2`` stays on the fetched page, not its directory (#48)."""
+        report = _of(extract_links('<a href="?page=2">next</a>', "http://127.0.0.1:1/a/b.html"))
+        assert report["links"] == ["http://127.0.0.1:1/a/b.html?page=2"]
+
+    def test_query_only_reference_replaces_the_base_query(self) -> None:
+        """RFC 3986 §5.3: the reference query replaces the base's own query."""
+        report = _of(
+            extract_links('<a href="?page=2">next</a>', "http://127.0.0.1:1/a/b.html?old=1")
+        )
+        assert report["links"] == ["http://127.0.0.1:1/a/b.html?page=2"]
+
+    def test_sitemap_rejects_entity_expansion_documents(self) -> None:
+        """DOCTYPE/ENTITY declarations are rejected before parsing (#56)."""
+        body = (
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE urlset [<!ENTITY laugh "ha">]>'
+            "<urlset><url><loc>/echo&amp;laugh;</loc></url></urlset>"
+        )
+        report = _of(parse_sitemap_xml(body, "http://127.0.0.1:1/sitemap.xml"))
+        assert report["error"] != ""
+        assert report["urls"] == []
+
+    def test_sitemap_rejects_any_doctype(self) -> None:
+        """Even an entity-free DOCTYPE is rejected (real sitemaps never carry one)."""
+        body = "<!DOCTYPE urlset><urlset><url><loc>/x</loc></url></urlset>"
+        report = _of(parse_sitemap_xml(body, "http://127.0.0.1:1/sitemap.xml"))
+        assert report["error"] != ""
+        assert report["urls"] == []

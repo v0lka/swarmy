@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from swarmy.events.models import EVENT_TYPES
+from swarmy.events.models import EVENT_TYPES, EventRegistry
 from swarmy.guardrails.pipeline import GuardrailMiddleware
 from swarmy.modules import loader as loader_module
 from swarmy.modules.loader import ModuleLoader, PlatformToolsetFactory
@@ -22,8 +22,20 @@ from swarmy.modules.registry import ModuleLoadError
 from swarmy.tools.projector import ProjectorMiddleware
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterator, Mapping
     from pathlib import Path
+
+
+@pytest.fixture(autouse=True)
+def _clean_event_taxonomy() -> Iterator[None]:
+    """Restore the built-in-only taxonomy after each loader test (F-12).
+
+    Loader tests register module event types in the process-global registry;
+    the reset keeps every other suite's exact-taxonomy assertions honest no
+    matter the collection order.
+    """
+    yield
+    EventRegistry.reset()
 
 EXPECTED_SUBAGENT_KEYS = {
     "name",
@@ -207,9 +219,12 @@ def test_five_violation_kinds_produce_exact_lines(tmp_path: Path) -> None:
     assert "tool 'loose': parameter 'x' uses Any" in message
     # 3: reserved prefix (arch §6.1)
     assert "uses the reserved platform prefix 'memory_' (arch §6.1, spec §4.3)" in message
-    # 4: network import (arch §8.5)
+    # 4: network import (arch §8.5, F-2 families)
     assert "imports 'socket': module tools must use the platform HTTP client" in message
-    assert "socket/urllib/http.client are forbidden (arch §8.5)" in message
+    assert (
+        "socket/urllib/http.client and the httpx/aiohttp/requests families "
+        "are forbidden (arch §8.5)" in message
+    )
     # 5: declared but unregistered event type (arch §8.4)
     assert (
         "declared event type 'NeverRegistered' is not registered in the EventRegistry"
@@ -349,6 +364,102 @@ def test_tool_classes_override_gates_by_profile(tmp_path: Path) -> None:
         "memory_probe": True,  # overlay again
         "heavy_probe": True,
     }
+
+
+def test_undeclared_module_tool_defaults_to_destructive(tmp_path: Path) -> None:
+    """F-3 (SECURITY.md ASI02): an undeclared module tool defaults to the most gated class."""
+    root = tmp_path / "agents"
+    _make_module(
+        root,
+        "forgetful",
+        tool_files={
+            "oops.py": (
+                "def oops_probe(x: int) -> int:\n"
+                '    """Forgot its swarmy_risk_class declaration."""\n    return x\n'
+            )
+        },
+    )
+    factory, _calls = _recording_factory()
+    for profile in ("paranoid", "normal", "yolo"):
+        registry = ModuleLoader(
+            include_builtins=False,
+            user_dirs=[root],
+            strictness=profile,  # type: ignore[arg-type]
+            platform_toolset_factory=factory,
+        ).load()
+        assert registry.get("forgetful").subagent["interrupt_on"] == {
+            "memory_probe": False,  # the platform tool declares passive explicitly
+            "oops_probe": True,  # undeclared → destructive → gated by every profile
+        }, profile
+
+
+def test_manifest_cannot_remove_operator_gate(tmp_path: Path) -> None:
+    """F-4 (ASI02/ASI09): a manifest ``False`` for a profile-gated tool fails the load."""
+    root = tmp_path / "agents"
+    _make_module(
+        root,
+        "selfungating",
+        frontmatter="interrupt_on:\n  self_probe: false\n",
+        guardrails="tool_classes:\n  self_probe: destructive\nrules: []\n",
+        tool_files={
+            "self.py": (
+                "def self_probe(x: int) -> int:\n"
+                '    """Destructive tool its manifest tries to un-gate."""\n    return x\n'
+            )
+        },
+    )
+    factory, _calls = _recording_factory()
+    message = _load_error_message(
+        ModuleLoader(
+            include_builtins=False,
+            user_dirs=[root],
+            strictness="paranoid",
+            platform_toolset_factory=factory,
+        )
+    )
+    assert "removes the operator gate for 'self_probe'" in message
+
+
+def test_manifest_cannot_ungate_destructive_under_yolo(tmp_path: Path) -> None:
+    """F-4: destructive is gated even under yolo — the manifest False still fails."""
+    root = tmp_path / "agents"
+    _make_module(
+        root,
+        "selfungating",
+        frontmatter="interrupt_on:\n  self_probe: false\n",
+        guardrails="tool_classes:\n  self_probe: destructive\nrules: []\n",
+        tool_files={
+            "self.py": (
+                "def self_probe(x: int) -> int:\n"
+                '    """Destructive tool its manifest tries to un-gate."""\n    return x\n'
+            )
+        },
+    )
+    factory, _calls = _recording_factory()
+    message = _load_error_message(
+        ModuleLoader(
+            include_builtins=False,
+            user_dirs=[root],
+            strictness="yolo",
+            platform_toolset_factory=factory,
+        )
+    )
+    assert "removes the operator gate for 'self_probe'" in message
+
+
+def test_manifest_gate_for_unknown_tool_fails(tmp_path: Path) -> None:
+    """F-4: an interrupt_on entry naming a tool outside the toolset fails the load."""
+    root = tmp_path / "agents"
+    _make_module(root, "ghost", frontmatter="interrupt_on:\n  ghost_probe: true\n")
+    factory, _calls = _recording_factory()
+    message = _load_error_message(
+        ModuleLoader(
+            include_builtins=False,
+            user_dirs=[root],
+            platform_toolset_factory=factory,
+        )
+    )
+    assert "not a tool of this module's toolset" in message
 
 
 def test_response_format_imported_from_result_py(tmp_path: Path) -> None:
@@ -547,3 +658,360 @@ def test_builtin_scan_edge_cases(
         lambda name: SimpleNamespace(is_dir=lambda: False),
     )
     assert loader_module._builtin_module_dirs(ExitStack()) == []
+
+
+# ---------------------------------------------------------------------------
+# F-2: extended forbidden-import / call-shape scan.
+# ---------------------------------------------------------------------------
+
+
+def test_http_client_family_imports_are_rejected(tmp_path: Path) -> None:
+    """F-2: httpx/aiohttp/requests are raw-network escapes and are forbidden."""
+    root = tmp_path / "agents"
+    _make_module(
+        root,
+        "httpfam",
+        tool_files={
+            "a_httpx.py": (
+                "import httpx\n\n\ndef via_httpx(url: str) -> str:\n"
+                '    """httpx tool that must not load."""\n    return url\n'
+            ),
+            "b_aiohttp.py": (
+                "import aiohttp\n\n\ndef via_aiohttp(url: str) -> str:\n"
+                '    """aiohttp tool."""\n    return url\n'
+            ),
+            "c_requests.py": (
+                "import requests\n\n\ndef via_requests(url: str) -> str:\n"
+                '    """requests tool."""\n    return url\n'
+            ),
+        },
+    )
+    message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
+    assert "imports 'httpx'" in message
+    assert "imports 'aiohttp'" in message
+    assert "imports 'requests'" in message
+
+
+def test_subprocess_import_and_os_spawn_usage_are_rejected(tmp_path: Path) -> None:
+    """F-2/ASI05: subprocess import, os.system/os.popen uses are problems; bare os is legal."""
+    root = tmp_path / "agents"
+    _make_module(
+        root,
+        "spawn",
+        tool_files={
+            "a_sub.py": (
+                "import subprocess\n\n\ndef via_sub(cmd: str) -> str:\n"
+                '    """subprocess tool."""\n    return cmd\n'
+            ),
+            "b_from_os.py": (
+                "from os import system\n\n\ndef via_from_os(cmd: str) -> str:\n"
+                '    """from-os tool."""\n    return cmd\n'
+            ),
+            "c_os_system.py": (
+                "import os\n\n\ndef via_os_system(cmd: str) -> str:\n"
+                '    """os.system tool."""\n    return os.system(cmd)  # noqa: S605 - test fixture\n'
+            ),
+            "d_os_popen.py": (
+                "import os\n\n\ndef via_os_popen(cmd: str) -> str:\n"
+                '    """os.popen tool."""\n    return os.popen(cmd).read()  # noqa: S607 - test fixture\n'
+            ),
+        },
+    )
+    message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
+    assert "imports 'subprocess'" in message
+    assert "SECURITY.md ASI05" in message
+    assert "imports os.system from os" in message
+    assert "calls os.system()" in message
+    assert "calls os.popen()" in message
+
+
+def test_bare_os_without_spawn_is_legal(tmp_path: Path) -> None:
+    """F-2: bare ``os`` import with non-spawn use loads clean (no bare-os ban)."""
+    root = tmp_path / "agents"
+    _make_module(
+        root,
+        "osok",
+        tool_files={
+            "osuser.py": (
+                "import os\n\n\ndef osuser(name: str) -> str:\n"
+                '    """Join a path under the current working directory."""\n'
+                "    return os.path.join(os.getcwd(), name)\n"
+            )
+        },
+    )
+    registry = ModuleLoader(user_dirs=[root], include_builtins=False).load()
+    assert "osok" in registry
+
+
+def test_asyncio_raw_streams_are_rejected(tmp_path: Path) -> None:
+    """F-2: asyncio.open_connection/start_server bypass the platform client."""
+    root = tmp_path / "agents"
+    _make_module(
+        root,
+        "rawsock",
+        tool_files={
+            "a_open_conn.py": (
+                "import asyncio\n\n\nasync def via_open_conn(host: str) -> str:\n"
+                '    """Raw stream tool."""\n'
+                "    reader, writer = await asyncio.open_connection(host, 80)\n"
+                "    writer.close()\n"
+                "    return host\n"
+            ),
+            "b_from_asyncio.py": (
+                "from asyncio import start_server\n\n\n"
+                "async def via_start_server(host: str) -> str:\n"
+                '    """Raw server tool."""\n'
+                "    return host\n"
+            ),
+        },
+    )
+    message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
+    assert "calls asyncio.open_connection()" in message
+    assert "imports asyncio.start_server" in message
+
+
+def test_skill_scripts_get_the_same_static_scan(tmp_path: Path) -> None:
+    """F-2 (option b): skills/**/*.py scripts are scanned like tools."""
+    root = tmp_path / "agents"
+    module_dir = _make_module(root, "skilled_bad")
+    scripts_dir = module_dir / "skills" / "helper" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "helper.py").write_text(
+        "import httpx\n\n\ndef grab(url: str) -> str:\n"
+        '    """Skill helper that must be rejected."""\n    return url\n',
+        encoding="utf-8",
+    )
+    message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
+    assert "helper.py imports 'httpx'" in message
+
+
+def test_skill_scripts_syntax_and_non_python_are_handled(tmp_path: Path) -> None:
+    """Broken skill scripts are problems; non-Python scripts stay outside the AST scan."""
+    root = tmp_path / "agents"
+    module_dir = _make_module(root, "skilled_edge")
+    scripts_dir = module_dir / "skills" / "s" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+    (scripts_dir / "run.sh").write_text("import httpx\n", encoding="utf-8")
+    message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
+    assert "broken.py: invalid syntax" in message
+    assert "run.sh" not in message  # non-Python scripts are a vetting matter, not AST
+
+
+# ---------------------------------------------------------------------------
+# #57: non-UTF-8 module files aggregate instead of crashing.
+# ---------------------------------------------------------------------------
+
+
+def test_non_utf8_module_files_aggregate_into_the_report(tmp_path: Path) -> None:
+    """#57: bad AGENT.md + bad guardrails.yaml + a later module all report."""
+    root = tmp_path / "agents"
+    bad_agent = root / "bad_agent"
+    bad_agent.mkdir(parents=True)
+    (bad_agent / "AGENT.md").write_bytes(
+        b"---\nname: badagent\ndescription: \xf2\xe5\xf1\xf2\n---\nBody.\n"
+    )
+    bad_guardrails = _make_module(root, "bad_guardrails", guardrails="rules: []\n")
+    (bad_guardrails / "guardrails.yaml").write_bytes(b"rules: []\n\xf2\xee\xec\n")
+    later = _make_module(
+        root,
+        "later",
+        tool_files={"naked.py": "def naked(x: int) -> int:\n    return x\n"},
+    )
+    with pytest.raises(ModuleLoadError) as excinfo:
+        ModuleLoader(user_dirs=[root], include_builtins=False).load()
+    message = str(excinfo.value)
+    assert "not valid UTF-8" in message
+    assert str(bad_agent / "AGENT.md") in message
+    assert str(bad_guardrails / "guardrails.yaml") in message
+    # the module AFTER the broken ones still had its problems collected (§4.5)
+    assert f"{later}: tool 'naked' has no docstring" in message
+
+
+def test_non_utf8_tool_file_is_a_collected_problem(tmp_path: Path) -> None:
+    """#57: a non-UTF-8 tools/*.py file joins the report, no raw ValueError."""
+    root = tmp_path / "agents"
+    _make_module(root, "badtool")
+    (root / "badtool" / "tools").mkdir()
+    (root / "badtool" / "tools" / "cp1251.py").write_bytes(b"\xf2\xee\xec\n")
+    message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
+    # The import (which reads the file first) fails before the AST read can:
+    # the aggregate report still names the file — no raw UnicodeDecodeError
+    # escapes (the #57 contract; the tolerant AST read is belt-and-braces).
+    assert "cp1251.py" in message
+    assert "file failed to import" in message
+
+
+# ---------------------------------------------------------------------------
+# #44: an aborted load writes nothing into the ToolRegistry.
+# ---------------------------------------------------------------------------
+
+
+def test_failed_load_leaves_the_tool_registry_untouched(tmp_path: Path) -> None:
+    """#44 (option a): registry writes flush only after ALL modules load clean."""
+    root = tmp_path / "agents"
+    _make_module(root, "good", tool_files={"probe.py": GOOD_TOOL})
+    _make_module(root, "bad", tool_files={"naked.py": "def naked(x: int) -> int:\n    return x\n"})
+    factory, _calls = _recording_factory()
+    tool_registry = loader_module.ToolRegistry()
+    with pytest.raises(ModuleLoadError):
+        ModuleLoader(
+            user_dirs=[root],
+            platform_toolset_factory=factory,
+            tool_registry=tool_registry,
+            include_builtins=False,
+        ).load()
+    assert len(tool_registry) == 0  # nothing registered on the abort path
+    # Fix the broken module (distinct tool name; the retry registers atomically).
+    (root / "bad" / "tools" / "naked.py").write_text(
+        GOOD_TOOL.replace("good_probe", "fixed_probe"), encoding="utf-8"
+    )
+    ModuleLoader(
+        user_dirs=[root],
+        platform_toolset_factory=factory,
+        tool_registry=tool_registry,
+        include_builtins=False,
+    ).load()
+    assert {"memory_probe", "good_probe", "fixed_probe"} <= set(tool_registry.names())
+
+
+def test_flush_time_collisions_are_aggregated_with_sources(tmp_path: Path) -> None:
+    """Two modules claiming one tool name collide at flush with both sources."""
+    root = tmp_path / "agents"
+    _make_module(root, "first", tool_files={"probe.py": GOOD_TOOL})
+    _make_module(
+        root,
+        "second",
+        tool_files={"clash.py": GOOD_TOOL},  # same tool name as module "first"
+    )
+    message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
+    assert "duplicate tool name 'good_probe'" in message
+    assert f"{root / 'second'}:" in message
+
+
+# ---------------------------------------------------------------------------
+# #35 ↔ F-12: reset-per-load lifecycle of the EventRegistry.
+# ---------------------------------------------------------------------------
+
+
+_PROBE_EVENT_PY = (
+    "from pydantic import BaseModel\n\n\n"
+    "class ProbeStarted(BaseModel):\n"
+    '    """Payload of the probe started event."""\n\n'
+    "    detail: str\n"
+)
+
+_PROBE_EVENT_PY_V2 = (
+    "from pydantic import BaseModel\n\n\n"
+    "class ProbeStarted(BaseModel):\n"
+    '    """Payload of the probe started event, schema v2."""\n\n'
+    "    detail: str\n    score: int\n"
+)
+
+
+def test_two_consecutive_loads_with_colliding_event_types(tmp_path: Path) -> None:
+    """#35↔F-12: the second load re-registers a fresh schema instead of colliding."""
+    root = tmp_path / "agents"
+    _make_module(
+        root,
+        "prober",
+        frontmatter="events:\n  - ProbeStarted\n",
+        event_models_py=_PROBE_EVENT_PY,
+    )
+    factory, _calls = _recording_factory()
+    ModuleLoader(
+        user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
+    ).load()
+    first_cls = EVENT_TYPES["ProbeStarted"]
+    assert first_cls.model_fields.keys() == {"detail"}  # type: ignore[union-attr]
+    # The module ships a new schema of the same event type between sessions.
+    (root / "prober" / "tools" / "event_models.py").write_text(
+        _PROBE_EVENT_PY_V2, encoding="utf-8"
+    )
+    second = ModuleLoader(
+        user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
+    ).load()
+    assert "prober" in second  # no "event type 'ProbeStarted' is already registered"
+    assert EVENT_TYPES["ProbeStarted"] is not first_cls
+    assert EVENT_TYPES["ProbeStarted"].model_fields.keys() == {"detail", "score"}  # type: ignore[union-attr]
+
+
+def test_failed_load_then_retry_with_the_same_event_type(tmp_path: Path) -> None:
+    """#35: types registered before a module's later failure do not poison the retry."""
+    root = tmp_path / "agents"
+    _make_module(
+        root,
+        "halfbroken",
+        frontmatter="events:\n  - ProbeStarted\n",
+        event_models_py=_PROBE_EVENT_PY,
+        tool_files={"naked.py": "def naked(x: int) -> int:\n    return x\n"},
+    )
+    message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
+    assert "tool 'naked' has no docstring" in message
+    # Retry after the fix: the ghost registration of the failed load is gone.
+    (root / "halfbroken" / "tools" / "naked.py").write_text(GOOD_TOOL, encoding="utf-8")
+    registry = ModuleLoader(user_dirs=[root], include_builtins=False).load()
+    assert "halfbroken" in registry
+    assert "ProbeStarted" in EVENT_TYPES
+
+
+def test_loader_reset_keeps_builtin_taxonomy_intact(tmp_path: Path) -> None:
+    """The reset at load start never drops the built-in types (arch §5.2)."""
+    root = tmp_path / "agents"
+    _make_module(
+        root,
+        "prober",
+        frontmatter="events:\n  - ProbeStarted\n",
+        event_models_py=_PROBE_EVENT_PY,
+    )
+    ModuleLoader(user_dirs=[root], include_builtins=False).load()
+    assert "FindingCandidate" in EVENT_TYPES  # built-ins survive the reset+reload
+    assert "ScopeChanged" in EVENT_TYPES
+
+
+def test_flush_platform_failure_is_attributed_to_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flush-time platform batch collision fails the load, attributed to 'platform'."""
+    root = tmp_path / "agents"
+    _make_module(root, "plain", tool_files={"probe.py": GOOD_TOOL})
+    factory, _calls = _recording_factory()
+    tool_registry = loader_module.ToolRegistry()
+
+    async def squatter() -> str:
+        """Platform name squatter pre-registered by a broken earlier state."""
+        return "x"
+
+    tool_registry.register_many(
+        [
+            loader_module.ToolSpec(
+                name="memory_probe",
+                fn=squatter,
+                owner=loader_module.PLATFORM_OWNER,  # stale platform registration
+                source=loader_module.BUILTIN_SOURCE,
+            )
+        ]
+    )
+    message = _load_error_message(
+        ModuleLoader(
+            user_dirs=[root],
+            platform_toolset_factory=factory,
+            tool_registry=tool_registry,
+            include_builtins=False,
+        )
+    )
+    assert "platform: duplicate tool name 'memory_probe'" in message
+    # The squatted entry was not silently replaced.
+    assert tool_registry.entry("memory_probe").owner == loader_module.PLATFORM_OWNER
+
+
+def test_non_utf8_skill_script_is_a_collected_problem(tmp_path: Path) -> None:
+    """A non-UTF-8 skills/**/*.py script joins the report (#57 treatment)."""
+    root = tmp_path / "agents"
+    module_dir = _make_module(root, "skilled_cp1251")
+    scripts_dir = module_dir / "skills" / "s" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "cp1251.py").write_bytes(b"x = '\xf2\xe5\xf1\xf2'\n")
+    message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
+    assert "cp1251.py" in message
+    assert "not valid UTF-8" in message

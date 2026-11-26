@@ -53,7 +53,7 @@ class ActivityPanel(Vertical):
         del view  # masking goes through the panel masker; the facade is unused
         log = self.query_one("#activity-log", RichLog)
         log.clear()
-        for envelope in state.feed[-_FEED_LIMIT:]:
+        for envelope in state.recent_feed(_FEED_LIMIT):
             log.write(escape(self.masker(self._feed_line(envelope))))
         self._refresh_delegations(state)
         self._refresh_status(state)
@@ -90,8 +90,8 @@ class ActivityPanel(Vertical):
             digest = done.summary_digest if done is not None else summary
             table.add_row(
                 cid[:8],
-                subagent,
-                status,
+                escape(subagent),
+                escape(status),
                 escape(self.masker(digest)),
                 key=cid,
             )
@@ -105,5 +105,6 @@ class ActivityPanel(Vertical):
         else:
             head = state.approvals[0]
             status.update(
-                f"approvals queue: [bold]{count}[/] pending; head: {head.tool} ({head.origin})"
+                f"approvals queue: [bold]{count}[/] pending; head: "
+                f"{escape(head.tool)} ({escape(head.origin)})"
             )

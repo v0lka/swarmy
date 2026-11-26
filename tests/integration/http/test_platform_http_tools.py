@@ -130,7 +130,7 @@ async def test_timeout_tool_call_returns_timeout_feedback(
         tools = make_http_tools(scoped)
         feedback = await tools["http_get"](echo_server.url("/slow"), query={"ms": "2000"})
     assert isinstance(feedback, str)
-    assert "invariant: timeout" in feedback
+    assert "invariant:timeout" in feedback
 
 
 def test_http_tools_declare_ad7_risk_classes(client: SwarmyHttpClient) -> None:

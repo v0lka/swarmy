@@ -9,7 +9,9 @@ stays on the platform memory tools (arch §8.5). Every parser is inert
 profiles.
 
 Stdlib parsing only: ``html.parser`` for markup, ``xml.etree.ElementTree``
-for sitemaps. ``urllib`` is deliberately not used (forbidden import for
+for sitemaps (with a pre-parse rejection of DOCTYPE/entity declarations —
+the stdlib XML parser is entity-expansion vulnerable, and the body is
+target-controlled). ``urllib`` is deliberately not used (forbidden import for
 module tools, arch §8.5) — the tiny URL-join helper below covers the
 relative-reference resolution the crawler needs.
 """
@@ -64,6 +66,7 @@ class LinksReport(BaseModel):
     links: list[str] = []  # absolute http(s) URLs, deduplicated, in page order
     count: int = 0
     skipped: int = 0  # non-http refs (mailto:, javascript:, fragments, assets)
+    error: str = ""  # non-empty for an unparseable body or invalid base URL
 
 
 class FormInput(BaseModel):
@@ -119,9 +122,11 @@ def _join_url(base_url: str, ref: str) -> str | None:
     """Resolve one link/reference against ``base_url`` (RFC-lite, no urllib).
 
     Handles absolute URLs, scheme-relative ``//host/path``, root-relative
-    ``/path``, and plain relative paths with ``./``/``../`` normalization;
-    fragments are dropped, queries kept. Returns ``None`` for refs the
-    crawler must not follow (non-http schemes, empty results).
+    ``/path``, query-only ``?query`` references (kept on the base path per
+    RFC 3986 §5.3 — the query replaces the base's own query), and plain
+    relative paths with ``./``/``../`` normalization; fragments are dropped,
+    queries kept. Returns ``None`` for refs the crawler must not follow
+    (non-http schemes, empty results).
     """
     origin = _base_origin(base_url)
     if origin is None:
@@ -132,7 +137,9 @@ def _join_url(base_url: str, ref: str) -> str | None:
     lowered = ref.lower()
     if lowered.startswith(_SKIPPED_REF_PREFIXES):
         return None
-    if lowered.startswith(("http://", "https://")):
+    if ref.startswith("?"):
+        resolved = f"{base_url.split('#', 1)[0].split('?', 1)[0]}{ref}"
+    elif lowered.startswith(("http://", "https://")):
         resolved = ref
     elif ref.startswith("//"):
         resolved = f"{base_url.split('://', 1)[0]}:{ref}"
@@ -302,10 +309,21 @@ def parse_sitemap_xml(text: str, base_url: str) -> str:
 
     Returns:
         JSON object ``{urls, count, error}``; ``error`` is non-empty for an
-        unparseable XML body or an invalid base URL.
+        unparseable XML body, a body declaring a DOCTYPE or XML entities
+        (rejected pre-parse: real sitemaps never carry them, and stdlib XML
+        parsing is vulnerable to billion-laughs entity expansion — a
+        hostile target must not inflate operator memory/CPU), or an
+        invalid base URL.
     """
     if _base_origin(base_url) is None:
         return _error_report(f"base_url is not an absolute http(s) URL: {base_url!r}", SitemapReport)
+    lowered = text.lower()
+    if "<!doctype" in lowered or "<!entity" in lowered:
+        return _error_report(
+            "sitemap XML declares a DOCTYPE or entities — rejected before "
+            "parsing (entity-expansion guard; real sitemaps never carry them)",
+            SitemapReport,
+        )
     try:
         root = ElementTree.fromstring(text)
     except ElementTree.ParseError as exc:

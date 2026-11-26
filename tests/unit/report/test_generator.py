@@ -239,6 +239,89 @@ class TestNoLlmNoNetwork:
         assert first == second
 
 
+class TestReportEscaping:
+    """Target/LLM-derived text renders report-safe (review Issues #40/#18)."""
+
+    async def test_finding_payloads_neutralized(self, store: MemoryStore) -> None:
+        """Raw HTML and markdown structure in finding text cannot reach report.md."""
+        await store.save_finding(
+            FindingDraft(
+                type="xss",
+                severity=Severity.HIGH,
+                title="<img src=x onerror=alert(1)>",
+                description="payload <svg onload=alert(2)> worked\n# fake heading",
+                created_by="xss-detector",
+                reproduction=["GET /q?x=`cmd` | sh", "![](http://evil/x)"],
+            )
+        )
+        report = await ReportGenerator(store).generate("http://t/", [], _statistics())
+        assert "<img" not in report
+        assert "<svg" not in report
+        assert "&lt;img src=x onerror=alert(1)&gt;" in report
+        assert "&lt;svg onload=alert(2)&gt;" in report
+        assert "\\# fake heading" in report  # leading structure neutralized
+        assert "GET /q?x=\\`cmd\\` \\| sh" in report  # code-span/table syntax inert
+        assert "![](http://evil/x)" not in report  # image syntax neutralized
+
+    async def test_endpoint_pipes_escaped_in_table(self, store: MemoryStore) -> None:
+        """Pipes in path/host cannot break the appendix table (#18)."""
+        await store.upsert_endpoint(
+            EndpointDraft(host="h.example|evil", method="GET", path="/a|b", parameters=[])
+        )
+        report = await ReportGenerator(store).generate("http://t/", [], _statistics())
+        assert "/a\\|b" in report
+        assert "h.example\\|evil" in report
+
+    async def test_method_pipe_escaped_in_table(self, store: MemoryStore) -> None:
+        """A pre-normalization method row (``A|B``) cannot break the table column.
+
+        The method token grammar (``tools.platform``) admits ``|`` and
+        backtick, and a resumed session may carry rows stored before the
+        normalization ran — the method is escaped like every other
+        target-derived cell.
+        """
+        await store.upsert_endpoint(
+            EndpointDraft(host="h.example", method="A|B", path="/m", parameters=[])
+        )
+        report = await ReportGenerator(store).generate("http://t/", [], _statistics())
+        assert "| A\\|B |" in report
+
+    async def test_created_by_neutralized(self, store: MemoryStore) -> None:
+        """``created_by`` renders report-safe like every other finding field."""
+        await store.save_finding(
+            FindingDraft(
+                type="xss",
+                severity=Severity.LOW,
+                title="t",
+                description="d",
+                created_by="<img src=x> | `xss-detector`",
+            )
+        )
+        report = await ReportGenerator(store).generate("http://t/", [], _statistics())
+        assert "<img" not in report
+        assert "&lt;img src=x&gt; \\| \\`xss-detector\\`" in report
+
+    async def test_mermaid_labels_carry_no_angle_brackets(self, store: MemoryStore) -> None:
+        """`<`/`>` never survive into a mermaid label (#40)."""
+        await store.link_attack_node(
+            AttackNodeDraft(kind="goal", title="steal <img src=x onerror=alert(1)>"), []
+        )
+        report = await ReportGenerator(store).generate("http://t/", [], _statistics())
+        block = _MERMAID_BLOCK.findall(report)[0]
+        assert "<" not in block
+        assert ">" not in block
+        text_block = re.search(r"```text\n(.*?)```", report, re.DOTALL)
+        assert text_block is not None
+        assert "<img" not in text_block.group(1)
+
+    async def test_backtick_payload_cannot_break_the_text_fence(self, store: MemoryStore) -> None:
+        """Fence-breaking payloads stay inside the ```text tree rendering."""
+        await store.link_attack_node(AttackNodeDraft(kind="goal", title="run ```cmd```"), [])
+        report = await ReportGenerator(store).generate("http://t/", [], _statistics())
+        text_blocks = re.findall(r"```text\n(.*?)```", report, re.DOTALL)
+        assert len(text_blocks) == 1  # the payload did not close the fence early
+
+
 class TestGenerateReportTool:
     """The orchestrator tool writes <session-dir>/report.md (RD-7)."""
 

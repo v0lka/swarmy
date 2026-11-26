@@ -164,6 +164,93 @@ class TestReflectionAnalysis:
         assert report["occurrences"][1]["offset"] == 10
         assert len(report["occurrences"]) == 2
 
+    def test_contexts_on_mixed_markup(self) -> None:
+        """Every context class is assigned on one page, in document order (#61)."""
+        marker = "swxm1"
+        segments: list[tuple[str, str | None]] = [
+            ("<html><p>plain ", "html_text"),
+            ("</p><!-- note ", "comment"),
+            (" --><script>var a='", "script_code"),
+            ("';</script><div class=\"b ", "attribute_value"),
+            ("\"><span data-x=1 ", "inside_tag"),
+            (">tail ", "html_text"),
+            ("</span></div></html>", None),
+        ]
+        parts: list[str] = []
+        expected: list[tuple[int, str]] = []
+        offset = 0
+        for text, context in segments:
+            parts.append(text)
+            offset += len(text)
+            if context is not None:
+                # The marker lands at the end of the segment: inside the
+                # markup context this segment's text opened.
+                parts.append(marker)
+                expected.append((offset, context))
+                offset += len(marker)
+        report = _of(reflection.analyze_reflection("".join(parts), marker, "q"))
+        assert report["reflected"] is True
+        got = [(occ["offset"], occ["context"]) for occ in report["occurrences"]]
+        assert got == expected
+        assert report["contexts"] == [
+            "html_text",
+            "comment",
+            "script_code",
+            "attribute_value",
+            "inside_tag",
+        ]
+
+    def test_later_tag_takes_over_between_occurrences(self) -> None:
+        """A '<' between two occurrences governs the later one (from-0 semantics)."""
+        body = '<div a="1" swxm1 <span b=2 swxm1 >'
+        report = _of(reflection.analyze_reflection(body, "swxm1", "q"))
+        got = [occ["context"] for occ in report["occurrences"]]
+        # First: the div head carries '=' and '"' → attribute_value.
+        # Second: the later '<span' (head without quotes) takes over → inside_tag.
+        assert got == ["attribute_value", "inside_tag"]
+
+    def test_marker_saturated_body_classifies_every_occurrence(self) -> None:
+        """Occurrences below the cap are all classified, in order (linear scan, #61)."""
+        marker = "swxm1"
+        body = (
+            "<script>"
+            + (marker + " ") * 100
+            + "</script><div data-x=\""
+            + (marker + " ") * 100
+            + "\">tail "
+            + (marker + " ") * 50
+        )
+        report = _of(reflection.analyze_reflection(body, marker, "q"))
+        assert report["reflected"] is True
+        assert report["contexts"] == ["script_code", "attribute_value", "html_text"]
+        occurrences = report["occurrences"]
+        assert len(occurrences) == 250
+        assert report["truncated"] is False
+        assert report["total_occurrences"] == 250
+        offsets = [occ["offset"] for occ in occurrences]
+        assert offsets == sorted(offsets)
+        assert occurrences[0]["context"] == "script_code"
+        assert occurrences[100]["context"] == "attribute_value"
+        assert occurrences[249]["context"] == "html_text"
+
+    def test_degenerate_short_marker_cap(self) -> None:
+        """A saturated body keeps the first 500 hits and reports the full count.
+
+        A degenerate short marker would otherwise push an unbounded list
+        into the model context — the report caps ``occurrences`` while
+        ``total_occurrences``/``truncated``/``verdict`` stay honest.
+        """
+        marker = "x"
+        body = "<script>" + (marker + " ") * 4500 + "</script>"
+        report = _of(reflection.analyze_reflection(body, marker, "q"))
+        assert report["reflected"] is True
+        assert len(report["occurrences"]) == 500
+        assert report["truncated"] is True
+        assert report["total_occurrences"] == 4500
+        assert report["contexts"] == ["script_code"]  # the kept prefix is script-only
+        assert "4500" in report["verdict"]
+        assert "first 500 kept" in report["verdict"]
+
     def test_safe_payload_report_survival(self) -> None:
         """Verbatim survival flips the finding signal."""
         body = "prefix <swxtagswxm1> suffix"

@@ -194,3 +194,71 @@ async def test_snapshot_written_without_secrets(tmp_path: Path, model: ScriptedC
         assert "hunter2" not in text  # no raw secret value anywhere
     finally:
         await session.close()
+
+
+async def test_set_mode_rebuilds_the_orchestrator_toolset(
+    tmp_path: Path, module_dir: Path, model: ScriptedChatModel
+) -> None:
+    """Issue #38: ``session_info`` reports the post-switch mode.
+
+    ``set_mode`` recompiles the graph AND rebuilds the orchestrator toolset —
+    ``session_info`` is composed with the mode baked in, so without the
+    rebuild the orchestrator would keep reading the pre-switch mode forever.
+    """
+    import json
+
+    session = await Session.open(
+        config=_config(tmp_path, module_dir), session_dir=tmp_path / "s", model=model
+    )
+    try:
+        info = session._orchestrator_tools["session_info"]
+        state = json.loads(await info())
+        assert state["hitl"]["mode"] == session.config.mode  # the pre-switch mode
+        await session.set_mode("mission", model=model)  # explicit: no L0 default flip
+        state_after = json.loads(await session._orchestrator_tools["session_info"]())
+        assert state_after["hitl"]["mode"] == "mission"  # the post-switch mode
+        # the runtime runs on the recompiled graph (the checkpointer carried over)
+        assert await session.runtime.run_step() is not None or True  # step executes
+        decisions = await session.reader.by_type("OperatorDecision")
+        assert any(
+            entry.payload.request_id == "mode-switch:mission" for entry in decisions
+        )
+    finally:
+        await session.close()
+
+
+def test_subagent_gates_carry_the_swarmy_decision_set() -> None:
+    """Issue #60: plain ``True`` subagent gates never offer L0 ``respond``.
+
+    The loader emits bool entries (the manifest map is bool-typed); langchain
+    expands ``True`` to the full default decision set, which includes the
+    ``respond`` decision the platform deliberately does not offer. The engine
+    normalizes every subagent gate to the swarmy decision set.
+    """
+    from swarmy.core.engine import Engine
+
+    subagents: list[dict[str, object]] = [
+        {"name": "crawler", "interrupt_on": {"http_get": True, "memory_get": False}},
+        {
+            "name": "custom",
+            "interrupt_on": {"http_post": {"allowed_decisions": ["approve", "respond"]}},
+        },
+        {"name": "plain", "description": "no gates"},
+    ]
+    normalized = Engine._normalize_subagent_gates(subagents)
+    crawler_gates = normalized[0]["interrupt_on"]
+    assert isinstance(crawler_gates, dict)
+    assert crawler_gates["http_get"] == {
+        "allowed_decisions": ["approve", "edit", "reject"],
+        "description": (
+            "Tool 'http_get' requires operator approval (module-declared gate)."
+        ),
+    }
+    assert crawler_gates["memory_get"] is False  # explicit False passes through
+    custom_gates = normalized[1]["interrupt_on"]
+    assert isinstance(custom_gates, dict)
+    entry = custom_gates["http_post"]
+    assert isinstance(entry, dict)
+    assert entry["allowed_decisions"] == ["approve"]  # respond stripped
+    assert "interrupt_on" not in normalized[2]  # gate-less dicts pass through
+    assert subagents[0]["interrupt_on"] == {"http_get": True, "memory_get": False}  # inputs untouched

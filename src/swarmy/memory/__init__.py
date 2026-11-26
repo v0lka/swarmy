@@ -35,7 +35,7 @@ from swarmy.memory.models import (
     Target,
 )
 from swarmy.memory.search import Fts5SearchIndex, SearchIndex
-from swarmy.memory.store import MemoryStore
+from swarmy.memory.store import MemoryStore, MemoryStoreBusy
 
 __all__ = [
     "AttackEdge",
@@ -55,6 +55,7 @@ __all__ = [
     "FindingType",
     "Fts5SearchIndex",
     "MemoryStore",
+    "MemoryStoreBusy",
     "Note",
     "NoteDraft",
     "Parameter",

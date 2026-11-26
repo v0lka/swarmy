@@ -37,8 +37,10 @@ from swarmy.tools.projector import ContextProjector
 from swarmy.tools.scope import ScopeEntries, ScopeRegistry
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Mapping
+    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
     from pathlib import Path
+
+    from swarmy.tools.http.models import HopRecord
 
 #: In-scope origin used across the tests (scope fixture allowlists it).
 BASE_URL = "http://app.example.com"
@@ -152,6 +154,7 @@ class EvidenceSpy:
         response_body: bytes,
         response_truncated: bool = False,
         response_dropped_bytes: int | None = None,
+        hops: Sequence[HopRecord] = (),
     ) -> Evidence:
         """Record the call and return a fresh ``Evidence`` pointer."""
         self.calls.append(
@@ -166,6 +169,7 @@ class EvidenceSpy:
                 "response_body": response_body,
                 "response_truncated": response_truncated,
                 "response_dropped_bytes": response_dropped_bytes,
+                "hops": hops,
             }
         )
         self._next_id += 1
@@ -267,9 +271,14 @@ def make_client(
         events: HttpClientEvents | None = None,
         evidence: EvidenceSink | None = None,
         secrets_override: SecretsConfig | None = None,
+        pipeline_override: GuardrailPipeline | None = None,
     ) -> SwarmyHttpClient:
         limiter = limiter_override if limiter_override is not None else ResourceLimiter(LIMITS)
-        pipeline = GuardrailPipeline(invariants=InvariantLayer(session_invariants(scope, limiter)))
+        pipeline = (
+            pipeline_override
+            if pipeline_override is not None
+            else GuardrailPipeline(invariants=InvariantLayer(session_invariants(scope, limiter)))
+        )
         return SwarmyHttpClient(
             scope=scope,
             limiter=limiter,

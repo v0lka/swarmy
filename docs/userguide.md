@@ -611,7 +611,7 @@ Todos оркестратора (план из харнесса) и статис�
 | Слой | Что это | Отключаемость |
 |------|---------|----------------|
 | 1. Платформенные инварианты (`invariant:*`) | скоуп, ресурсные лимиты, бюджет, таймауты, «сеть только через платформенный HTTP-клиент» | **никогда** |
-| 2. Базовые правила движка | `no-true-based-sqli`, `block-trace-connect-methods`, `block-destructive-payloads` (для http-инструментов) | ключ `guardrails.engine_rules: false` |
+| 2. Базовые правила движка | `no-true-based-sqli`, `block-destructive-payloads` (для http-инструментов; методы TRACE/CONNECT структурно исключены самой поверхностью инструментов — D30) | ключ `guardrails.engine_rules: false` |
 | 3. Модульные правила | `guardrails.yaml` каждого модуля | удаляется вместе с модулем |
 | Судья (LLM) | отдельные полосы pre-call (по классам из `judge.tools`) и post-call (подозрительные результаты) | `judge.model: null` = выключен |
 
@@ -1464,7 +1464,6 @@ error: agents/tech-fingerprint: manifest field 'events': unknown event type ...
 | `invariant:limits`, `invariant:budget`, `invariant:timeout` | 1 | нет |
 | `invariant:platform-http` | 1 | нет |
 | `no-true-based-sqli` | 2 | `guardrails.engine_rules: false` |
-| `block-trace-connect-methods` | 2 | там же |
 | `block-destructive-payloads` | 2 | там же |
 | правила модулей | 3 | правкой `guardrails.yaml` модуля |
 | эскалации судьи | judge | `judge.model: null` |

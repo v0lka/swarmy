@@ -25,16 +25,22 @@ correct its plan (spec §8.5).
 
 Runtime extension (arch §6.3): ``extend()`` requires ``origin="operator"``
 — the scope may grow only through an operator decision (HITL). The
-``ScopeChanged`` journal event is published by the platform HITL contour
-when it docks in P3.3; the registry itself stays event-free.
+production contour is :meth:`swarmy.core.session.Session.extend_scope`,
+which journals ``ScopeChanged`` and merges the entries (journal-first);
+the TUI/chat command docks there at M4.
 
 Out-of-scope endpoints (``invariant: out-of-scope-target``): the platform
-contour feeds memory ``Endpoint`` records flagged ``out_of_scope=True``
-(``host`` = full ``host:port``, arch §4.2) via :meth:`ScopeRegistry.
-mark_out_of_scope`; requests to such endpoints are denied even when the
-host itself is allowlisted (e.g. a specific path the operator excluded).
-Marking is a *restriction*, so unlike :meth:`extend` it needs no origin
-gate — the fail-closed direction is always safe to record programmatically.
+contour in ``core.session`` feeds memory ``Endpoint`` records flagged
+``out_of_scope=True`` (``host`` = full ``host:port``, arch §4.2) into
+:meth:`ScopeRegistry.mark_out_of_scope` — all flagged rows are re-loaded
+at session open **and** resume, and the endpoint bus events keep the
+registry current mid-session. Requests to such endpoints are denied even
+when the host itself is allowlisted (e.g. a specific path the operator
+excluded). Marking is a *restriction*, so unlike :meth:`extend` it needs
+no origin gate — the fail-closed direction is always safe to record
+programmatically, and the registry has no unmark: clearing a memory flag
+is an operator decision and never widens the live perimeter.
+
 """
 
 from __future__ import annotations
@@ -417,9 +423,43 @@ class ScopeRegistry:
         except ValueError:
             return None  # unparseable: the scope check denies it separately
 
+    def resolved_ip_denial_reason(self, ip: str) -> str | None:
+        """Denial reason when a name-resolved address is outside ``ip_subnets``.
+
+        The DNS-rebinding guard's scope half (F-11, arch §6.2/§6.3): when
+        the scope configures ``ip_subnets``, an allowlisted *name* must
+        resolve to an address inside them — the HTTP client checks the
+        first-resolved address here before every hop and pins it for the
+        session. With no ``ip_subnets`` configured the method allows (a
+        domain-only scope does not constrain resolution targets — there is
+        nothing to verify against).
+
+        Args:
+            ip: a resolved address literal (untrusted resolver output).
+
+        Returns:
+            The denial reason, or ``None`` when the address is verifiable
+            in-scope (or no subnets are configured).
+        """
+        if not self._compiled.networks:
+            return None
+        try:
+            address = ipaddress.ip_address(ip)
+        except ValueError:
+            return None  # not an address literal: the scope check judges hosts
+        if any(address in network for network in self._compiled.networks):
+            return None
+        return (
+            f"resolved address {address} is outside the scope ip_subnets "
+            f"({[str(net) for net in self._compiled.networks]}); an allowlisted "
+            "name must resolve inside the allowlisted subnets "
+            "(DNS-rebinding guard, arch §6.3)"
+        )
+
     def marked_endpoints(self) -> tuple[OutOfScopeEndpoint, ...]:
         """All marked out-of-scope endpoint records (diagnostics/tests)."""
         return tuple(self._out_of_scope.values())
+
 
     # ---- mutations ----
 

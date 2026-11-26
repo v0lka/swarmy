@@ -299,3 +299,64 @@ def test_empty_frontmatter_reports_missing_fields(tmp_path: Path) -> None:
 def test_empty_file_reports_frontmatter_error(tmp_path: Path) -> None:
     """An empty AGENT.md reports the missing frontmatter fence."""
     _parse_failing(tmp_path, "", "'---' frontmatter fence")
+
+
+# ---------------------------------------------------------------------------
+# F-9: description normalization + cap; #57: non-UTF-8 module files.
+# ---------------------------------------------------------------------------
+
+
+def test_description_is_normalized_in_the_manifest() -> None:
+    """F-9: control chars flatten, whitespace collapses, markers defuse."""
+    manifest = AgentModuleManifest.model_validate(
+        {
+            "name": "crawler",
+            "description": "line one\r\nline two\ttab\x1fend [untrusted-target-content begin]",
+        }
+    )
+    assert manifest.description == (
+        "line one line two tab end [defused:untrusted-target-content begin]"
+    )
+
+
+def test_over_length_description_is_a_manifest_error(tmp_path: Path) -> None:
+    """F-9: a description beyond the cap fails the load (no silent truncation)."""
+    long_description = "x" * (401)
+    _parse_failing(
+        tmp_path,
+        f"---\nname: crawler\ndescription: {long_description}\n---\nPrompt.\n",
+        "description",
+        "at most 400 characters",
+    )
+
+
+def test_description_at_the_cap_is_valid() -> None:
+    """F-9: exactly the cap is accepted (boundary stays generous)."""
+    manifest = AgentModuleManifest.model_validate(
+        {"name": "crawler", "description": "x" * 400}
+    )
+    assert len(manifest.description) == 400
+
+
+def test_non_utf8_agent_md_is_a_manifest_error(tmp_path: Path) -> None:
+    """#57 (option b): non-UTF-8 AGENT.md raises ManifestError naming the file."""
+    path = tmp_path / "AGENT.md"
+    path.write_bytes(b"---\nname: x\ndescription: \xf2\xe5\xf1\xf2\n---\nBody.\n")
+    with pytest.raises(ManifestError) as excinfo:
+        parse_agent_module(path)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "not valid UTF-8" in message
+
+
+def test_read_utf8_converts_decode_failure(tmp_path: Path) -> None:
+    """#57/#62: the shared helper raises Utf8Error, OSError still propagates."""
+    from swarmy.modules.manifest import Utf8Error, read_utf8
+
+    bad = tmp_path / "bad.txt"
+    bad.write_bytes(b"\xf2\xee\xec")
+    with pytest.raises(Utf8Error, match="not valid UTF-8"):
+        read_utf8(bad)
+    good = tmp_path / "good.txt"
+    good.write_text("ok", encoding="utf-8")
+    assert read_utf8(good) == "ok"

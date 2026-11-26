@@ -422,3 +422,175 @@ class TestExternalJudgeRequests:
         assert queue.pending() == ()
         decisions = [payload for kind, payload in calls if kind == "OperatorDecision"]
         assert decisions[0]["decision"] == "approve"
+
+
+# ---------------------------------------------------------------------------
+# Issue #25 — batched L0 interrupts expand into per-action requests.
+# ---------------------------------------------------------------------------
+
+
+def _batched_snapshot() -> StateSnapshot:
+    """A snapshot carrying ONE batched interrupt with two action requests."""
+    value = {
+        "action_requests": [
+            {"name": "http_get", "args": {"url": "https://t/a"}},
+            {"name": "http_post", "args": {"url": "https://t/b"}},
+        ],
+        "review_configs": [],
+    }
+    return StateSnapshot(
+        values={},
+        next=(),
+        config={"configurable": {"thread_id": "t"}},
+        metadata=None,
+        created_at=None,
+        parent_config=None,
+        tasks=(),
+        interrupts=(Interrupt(value=value, id="int-batch"),),
+    )
+
+
+class TestBatchedInterrupts:
+    """One assistant turn with several gated calls = ONE batched L0 interrupt.
+
+    The queue expands it into one request per action (per-call digests,
+    origins and labels), and the resume value is built from the per-action
+    decisions — an operator edit can no longer rewrite a sibling call with
+    foreign arguments (Issue #25).
+    """
+
+    async def test_batched_interrupt_expands_to_per_action_requests(self) -> None:
+        queue, _calls = _recording_queue()
+        queue.refresh(
+            _batched_snapshot(),
+            origins={"http_post": "module"},
+            rules={"http_post": "module gate"},
+        )
+        pending = queue.pending()
+        assert [request.tool for request in pending] == ["http_get", "http_post"]
+        assert [request.interrupt_id for request in pending] == ["int-batch", "int-batch"]
+        assert {request.args_digest for request in pending} == {
+            '{"url": "https://t/a"}',
+            '{"url": "https://t/b"}',
+        }
+        assert {request.tool: request.origin for request in pending} == {
+            "http_get": "profile",  # per-tool lookup, not the joined-name fallback
+            "http_post": "module",
+        }
+        assert {request.tool: request.rule_or_profile for request in pending} == {
+            "http_get": "profile",
+            "http_post": "module gate",
+        }
+
+    async def test_partial_decision_builds_no_resume(self) -> None:
+        queue, _calls = _recording_queue()
+        queue.refresh(_batched_snapshot())
+        first, second = queue.pending()
+        command = await queue.submit_decision(first.request_id, "approve")
+        assert command.resume == {}  # the sibling action is still pending
+        assert [request.request_id for request in queue.pending()] == [second.request_id]
+
+    async def test_last_decision_resumes_with_per_action_decisions(self) -> None:
+        queue, calls = _recording_queue()
+        queue.refresh(_batched_snapshot())
+        first, second = queue.pending()
+        await queue.submit_decision(first.request_id, "approve")
+        command = await queue.submit_decision(
+            second.request_id, "edit", edited_args={"url": "https://t/edited"}
+        )
+        payload = command.resume["int-batch"]
+        assert payload == {
+            "decisions": [
+                {"type": "approve"},
+                {
+                    "type": "edit",
+                    "edited_action": {
+                        "name": "http_post",  # the edit stays on its own action
+                        "args": {"url": "https://t/edited"},
+                    },
+                },
+            ]
+        }
+        decisions = [entry for kind, entry in calls if kind == "OperatorDecision"]
+        assert [entry["request_id"] for entry in decisions] == [
+            first.request_id,
+            second.request_id,
+        ]
+        assert queue.pending() == ()
+
+    async def test_decision_order_does_not_reorder_the_resume(self) -> None:
+        queue, _calls = _recording_queue()
+        queue.refresh(_batched_snapshot())
+        first, second = queue.pending()
+        await queue.submit_decision(second.request_id, "reject")
+        command = await queue.submit_decision(first.request_id, "approve")
+        payload = command.resume["int-batch"]
+        # decisions follow ACTION order (the L0 middleware consumes positionally)
+        assert [decision["type"] for decision in payload["decisions"]] == [
+            "approve",
+            "reject",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Issue #26 — reinstate/acknowledge lifecycle of a completed group.
+# ---------------------------------------------------------------------------
+
+
+class TestReinstateOnFailedResume:
+    """A failed resume invocation keeps the interrupt answerable (Issue #26)."""
+
+    async def test_reinstate_reenqueues_all_actions_with_fresh_ids(self) -> None:
+        queue, calls = _recording_queue()
+        queue.refresh(_batched_snapshot())
+        first, second = queue.pending()
+        await queue.submit_decision(first.request_id, "approve")
+        await queue.submit_decision(second.request_id, "reject")
+        assert queue.pending() == ()
+        reinstated = queue.reinstate(first.request_id)  # a retired id still resolves
+        assert [request.tool for request in reinstated] == ["http_get", "http_post"]
+        assert queue.pending() == reinstated
+        assert [request.request_id for request in reinstated] != [first.request_id, second]
+        decisions = [entry for kind, entry in calls if kind == "OperatorDecision"]
+        assert len(decisions) == 2  # the failed attempt stays in the audit trail
+        with pytest.raises(ValueError, match="no reinstatable"):
+            queue.reinstate(first.request_id)  # already reinstated
+
+    async def test_acknowledge_resume_drops_the_group(self) -> None:
+        queue, _calls = _recording_queue()
+        queue.refresh(_batched_snapshot())
+        first, second = queue.pending()
+        await queue.submit_decision(first.request_id, "approve")
+        await queue.submit_decision(second.request_id, "approve")
+        queue.acknowledge_resume(first.request_id)
+        with pytest.raises(ValueError, match="no reinstatable"):
+            queue.reinstate(second.request_id)
+
+    async def test_reinstate_unknown_id_rejected(self) -> None:
+        queue, _calls = _recording_queue()
+        with pytest.raises(ValueError, match="no reinstatable"):
+            queue.reinstate("apr-9999")
+
+
+# ---------------------------------------------------------------------------
+# Issue #23 — the builders default to the documented session mode.
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultMode:
+    """An omitted ``mode`` must not select the fail-open direction (Issue #23)."""
+
+    def test_default_mode_is_interactive(self) -> None:
+        default = build_interrupt_config("yolo", _CLASSES)
+        interactive = build_interrupt_config("yolo", _CLASSES, mode="interactive")
+        mission = build_interrupt_config("yolo", _CLASSES, mode="mission")
+        assert default == interactive  # the documented session default
+        assert default != mission
+        assert default["verify_probe"] is not False  # the interactive floor applies
+        assert mission["verify_probe"] is False  # mission keeps the profile matrix
+
+    def test_session_view_default_mode_is_interactive(self) -> None:
+        default = build_session_interrupt_config("yolo", _CLASSES)
+        interactive = build_session_interrupt_config("yolo", _CLASSES, mode="interactive")
+        assert default == interactive
+        assert default.orchestrator["verify_probe"] is not False

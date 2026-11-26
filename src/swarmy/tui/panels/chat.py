@@ -70,7 +70,7 @@ class ChatPanel(Vertical):
             self.target = "orchestrator"
         index = live.index(self.target)
         self.target = live[(index + 1) % len(live)]
-        self.border_title = f"Chat — inspecting: {self.target}"
+        self.border_title = f"Chat — inspecting: {escape(self.target)}"
         return self.target
 
     def refresh_state(self, state: TuiState, view: SessionView) -> None:
@@ -100,6 +100,13 @@ class ChatPanel(Vertical):
                     else str(payload)
                 )
                 lines.append(("operator>", digest))
-        if state.last_reply:
+        if state.replies:
+            # Issue #47: the transcript keeps the whole orchestrator dialog
+            # (bounded by TuiState.replies), not only the latest reply.
+            for reply in state.replies:
+                lines.append(("orchestrator>", reply))
+        elif state.last_reply:
             lines.append(("orchestrator>", state.last_reply))
+        for error in state.system_errors:
+            lines.append(("system>", error))
         return lines

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from swarmy.guardrails import dsl
 from swarmy.guardrails.dsl import (
     GuardrailsDslError,
     load_module_guardrails,
@@ -135,6 +136,200 @@ def test_invalid_regex_rejected_at_validation() -> None:
         )
     messages = [problem.message for problem in excinfo.value.problems]
     assert any("url_matches does not compile" in message for message in messages)
+
+
+def test_catastrophic_nested_quantifier_rejected() -> None:
+    """A group carrying a quantifier, quantified unboundedly, is rejected (F-10)."""
+    with pytest.raises(GuardrailsDslError) as excinfo:
+        parse_module_guardrails(
+            "rules:\n"
+            "  - id: redos\n"
+            "    applies_to: [\"http_get\"]\n"
+            "    condition:\n"
+            '      any_param_matches: "(a+)+b"\n'
+            "    action: block\n"
+            "    severity: low\n"
+            "    message: m\n"
+        )
+    assert any("catastrophic" in p.message for p in excinfo.value.problems)
+
+
+def test_bounded_outer_quantifier_over_ambiguous_group_rejected() -> None:
+    """``(a+){15}`` is the same split-point blow-up as ``(a+)+`` — rejected.
+
+    A bounded outer quantifier over a group whose inner quantifier applies
+    to a single ambiguous token multiplies the split points (``a+`` x 15);
+    the bound does not make the shape safe.
+    """
+    for pattern in ("(a+){15}", "(.+){15}"):
+        with pytest.raises(GuardrailsDslError) as excinfo:
+            parse_module_guardrails(
+                "rules:\n"
+                "  - id: redos-bounded\n"
+                "    applies_to: [\"http_get\"]\n"
+                "    condition:\n"
+                f'      any_param_matches: "{pattern}"\n'
+                "    action: block\n"
+                "    severity: low\n"
+                "    message: m\n"
+            )
+        assert any("catastrophic" in p.message for p in excinfo.value.problems), pattern
+
+
+def test_bounded_quantifier_over_class_group_still_accepted() -> None:
+    """A bound over a class-quantified run stays valid (no split ambiguity)."""
+    pattern = "^/api(?:/[^/?#]+){3}/tail"
+    guardrails = parse_module_guardrails(
+        "rules:\n"
+        "  - id: bounded-class\n"
+        "    applies_to: [\"http_get\"]\n"
+        "    condition:\n"
+        f'      url_matches: "{pattern}"\n'
+        "    action: block\n"
+        "    severity: low\n"
+        "    message: m\n"
+    )
+    assert guardrails.rules[0].condition.url_matches == pattern
+
+
+def test_oversized_pattern_rejected() -> None:
+    """A regex predicate beyond the 512-character cap is rejected (F-10)."""
+    pattern = "a" * 600
+    with pytest.raises(GuardrailsDslError) as excinfo:
+        parse_module_guardrails(
+            "rules:\n"
+            "  - id: huge\n"
+            "    applies_to: [\"http_get\"]\n"
+            "    condition:\n"
+            f'      url_matches: "{pattern}"\n'
+            "    action: block\n"
+            "    severity: low\n"
+            "    message: m\n"
+        )
+    assert any("pattern limit" in p.message for p in excinfo.value.problems)
+
+
+def test_bounded_group_quantifier_still_accepted() -> None:
+    """The crawler's bounded `(?:/[^/?#]+){6,}` shape stays valid (F-10)."""
+    pattern = "^https?://[^/]+(?:/[^/?#]+){6,}"
+    guardrails = parse_module_guardrails(
+        "rules:\n"
+        "  - id: depth\n"
+        "    applies_to: [\"http_get\"]\n"
+        "    condition:\n"
+        f'      url_matches: "{pattern}"\n'
+        "    action: block\n"
+        "    severity: low\n"
+        "    message: m\n"
+    )
+    assert guardrails.rules[0].condition.url_matches == pattern
+
+
+def _redos_rule_yaml(pattern: str, field: str = "any_param_matches") -> str:
+    """One-rule guardrails.yaml carrying ``pattern`` in ``field``."""
+    return (
+        "rules:\n"
+        "  - id: redos-probe\n"
+        "    applies_to: [\"http_get\"]\n"
+        "    condition:\n"
+        f"      {field}: '{pattern}'\n"
+        "    action: block\n"
+        "    severity: low\n"
+        "    message: m\n"
+    )
+
+
+def test_alternation_ambiguity_rejected() -> None:
+    """``(a|aa)+`` — the canonical alternation-ambiguity blow-up (CWE-1333).
+
+    The parser factors the common prefix into a nested branch; every
+    iteration can take either branch, so the split points multiply
+    exponentially on a failing tail. The retired string-shape heuristic
+    accepted exactly this form.
+    """
+    for pattern in ("(a|aa)+$", "(a|aa)+b", "(?:ab|a)+"):
+        with pytest.raises(GuardrailsDslError) as excinfo:
+            parse_module_guardrails(_redos_rule_yaml(pattern))
+        assert any("catastrophic" in p.message for p in excinfo.value.problems), pattern
+
+
+def test_optional_token_loop_rejected() -> None:
+    """``(\\w?\\s?){5,}`` — the iteration can end without consuming (CWE-1333).
+
+    An optional tail lets the boundary between iterations slide; the
+    retired string-shape heuristic accepted this form too.
+    """
+    for pattern in (r"(\w?\s?){5,}", r"(?:x?)+", r"(a?)+", r"(?:xa?)+"):
+        with pytest.raises(GuardrailsDslError) as excinfo:
+            parse_module_guardrails(_redos_rule_yaml(pattern))
+        assert any("catastrophic" in p.message for p in excinfo.value.problems), pattern
+
+
+def test_overlapping_adjacent_pair_rejected() -> None:
+    """Adjacent variable-width quantifiers sharing characters are rejected.
+
+    ``a+a+`` and group-wrapped variants ``(a*)(a*)`` split one character
+    run between the two quantifiers — the compositions multiply
+    exponentially on a failing tail.
+    """
+    for pattern in ("a+a+", "(a*)(a*)", r"\d+\w+"):
+        with pytest.raises(GuardrailsDslError) as excinfo:
+            parse_module_guardrails(_redos_rule_yaml(pattern))
+        assert any("catastrophic" in p.message for p in excinfo.value.problems), pattern
+
+
+def test_catastrophic_shape_inside_lookahead_rejected() -> None:
+    """A catastrophic shape inside a lookahead is re-evaluated per position."""
+    with pytest.raises(GuardrailsDslError) as excinfo:
+        parse_module_guardrails(_redos_rule_yaml(r"(?:(?=a+a+)x)+"))
+    assert any("catastrophic" in p.message for p in excinfo.value.problems)
+
+
+def test_pinned_and_atomic_loops_still_accepted() -> None:
+    """The proven-safe loop families stay valid.
+
+    Delimiter-pinned runs (the crawler shape), atomic and possessive
+    inner quantifiers (the engine cannot backtrack into them),
+    fixed-width iterations, and disjoint mandatory seams all pass.
+    """
+    accepted = (
+        r"(?:/ab+){2,}",
+        r"(?:a+b+)+",
+        r"(?:a?x)+",
+        r"(?:a{2})+",
+        r"(?>a+)+",
+        r"(?:xa++)+",
+        r"\s+\w+",
+        r"a*b+",
+        r"https?://[^\s]+",
+    )
+    for pattern in accepted:
+        guardrails = parse_module_guardrails(_redos_rule_yaml(pattern))
+        assert guardrails.rules[0].condition.any_param_matches == pattern, pattern
+
+
+def test_unanalyzable_pattern_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parse-tree failure rejects the pattern instead of accepting it.
+
+    The pattern compiles, but if the internal tree API changed between
+    interpreter versions the safe verdict is rejection — the predicate
+    would run over untrusted argument trees on every tool call.
+    """
+    class _ExplodingParser:
+        """Stub standing in for ``re._parser`` (test seam)."""
+
+        def parse(self, pattern: str) -> list[object]:
+            del pattern
+            raise re.error("internal tree API changed")
+
+    monkeypatch.setattr(dsl, "_RE_PARSER", _ExplodingParser())
+    with pytest.raises(GuardrailsDslError) as excinfo:
+        parse_module_guardrails(_redos_rule_yaml("(a)+b"))
+    assert any(
+        "could not be statically analyzed" in p.message for p in excinfo.value.problems
+    )
 
 
 def test_duplicate_rule_ids_rejected() -> None:

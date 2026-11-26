@@ -21,7 +21,14 @@ operator-only via HITL.
 ``tool_args_digest`` routes the deterministic JSON serialization of the
 arguments through the ``ContextProjector`` (T2.3.2, RD-4 closed): operator
 secrets are masked and the §6.8 budget/normalization steps run before the
-digest is stored, so the journal never carries a verbatim secret.
+digest is stored, so the journal never carries a verbatim secret. The same
+projection covers the deny feedback and the journaled ``reason``: invariant
+reasons embed raw tool-argument URLs, and the deny ``ToolMessage`` bypasses
+the post-tool-call ``ProjectorMiddleware`` (a deny short-circuits the
+handler), so ``GuardrailMiddleware`` projects the feedback itself and the
+sink payload's ``reason`` is projected exactly like the digest (arch §16.4,
+§6.8; Issue #39). Argument trees above :data:`MAX_ARGS_SCAN_BYTES` are
+denied before any rule regex scans them (F-10, CWE-1333).
 
 Assembly (arch §6.5): each ``GuardrailMiddleware`` instance carries the full
 layer set of its agent — subagent: invariants + engine + the module's own
@@ -41,7 +48,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Final, NamedTuple, Protocol
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
@@ -61,6 +68,8 @@ from swarmy.guardrails.models import (
 from swarmy.tools.projector import ContextProjector
 
 if TYPE_CHECKING:
+    import asyncio
+
     from langgraph.prebuilt.tool_node import ToolCallRequest
     from langgraph.types import Command
 
@@ -93,12 +102,35 @@ class JudgeBand(Protocol):
         """
         ...
 
+    def postcall(
+        self, tool_name: str, result_text: str, args_digest: str
+    ) -> asyncio.Task[None] | None:
+        """Spawn the off-path post-call result screen (T3.4.2, #54 ↔ F-19).
+
+        Called by the middleware **after** the tool executed, on its result
+        text: a hit on an instruction-like pattern spawns the judge task
+        (flag note or class-gate escalation off the execution path). The
+        caller never awaits the returned task — post-call analysis never
+        blocks or fails execution; ``None`` means "nothing suspicious" (or
+        the band does not apply to the tool). ``args_digest`` is the §6.8
+        projection the middleware computed for the executed call (Issue #49).
+        """
+        ...
+
 #: Projector used when a pipeline is built without an explicit one (tests,
 #: pure evaluation): default conservative budgets, built-in masking
 #: detectors, no injected operator secrets (they arrive with the session
 #: wiring, T3.1.1). Untrusted marking stays on — arguments may echo
 #: target-derived content.
 _DIGEST_PROJECTOR = ContextProjector()
+
+#: Guardrail scan budget (F-10, CWE-1333): argument trees whose serialized
+#: size exceeds this cap are denied by the pipeline itself *without* running
+#: any rule regex over them. A model-authored multi-hundred-KB argument
+#: shaped to a quadratic worst case could otherwise stall the regex of every
+#: rule of every layer on every call — ReDoS pressure on the operator
+#: workstation while no budget event explains the stall.
+MAX_ARGS_SCAN_BYTES: Final[int] = 262_144
 
 #: Argument keys that carry the request URL of an HTTP tool.
 _URL_ARG_KEYS: frozenset[str] = frozenset({"url", "base_url"})
@@ -383,8 +415,25 @@ class GuardrailPipeline:
 
         Returns:
             ``Verdict.ALLOW`` or ``Verdict.BLOCK`` with the denying layer's
-            feedback (judge verdicts arrive with P3.4, RD-2).
+            feedback (judge verdicts arrive with P3.4, RD-2). Arguments
+            above :data:`MAX_ARGS_SCAN_BYTES` are denied by the scan-size
+            cap (``invariant:args-scan-size-cap``) before any rule regex
+            runs over them (F-10).
         """
+        size = _serialized_size(tool_args)
+        if size > MAX_ARGS_SCAN_BYTES:  # F-10: cap the regex scan surface
+            return EvaluationResult(
+                verdict=Verdict.BLOCK,
+                feedback=BlockedFeedback(
+                    rule_id="invariant:args-scan-size-cap",
+                    layer="invariant",
+                    reason=(
+                        f"tool arguments exceed the guardrail scan budget "
+                        f"({size} > {MAX_ARGS_SCAN_BYTES} bytes); the call is "
+                        "denied without rule evaluation"
+                    ),
+                ),
+            )
         feedback = self._invariants.evaluate(tool_name, tool_args)  # layer 1
         if feedback is None and self._engine_enabled:  # layer 2
             feedback = _first_denial(self._engine_rules, "engine", tool_name, tool_args)
@@ -440,11 +489,54 @@ class GuardrailPipeline:
                     tool_name=tool_name,
                     rule_id=result.feedback.rule_id,
                     layer=result.feedback.layer,
-                    reason=result.feedback.reason,
+                    # The reason embeds raw tool-argument URLs (invariant
+                    # scope denials quote the URL verbatim): it is projected
+                    # exactly like tool_args_digest so the journal row never
+                    # carries an unmasked secret (arch §5.5, §12.3; Issue #39).
+                    reason=self._projector.project(result.feedback.reason),
                     tool_args_digest=tool_args_digest(tool_args, self._projector),
                 )
             )
         return result
+
+    def spawn_postcall(
+        self, tool_name: str, tool_args: Mapping[str, object], result_text: str
+    ) -> None:
+        """Fire-and-forget the post-call judge screen (T3.4.2, #54 ↔ F-19).
+
+        Invoked by the middleware after a tool **executed**, with its §6.8-
+        projected result text. Computes the call's ``tool_args_digest`` here
+        (Issue #49 — judge-band rows carry the same projected digest as the
+        deterministic rows) and hands everything to the band, which never
+        blocks the caller: this method swallows any synchronous failure of
+        the screen itself (a broken screen must not turn an executed,
+        allowed call into an error) and returns without awaiting the spawned
+        task.
+        """
+        if self._judge_band is None:
+            return
+        try:
+            self._judge_band.postcall(
+                tool_name, result_text, tool_args_digest(tool_args, self._projector)
+            )
+        except Exception:  # pragma: no cover - defensive: screen never breaks execution
+            return
+
+
+def _tool_message_text(message: ToolMessage) -> str:
+    """Extract the screenable text of a tool result (string or content blocks)."""
+    content = message.content
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, Mapping):
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
 
 
 class GuardrailMiddleware(AgentMiddleware):
@@ -456,11 +548,25 @@ class GuardrailMiddleware(AgentMiddleware):
     handler skips the tool — exactly the violation semantics of spec §8.5.
     """
 
-    __slots__ = ("_pipeline",)
+    __slots__ = ("_pipeline", "_projector")
 
-    def __init__(self, pipeline: GuardrailPipeline) -> None:
-        """Bind the pipeline carrying this agent's full layer set."""
+    def __init__(
+        self, pipeline: GuardrailPipeline, projector: ContextProjector | None = None
+    ) -> None:
+        """Bind the pipeline and the projector sanitizing the deny feedback.
+
+        Args:
+            pipeline: the pipeline carrying this agent's full layer set.
+            projector: the session projector (§6.8) applied to the deny
+                feedback text before it becomes the ``ToolMessage`` content —
+                a deny short-circuits the handler, so the inner
+                ``ProjectorMiddleware`` never sees the feedback, while
+                invariant reasons embed raw tool-argument URLs (arch §16.4,
+                Issue #39). ``None`` uses the module default (conservative
+                budgets, built-in masking detectors).
+        """
         self._pipeline = pipeline
+        self._projector = projector if projector is not None else _DIGEST_PROJECTOR
 
     async def awrap_tool_call(
         self,
@@ -487,10 +593,19 @@ class GuardrailMiddleware(AgentMiddleware):
             and result.feedback is not None
         ):
             return ToolMessage(
-                content=blocked_feedback_text(result.feedback),
+                # Projected here, not by the inner ProjectorMiddleware: the
+                # deny returns before the handler runs, so the post-tool-call
+                # hook never sees this message (Issue #39, arch §16.4).
+                content=self._projector.project(blocked_feedback_text(result.feedback)),
                 tool_call_id=str(tool_call.get("id", "")),
             )
-        return await handler(request)
+        outcome = await handler(request)
+        if isinstance(outcome, ToolMessage):
+            # T3.4.2 / #54 ↔ F-19: the executed result goes through the
+            # post-call judge screen off the execution path (fire-and-forget;
+            # the screen never alters the already-executed call's outcome).
+            self._pipeline.spawn_postcall(tool_name, tool_args, _tool_message_text(outcome))
+        return outcome
 
     def wrap_tool_call(
         self,
@@ -518,6 +633,7 @@ class GuardrailMiddleware(AgentMiddleware):
 
 
 __all__ = [
+    "MAX_ARGS_SCAN_BYTES",
     "BlockedSink",
     "EvaluationResult",
     "GuardrailMiddleware",

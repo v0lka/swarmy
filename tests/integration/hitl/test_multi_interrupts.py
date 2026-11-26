@@ -24,7 +24,7 @@ from langchain_core.messages import AIMessage
 from swarmy.core.config import ScopeEntries, SessionConfig, TargetConfig
 from swarmy.core.session import Session
 from tests.helpers.agent_modules import make_module
-from tests.helpers.fake_models import ScriptedChatModel, final_reply
+from tests.helpers.fake_models import ScriptedChatModel, final_reply, task_call
 
 pytestmark = pytest.mark.integration
 
@@ -131,3 +131,69 @@ class TestMultiInterrupts:
         )
         completed = await session.reader.by_type("TaskCompleted")
         assert len(completed) == 2
+
+
+class TestSingleTurnMultiCall:
+    """Issue #25 (integration, option c): one turn, two gated calls, one interrupt.
+
+    A subagent issuing two verify-class calls in ONE assistant turn raises a
+    single *batched* L0 interrupt (``HITLRequest`` with two ``action_requests``
+    — the pinned default ``interrupt_mode="batched"``). The queue expands it
+    into two per-action entries and resumes only when both are decided, each
+    decision carrying its own action's tool name and edited args.
+    """
+
+    async def test_batched_interrupt_served_per_action(self, tmp_path: Path) -> None:
+        agents = tmp_path / "agents"
+        make_module(
+            agents, "verifier_x", description="Verify X (fixture).",
+            prompt="You are verifier_x: run your `verify_thing` tool once, then report.",
+            risk="verify", tool_name="verify_thing",
+        )
+        model = ScriptedChatModel(
+            scripts={
+                "orchestrator": [
+                    task_call("verify x twice", "verifier_x", "call-x"),
+                    final_reply("delegation finished"),
+                ],
+                "verifier_x": [
+                    _ai([_verify_call("vx1"), _verify_call("vx2")]),  # ONE turn, two calls
+                    final_reply("x verified"),
+                ],
+            },
+            fallback_reply="done",
+        )
+        config = SessionConfig(
+            target=TargetConfig(base_url="http://127.0.0.1:9/"),
+            scope=ScopeEntries(ip_subnets=["127.0.0.1/32"], schemes=["http"]),
+            agents_dirs=[str(agents)],
+            profile="normal",
+        )
+        session = await Session.open(config=config, session_dir=tmp_path / "s", model=model)
+        try:
+            await session.runtime.run_step("verify both")
+            approvals = session.approvals
+            pending = approvals.pending()
+            assert len(pending) == 2, "the batched interrupt must expand per action"
+            assert {request.tool for request in pending} == {"verify_thing"}
+            assert len({request.interrupt_id for request in pending}) == 1
+            assert len({request.request_id for request in pending}) == 2
+            first, second = pending
+
+            # The first decision alone must not resume the turn yet.
+            await session.runtime.submit_decision(first.request_id, "approve")
+            assert len(approvals.pending()) == 1
+            completed = await session.reader.by_type("TaskCompleted")
+            assert completed == []  # the batched turn is still held
+
+            # The edit decision stays on ITS action and completes the group.
+            await session.runtime.submit_decision(
+                second.request_id, "edit", edited_args={"message": "rewritten"}
+            )
+            decisions = await session.reader.by_type("OperatorDecision")
+            assert [entry.payload.decision for entry in decisions] == ["approve", "edit"]
+            completed = await session.reader.by_type("TaskCompleted")
+            assert len(completed) == 1, "the last decision resumed the batched turn"
+            assert approvals.pending() == ()
+        finally:
+            await session.close()

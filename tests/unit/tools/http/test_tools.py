@@ -73,7 +73,7 @@ async def test_out_of_scope_get_returns_feedback_not_exception(
     feedback = await tool(url="http://outside.example.net/")
     assert isinstance(feedback, str)
     assert "invariant guardrail layer" in feedback
-    assert "invariant: scope" in feedback
+    assert "invariant:scope" in feedback
     assert calls == []  # the block happens before any connection
     assert limiter.budget_used == 0  # ...and before the limiter is engaged
     assert event_spy.blocked[0].tool_name == "http_get"
@@ -138,3 +138,26 @@ async def test_duplicate_registration_fails_fast(make_client: ClientFactory, mak
     with pytest.raises(ToolRegistryError) as excinfo:
         register_http_tools(registry, client)
     assert any("duplicate tool name" in problem for problem in excinfo.value.problems)
+
+
+async def test_platform_http_tool_sets_move_together(
+    make_client: ClientFactory, make_transport: TransportFactory
+) -> None:
+    """Issue #16 guard: the platform HTTP tool-name sets stay identical.
+
+    ``engine_rules._HTTP_TOOL_NAMES`` (layer 2), ``invariants.PLATFORM_HTTP_TOOLS``
+    (layer 1) and the real tools built by ``make_http_tools`` must name exactly
+    the same set — a future wrapper added to one set only would leave the
+    engine rules silently not applying to it while the platform-http invariant
+    denies it (an inconsistent perimeter).
+    """
+    from swarmy.guardrails.engine_rules import _HTTP_TOOL_NAMES
+    from swarmy.guardrails.invariants import PLATFORM_HTTP_TOOLS
+    from swarmy.tools.http.tools import _RISK_BY_TOOL, make_http_tools
+
+    calls: list[httpx.Request] = []
+    client = make_client(transport=make_transport({}, calls))
+    tools = make_http_tools(client)
+    assert frozenset(_HTTP_TOOL_NAMES) == PLATFORM_HTTP_TOOLS
+    assert frozenset(_HTTP_TOOL_NAMES) == frozenset(tools)
+    assert frozenset(_HTTP_TOOL_NAMES) == frozenset(_RISK_BY_TOOL)

@@ -105,8 +105,8 @@ def test_batch_registration_aggregates_problems_across_specs() -> None:
     assert len(registry) == 1  # atomic: nothing inserted on failure
 
 
-def test_risk_class_from_attribute_with_passive_default() -> None:
-    """AC (T1.5.1, AD-7): ``swarmy_risk_class`` wins; missing attribute → passive."""
+def test_risk_class_from_attribute_with_most_gated_default() -> None:
+    """AC (T1.5.1, AD-7 + F-3/ASI02): declared wins; undeclared module tool → destructive."""
     registry = ToolRegistry()
     verify_tool = _probe()
     verify_tool.swarmy_risk_class = RiskClass.VERIFY
@@ -116,12 +116,15 @@ def test_risk_class_from_attribute_with_passive_default() -> None:
         [
             _spec("explicit", fn=verify_tool),
             _spec("string_form", fn=string_tool),
-            _spec("defaulted", fn=_probe()),
+            _spec("defaulted", fn=_probe()),  # module-owned: most gated (F-3)
+            _spec("platform_defaulted", fn=_probe(), owner=PLATFORM_OWNER,
+                  source=BUILTIN_SOURCE),
         ]
     )
     assert registry.entry("explicit").risk_class is RiskClass.VERIFY
     assert registry.entry("string_form").risk_class is RiskClass.DESTRUCTIVE
-    assert registry.entry("defaulted").risk_class is RiskClass.PASSIVE
+    assert registry.entry("defaulted").risk_class is RiskClass.DESTRUCTIVE
+    assert registry.entry("platform_defaulted").risk_class is RiskClass.PASSIVE
 
 
 def test_explicit_spec_override_beats_attribute() -> None:
@@ -176,9 +179,9 @@ def test_duplicate_within_one_batch_is_reported() -> None:
 
 
 def test_risk_class_of_helper() -> None:
-    """``risk_class_of`` resolves the attribute with the passive default (AD-7)."""
+    """``risk_class_of`` resolves the attribute; undeclared → destructive (F-3/ASI02)."""
     plain = _probe()
-    assert risk_class_of(plain) is RiskClass.PASSIVE
+    assert risk_class_of(plain) is RiskClass.DESTRUCTIVE
     marked = _probe()
     marked.swarmy_risk_class = RiskClass.NETWORK_WRITE
     assert risk_class_of(marked) is RiskClass.NETWORK_WRITE

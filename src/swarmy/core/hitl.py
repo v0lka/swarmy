@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Final, Literal, TypeAlias
+from typing import TYPE_CHECKING, Final, Literal, NamedTuple, TypeAlias
 
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
@@ -88,8 +88,15 @@ _PROFILE_GATES: Final[Mapping[StrictnessProfile, frozenset[RiskClass]]] = {
 #: The verify/destructive floor the ``interactive`` mode gates regardless of
 #: the profile (arch §7.2 bottom, spec §5.5: significant forks are launching a
 #: vulnerability-class test run and verification). A ``yolo`` *mission* run
-#: stays destructive-only; a ``yolo`` *interactive* run still gates
-#: verify-class calls and the designated decision points.
+#: stays destructive-only; a ``yolo`` *interactive* **orchestrator** still
+#: gates verify-class calls and the designated decision points.
+#:
+#: Reach (Issue #51, documented limitation): the floor is layered into the
+#: *orchestrator-graph* gate matrix only — the loader builds each subagent's
+#: ``interrupt_on`` from the profile gates plus module entries and has no
+#: mode parameter, so a ``yolo`` interactive run does NOT extend the floor
+#: into subagent graphs. No shipped tool declares ``verify``/``destructive``
+#: risk classes in v0.1, so nothing binds today; revisit when a module does.
 _INTERACTIVE_CLASS_FLOOR: Final[frozenset[RiskClass]] = frozenset(
     {RiskClass.VERIFY, RiskClass.DESTRUCTIVE}
 )
@@ -110,7 +117,7 @@ def build_interrupt_config(
     profile: StrictnessProfile,
     risk_classes: Mapping[str, RiskClass],
     *,
-    mode: AutonomyMode = "mission",
+    mode: AutonomyMode = "interactive",
     significant_tools: Iterable[str] = (),
     module_overrides: Mapping[str, bool | InterruptOnConfig] | None = None,
     allowed_decisions: Sequence[DecisionType] = ALLOWED_DECISIONS,
@@ -129,9 +136,12 @@ def build_interrupt_config(
     profile (spec §5.5): the verify/destructive class floor
     (:data:`_INTERACTIVE_CLASS_FLOOR`) is gated regardless of the profile,
     and every ``significant_tools`` name (the decision-point markers) is
-    gated regardless of its risk class. ``mode="mission"`` — the default —
-    keeps the pure profile matrix. ``module_overrides`` replace the entries
-    of the tools they name (L0 semantics, see :func:`merge_interrupt_config`).
+    gated regardless of its risk class. ``mode="mission"`` keeps the pure
+    profile matrix. The default follows the documented session default
+    (``interactive`` — config.py, arch §9.5; Issue #23): an omitted ``mode``
+    must not silently select the *less* restrictive gate matrix.
+    ``module_overrides`` replace the entries of the tools they name (L0
+    semantics, see :func:`merge_interrupt_config`).
 
     The result feeds ``create_deep_agent(interrupt_on=...)`` directly (the L0
     parameter type is ``dict[str, bool | InterruptOnConfig]``; user entries
@@ -145,7 +155,9 @@ def build_interrupt_config(
             class is authored with the tool, never inferred).
         mode: autonomy mode; ``interactive`` layers the class floor and the
             significant-fork decision points over the profile, ``mission``
-            keeps profile gates only (default).
+            keeps profile gates only. Defaults to the documented session
+            default ``interactive`` (Issue #23: the previous ``"mission"``
+            default was the fail-open direction).
         significant_tools: tool names ``interactive`` gates as significant
             forks (e.g. ``update_finding_status``, verification HTTP calls);
             injectable so call sites stay in control; ignored by ``mission``.
@@ -246,7 +258,7 @@ def build_session_interrupt_config(
     profile: StrictnessProfile,
     tool_risk_classes: Mapping[str, RiskClass],
     *,
-    mode: AutonomyMode = "mission",
+    mode: AutonomyMode = "interactive",
     significant_tools: Iterable[str] = (),
     module_overrides: Mapping[str, Mapping[str, bool | InterruptOnConfig]] | None = None,
     allowed_decisions: Sequence[DecisionType] = ALLOWED_DECISIONS,
@@ -264,10 +276,11 @@ def build_session_interrupt_config(
     Args:
         profile: strictness profile (arch §7.2).
         tool_risk_classes: registered tool name → declared risk class (AD-7).
-        mode: autonomy mode (arch §7.2): ``mission`` — the default — keeps
-            the pure profile matrix; ``interactive`` additionally gates the
-            verify/destructive class floor and the ``significant_tools``
-            decision points regardless of the profile.
+        mode: autonomy mode (arch §7.2): ``mission`` keeps the pure profile
+            matrix; ``interactive`` additionally gates the verify/destructive
+            class floor and the ``significant_tools`` decision points
+            regardless of the profile. Defaults to the documented session
+            default ``interactive`` (Issue #23).
         significant_tools: decision-point tool names ``interactive`` gates
             (e.g. vulnerability-class test runs, verification, scope
             changes); ignored by ``mission``.
@@ -320,44 +333,107 @@ def default_args_digest(args: Mapping[str, object]) -> str:
     return text
 
 
-def _tool_and_args(value: object) -> tuple[str, dict[str, object]]:
-    """Read ``(tool, args)`` out of one L0 interrupt value (arch §7.3).
+class _ActionRecord(NamedTuple):
+    """One gated call of an interrupt with its display facts (arch §7.3)."""
 
-    ``per_call`` interrupts carry the ``ToolApprovalRequest`` TypedDict
-    (``name``/``args`` — human_in_the_loop.py); ``batched`` interrupts carry a
-    ``HITLRequest`` whose ``action_requests`` list is flattened for display,
-    because the queue addresses one interrupt per request. Unknown shapes
-    degrade to ``("unknown", {})`` instead of raising — an operator must stay
-    able to see and answer a request even if L0 changes its payload.
+    tool: str
+    args_digest: str
+    origin: ApprovalOrigin
+    rule_or_profile: str
+
+
+class _InterruptGroup:
+    """Per-action decision bookkeeping of one L0 interrupt (arch §7.3).
+
+    The L0 HITL middleware runs in its default ``batched`` mode (deepagents
+    0.7.x constructs ``HumanInTheLoopMiddleware`` without ``interrupt_mode``,
+    so one assistant turn with N gated calls raises ONE interrupt whose value
+    is a ``HITLRequest`` with N ``action_requests`` — verified against the
+    pinned langchain source). The queue surfaces each action as its own
+    :class:`ApprovalRequest` (per-call digests/origins, Issue #25) and builds
+    the L0 resume value ``{"decisions": [...]}`` — one decision per action,
+    in action order — once every action of the group is decided. A group with
+    a single action (the ``per_call``/``ToolApprovalRequest`` shape) resumes
+    immediately on its one decision.
+    """
+
+    __slots__ = ("actions", "decisions", "interrupt_id")
+
+    def __init__(self, interrupt_id: str, actions: list[_ActionRecord]) -> None:
+        self.interrupt_id = interrupt_id
+        self.actions = actions
+        self.decisions: dict[int, tuple[ApprovalDecision, Mapping[str, object] | None]] = {}
+
+
+def _group_resume_value(group: _InterruptGroup, interrupt_value: object) -> object:
+    """Build the L0 resume value from the recorded per-action decisions.
+
+    Contract verified against the pinned langchain source: a *batched*
+    interrupt (``HITLRequest`` with an ``action_requests`` list) is answered
+    with ``{"decisions": [...]}`` — one decision object per action request,
+    in action order (the middleware validates the count and consumes
+    decisions positionally; a single-action batched interrupt still demands
+    the decisions list). A *per-call* interrupt (``ToolApprovalRequest`` with
+    ``name``/``args``) is answered with the bare decision object. Each
+    decision carries its own action's tool name and edited args — an operator
+    edit can no longer rewrite a sibling call with foreign arguments
+    (Issue #25). The shape is read from the saved interrupt value, not from
+    the action count: both shapes exist with a single action.
+    """
+    batched = (
+        isinstance(interrupt_value, Mapping)
+        and isinstance(interrupt_value.get("action_requests"), Sequence)
+    )
+    if not batched:
+        decision, edited = group.decisions[0]
+        return _resume_payload(group.actions[0].tool, decision, edited)
+    decisions: list[dict[str, object]] = []
+    for index, action in enumerate(group.actions):
+        decision, edited = group.decisions[index]
+        decisions.append(_resume_payload(action.tool, decision, edited))
+    return {"decisions": decisions}
+
+
+def _action_views(value: object) -> list[tuple[str, dict[str, object]]]:
+    """Split one L0 interrupt value into ``(tool, args)`` per gated call.
+
+    A *per-call* interrupt (``ToolApprovalRequest`` TypedDict with
+    ``name``/``args``) yields one view; a *batched* interrupt (``HITLRequest``
+    with ``action_requests``) yields one view per action request. Unknown
+    shapes degrade to a single ``("unknown", {})`` view instead of raising —
+    an operator must stay able to see and answer a request even if L0 changes
+    its payload.
 
     Args:
         value: the ``Interrupt.value`` payload from the L0 state snapshot.
 
     Returns:
-        Tool name (joined names for a batched request) and its arguments.
+        ``(tool, args)`` pairs, one per gated call of the interrupt.
     """
     if not isinstance(value, Mapping):
-        return "unknown", {}
+        return [("unknown", {})]
     name = value.get("name")
     args = value.get("args")
     if isinstance(name, str) and isinstance(args, Mapping):
-        return name, {str(key): item for key, item in args.items()}
+        return [(name, {str(key): item for key, item in args.items()})]
     requests = value.get("action_requests")
     if isinstance(requests, Sequence):
-        names: list[str] = []
-        first_args: dict[str, object] = {}
+        views: list[tuple[str, dict[str, object]]] = []
         for request in requests:
             if not isinstance(request, Mapping):
+                views.append(("unknown", {}))
                 continue
             request_name = request.get("name")
-            if isinstance(request_name, str):
-                names.append(request_name)
-            if not first_args and isinstance(request.get("args"), Mapping):
-                request_args: Mapping[object, object] = request["args"]
-                first_args = {str(key): item for key, item in request_args.items()}
-        if names:
-            return ", ".join(names), first_args
-    return "unknown", {}
+            request_args = request.get("args")
+            if isinstance(request_name, str) and isinstance(request_args, Mapping):
+                views.append(
+                    (request_name, {str(key): item for key, item in request_args.items()})
+                )
+            else:
+                views.append(("unknown", {}))
+        if views:
+            return views
+    return [("unknown", {})]
 
 
 def _resume_payload(
@@ -382,36 +458,6 @@ def _resume_payload(
         msg = "decision 'edit' requires edited_args"
         raise ValueError(msg)
     return {"type": "edit", "edited_action": {"name": tool, "args": dict(edited_args)}}
-
-
-def _resume_value(
-    interrupt_value: object,
-    decision: ApprovalDecision,
-    edited_args: Mapping[str, object] | None,
-) -> dict[str, object]:
-    """Build the ``Command(resume={interrupt_id: ...})`` value for one interrupt.
-
-    Two L0 shapes exist (``interrupt_mode`` of the HITL middleware): a
-    *batched* interrupt (``HITLRequest`` with an ``action_requests`` list) is
-    answered with ``{"decisions": [...]}`` — one decision per action request,
-    in order; a *per-call* interrupt (``ToolApprovalRequest`` with
-    ``name``/``args``) is answered with the bare decision object. Unknown
-    shapes fall back to the bare object (fail-loud downstream, never silent).
-    """
-    if isinstance(interrupt_value, Mapping):
-        requests = interrupt_value.get("action_requests")
-        if isinstance(requests, Sequence):
-            decisions = []
-            for request in requests:
-                name = (
-                    str(request.get("name"))
-                    if isinstance(request, Mapping) and request.get("name")
-                    else "unknown"
-                )
-                decisions.append(_resume_payload(name, decision, edited_args))
-            return {"decisions": decisions}
-    name = interrupt_value.get("name") if isinstance(interrupt_value, Mapping) else None
-    return _resume_payload(name if isinstance(name, str) else "unknown", decision, edited_args)
 
 
 class ApprovalRequest(BaseModel):
@@ -504,6 +550,16 @@ class ApprovalQueue:
         self._known_interrupt_ids: set[str] = set()
         self._interrupt_values: dict[str, object] = {}
         self._resolvers: dict[str, Callable[[ApprovalDecision], Awaitable[None]]] = {}
+        # Issue #25: batched interrupts expand into one request per action;
+        # the group tracks per-action decisions until all of them are decided.
+        self._groups: dict[str, _InterruptGroup] = {}
+        # Completed groups kept for Issue #26 recovery: a failed resume
+        # invocation re-enqueues them via :meth:`reinstate`; a successful one
+        # drops them via :meth:`acknowledge_resume`.
+        self._completed_groups: dict[str, _InterruptGroup] = {}
+        self._request_group: dict[str, _InterruptGroup] = {}
+        self._request_action: dict[str, int] = {}
+        self._request_interrupt: dict[str, str] = {}
         self._counter = 0
         self._lock = asyncio.Lock()
 
@@ -562,7 +618,11 @@ class ApprovalQueue:
 
         Interrupts already seen (pending or answered) are skipped, so polling
         the same snapshot repeatedly is idempotent and a resume does not
-        re-enqueue answered requests. ``origins``/``rules`` optionally map a
+        re-enqueue answered requests. A batched interrupt (``HITLRequest``
+        with several ``action_requests``) is expanded into one
+        :class:`ApprovalRequest` **per action** (Issue #25): each carries its
+        own digest, origin and label, and the group's resume value is built
+        once every action is decided. ``origins``/``rules`` optionally map a
         tool name to the origin/label of its gate — the runtime derives them
         from the effective config it built (profile vs module override vs mode
         gate); tools without an entry fall back to the constructor defaults.
@@ -580,18 +640,35 @@ class ApprovalQueue:
                 continue
             self._known_interrupt_ids.add(interrupt.id)
             self._interrupt_values[interrupt.id] = interrupt.value
-            tool, args = _tool_and_args(interrupt.value)
-            self._counter += 1
-            request = ApprovalRequest(
-                request_id=f"apr-{self._counter:04d}",
-                interrupt_id=interrupt.id,
-                tool=tool,
-                args_digest=self._digest(args),
-                rule_or_profile=rules_map.get(tool, self._rule_or_profile),
-                origin=origin_map.get(tool, self._origin),
-            )
-            self._pending.append(request)
-            self._by_request_id[request.request_id] = request
+            # Issue #25: a batched L0 interrupt (one assistant turn with N
+            # gated calls) expands into one request per action — per-call
+            # digests/origins/labels instead of one joined-name entry.
+            actions = [
+                _ActionRecord(
+                    tool=tool,
+                    args_digest=self._digest(args),
+                    origin=origin_map.get(tool, self._origin),
+                    rule_or_profile=rules_map.get(tool, self._rule_or_profile),
+                )
+                for tool, args in _action_views(interrupt.value)
+            ]
+            group = _InterruptGroup(interrupt.id, actions)
+            self._groups[interrupt.id] = group
+            for index, action in enumerate(actions):
+                self._counter += 1
+                request = ApprovalRequest(
+                    request_id=f"apr-{self._counter:04d}",
+                    interrupt_id=interrupt.id,
+                    tool=action.tool,
+                    args_digest=action.args_digest,
+                    rule_or_profile=action.rule_or_profile,
+                    origin=action.origin,
+                )
+                self._pending.append(request)
+                self._by_request_id[request.request_id] = request
+                self._request_group[request.request_id] = group
+                self._request_action[request.request_id] = index
+                self._request_interrupt[request.request_id] = interrupt.id
 
     async def refresh_from_config(self, thread_config: object) -> list[ApprovalRequest]:
         """Poll the graph through the injected ``state_reader`` (arch §7.1).
@@ -635,18 +712,20 @@ class ApprovalQueue:
     ) -> Command[str]:
         """Apply one operator decision and resume its interrupt (arch §7.3-7.4).
 
-        Builds the L0 resume payload, journals the step as ``OperatorDecision``
-        *before* returning the resume command (journal-first discipline — a
-        failed append leaves the request pending and retriable), then retires
-        the request. The runtime invokes the returned command
+        Journals the step as an ``OperatorDecision`` *before* any state change
+        (journal-first discipline — a failed append leaves the request pending
+        and retriable), then retires the request and records the per-action
+        decision in its group (Issue #25). A batched interrupt resumes only
+        once **every** action of its group is decided; the built resume value
+        then carries one decision object per action, in action order, each
+        with its own tool name and edited args (verified against the langchain
+        ``human_in_the_loop`` middleware source). A single-action (per-call)
+        interrupt resumes immediately, exactly as before.
+
+        The runtime invokes the returned command
         (``graph.ainvoke(Command(resume=...), config)``) to continue exactly
         the addressed interruption; approve does not cancel guardrails — the
         resumed tool call passes the same ``GuardrailPipeline`` (arch §7.4).
-
-        Resume payload contract: see :func:`_resume_payload` (verified against
-        the langchain ``human_in_the_loop`` middleware source — per-call
-        decisions are TypedDict-shaped objects keyed by interrupt id, not
-        booleans/strings).
 
         Args:
             request_id: id of the pending :class:`ApprovalRequest`.
@@ -656,13 +735,18 @@ class ApprovalQueue:
             graph_runner: optional async sink for the built command (the
                 runtime's ``graph.ainvoke(command, config)`` seam, arch
                 §7.1). The queue never invokes the graph itself; when the
-                runner is injected and the request is interrupt-backed, the
-                command is handed to it after journaling and retirement.
+                runner is injected and the group is complete, the command is
+                handed to it after journaling and retirement. A runner
+                failure re-enqueues the group (:meth:`reinstate`, Issue #26)
+                before re-raising — the interrupt stays answerable.
 
         Returns:
             ``Command(resume={interrupt_id: decision_payload})`` addressing
-            exactly the interrupted tool call (empty resume mapping for
-            external judge requests). The same command is handed to
+            exactly the interrupted call — for a batched group, the L0
+            ``{"decisions": [...]}`` value over the recorded per-action
+            decisions. An empty resume mapping is returned for external judge
+            requests and for partially-decided groups (the remaining actions
+            are still pending). The same command is handed to
             ``graph_runner`` when one is injected.
 
         Raises:
@@ -676,32 +760,123 @@ class ApprovalQueue:
                 f"(pending: {len(self._pending)})"
             )
             raise ValueError(msg)
-        payload = (
-            _resume_value(
-                self._interrupt_values.get(request.interrupt_id),
-                decision,
-                edited_args,
-            )
-            if request.interrupt_id
-            else {}
-        )
+        if decision == "edit" and edited_args is None:
+            # Refused before any journaling or retirement: the request stays
+            # pending and retriable (same contract as the per-call era).
+            msg = "decision 'edit' requires edited_args"
+            raise ValueError(msg)
+        group = self._request_group.get(request_id)
+        action_index = self._request_action.get(request_id)
         edited_digest = (
             self._digest(edited_args) if decision == "edit" and edited_args is not None else None
         )
+        complete = False
         async with self._lock:
             await self._journal_decision(request, decision, edited_digest)
             self._pending.remove(request)
             self._by_request_id.pop(request_id, None)
             resolver = self._resolvers.pop(request_id, None)
+            if group is not None and action_index is not None:
+                # Record the per-action decision (Issue #25): the L0 resume
+                # value is built only once every action of the group is
+                # decided, each with its own tool name and edited args.
+                group.decisions[action_index] = (decision, edited_args)
+                complete = len(group.decisions) == len(group.actions)
+                if complete:
+                    self._groups.pop(group.interrupt_id, None)
+                    self._completed_groups[group.interrupt_id] = group
         if resolver is not None:
             await resolver(decision)
+        if group is None or not complete:
+            # External judge request (no group) or a partially-decided batched
+            # interrupt: nothing to resume yet — the remaining actions keep
+            # their FIFO entries and the last decision triggers the resume.
+            return Command[str](resume={})
         # N subscripted explicitly: the ``resume`` mapping does not constrain
         # Command's TypeVar, and the runtime resume state here is graph state.
-        resume = {request.interrupt_id: payload} if request.interrupt_id else {}
+        resume = {
+            group.interrupt_id: _group_resume_value(
+                group, self._interrupt_values.get(group.interrupt_id)
+            )
+        }
         command = Command[str](resume=resume)
-        if graph_runner is not None and request.interrupt_id:
-            await graph_runner(command)
+        if graph_runner is not None:
+            try:
+                await graph_runner(command)
+            except Exception:
+                # Issue #26: the interrupt is still live in the checkpointed
+                # graph — retire-before-invoke must not orphan it. Re-enqueue
+                # the group so the operator can retry (the journaled decisions
+                # of the failed attempt stay: an honest audit trail).
+                self.reinstate(request_id)
+                raise
         return command
+
+    def reinstate(self, request_id: str) -> tuple[ApprovalRequest, ...]:
+        """Re-enqueue the decided actions of an interrupt (arch §7.3, #26).
+
+        Recovery path for a failed resume invocation: the request group was
+        retired when its last action was decided, but the interrupt is still
+        live in the checkpointed graph — without this, the operator would face
+        an empty approvals queue and no supported way to answer the interrupt
+        again. Every action of the group is re-enqueued with a **fresh**
+        request id (the retired ids stay in the journal's ``OperatorDecision``
+        rows — the retry is a new, honestly-audited attempt), the recorded
+        decisions are discarded, and the group returns to the pending state.
+        A later successful resume must call :meth:`acknowledge_resume` so a
+        consumed interrupt cannot be resurrected.
+
+        Args:
+            request_id: any request id of the group (pending or already
+                retired — the lookup survives retirement).
+
+        Returns:
+            The freshly enqueued requests, in action order.
+
+        Raises:
+            ValueError: the request id is unknown or its group was already
+                acknowledged (the resume succeeded — nothing to reinstate).
+        """
+        interrupt_id = self._request_interrupt.get(request_id)
+        group = self._completed_groups.pop(interrupt_id, None) if interrupt_id else None
+        if group is None:
+            msg = (
+                f"request {request_id!r} has no reinstatable interrupt: either the id "
+                f"is unknown, the group is still pending, or the resume already succeeded"
+            )
+            raise ValueError(msg)
+        group.decisions = {}
+        reinstated: list[ApprovalRequest] = []
+        for index, action in enumerate(group.actions):
+            self._counter += 1
+            request = ApprovalRequest(
+                request_id=f"apr-{self._counter:04d}",
+                interrupt_id=group.interrupt_id,
+                tool=action.tool,
+                args_digest=action.args_digest,
+                rule_or_profile=action.rule_or_profile,
+                origin=action.origin,
+            )
+            self._pending.append(request)
+            self._by_request_id[request.request_id] = request
+            self._request_group[request.request_id] = group
+            self._request_action[request.request_id] = index
+            self._request_interrupt[request.request_id] = group.interrupt_id
+            reinstated.append(request)
+        self._groups[group.interrupt_id] = group
+        return tuple(reinstated)
+
+    def acknowledge_resume(self, request_id: str) -> None:
+        """Drop the completed group record after a successful resume (#26).
+
+        Called by the runtime when the resume invocation returned: the
+        interrupt is consumed, so :meth:`reinstate` must no longer resurrect
+        it. No-op when the request carries no group record (external judge
+        requests, already-acked groups).
+        """
+        interrupt_id = self._request_interrupt.get(request_id)
+        if interrupt_id is not None:
+            self._completed_groups.pop(interrupt_id, None)
 
     async def _journal_decision(
         self,

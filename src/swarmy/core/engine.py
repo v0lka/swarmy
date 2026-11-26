@@ -24,18 +24,23 @@ Responsibilities:
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from deepagents import create_deep_agent
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from swarmy.core.hitl import AutonomyMode, StrictnessProfile, build_interrupt_config
+from swarmy.core.hitl import (
+    ALLOWED_DECISIONS,
+    AutonomyMode,
+    StrictnessProfile,
+    build_interrupt_config,
+)
 from swarmy.guardrails.pipeline import GuardrailMiddleware, GuardrailPipeline
+from swarmy.modules.loader import PLATFORM_TOOL_BUDGET_CLASSES
 from swarmy.tools.projector import ProjectorMiddleware
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
-
     from aiosqlite import Connection as AioConnection
     from langchain.agents.middleware import InterruptOnConfig
     from langchain_core.language_models.chat_models import BaseChatModel
@@ -139,8 +144,12 @@ class Engine:
             tool_registry, profile, mode, significant_tools, module_overrides
         )
         middleware: list[object] = [
-            GuardrailMiddleware(pipeline),
-            ProjectorMiddleware(projector),
+            # The session projector also sanitizes deny feedback inside
+            # GuardrailMiddleware (deny bypasses the inner projector, #39);
+            # the tool-class map applies the §6.8 budgets to HTTP tool
+            # envelopes (#58 ↔ F-6).
+            GuardrailMiddleware(pipeline, projector=projector),
+            ProjectorMiddleware(projector, tool_classes=PLATFORM_TOOL_BUDGET_CLASSES),
             correlation_middleware,
         ]
         graph = cls._compile(
@@ -187,8 +196,8 @@ class Engine:
             tool_registry, profile, mode, significant_tools, module_overrides
         )
         middleware: list[object] = [
-            GuardrailMiddleware(pipeline),
-            ProjectorMiddleware(projector),
+            GuardrailMiddleware(pipeline, projector=projector),
+            ProjectorMiddleware(projector, tool_classes=PLATFORM_TOOL_BUDGET_CLASSES),
             correlation_middleware,
         ]
         self.graph = self._compile(
@@ -221,6 +230,57 @@ class Engine:
         )
 
     @staticmethod
+    def _normalize_subagent_gates(
+        subagents: Sequence[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Restrict every subagent gate to the swarmy decision set (Issue #60).
+
+        The loader emits plain ``True`` entries per tool (the manifest's
+        ``interrupt_on`` map is bool-typed); in langchain's HITL middleware a
+        ``True`` entry enables the *default* decision set — which includes
+        the L0 ``respond`` decision the platform deliberately does not offer
+        (arch §7.2: operator feedback rides ``reject``/``edit`` payloads,
+        never a synthetic answer). Each ``True`` entry is rewritten as an
+        ``InterruptOnConfig`` offering exactly :data:`ALLOWED_DECISIONS`,
+        mirroring the orchestrator matrix; explicit dict entries keep their
+        shape but never offer ``respond``. ``False`` passes through.
+
+        Args:
+            subagents: the loaded ``SubAgent`` dicts (loader output).
+
+        Returns:
+            Copies with normalized ``interrupt_on`` entries (inputs untouched).
+        """
+        normalized: list[dict[str, object]] = []
+        for subagent in subagents:
+            gates = subagent.get("interrupt_on")
+            if not isinstance(gates, Mapping) or not gates:
+                normalized.append(dict(subagent))
+                continue
+            rewritten: dict[str, object] = {}
+            for tool_name, entry in gates.items():
+                if entry is True:
+                    rewritten[str(tool_name)] = {
+                        "allowed_decisions": list(ALLOWED_DECISIONS),
+                        "description": (
+                            f"Tool {tool_name!r} requires operator approval "
+                            "(module-declared gate)."
+                        ),
+                    }
+                elif isinstance(entry, Mapping):
+                    config_entry: dict[str, object] = dict(entry)
+                    decisions = config_entry.get("allowed_decisions")
+                    if isinstance(decisions, list) and "respond" in decisions:
+                        config_entry["allowed_decisions"] = [
+                            item for item in decisions if item != "respond"
+                        ]
+                    rewritten[str(tool_name)] = config_entry
+                else:
+                    rewritten[str(tool_name)] = entry
+            normalized.append({**subagent, "interrupt_on": rewritten})
+        return normalized
+
+    @staticmethod
     def _compile(
         *,
         model: str | BaseChatModel | None,
@@ -241,7 +301,9 @@ class Engine:
             model=model,
             system_prompt=system_prompt,
             tools=list(orchestrator_tools),
-            subagents=list(subagents),  # ty: ignore[invalid-argument-type]
+            subagents=Engine._normalize_subagent_gates(
+                list(subagents)
+            ),  # ty: ignore[invalid-argument-type]
             middleware=middleware,  # ty: ignore[invalid-argument-type]
             interrupt_on=interrupt_config,
             checkpointer=AsyncSqliteSaver(checkpointer_connection),

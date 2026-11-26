@@ -32,13 +32,38 @@ HttpMethod = Literal["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
 EvidenceDepth = Literal["request", "request_response"]
 
 
+class HopRecord(BaseModel):
+    """Raw traffic exchanged on one manual redirect hop (arch §6.2, Issue #42).
+
+    Byte-for-byte what the client put on the wire and read back on that hop —
+    the request as rewritten by the redirect (``_hop_method``) and the
+    response received before the next hop. Recorded under
+    ``evidence/<request_id>/hop-<n>/`` so the stored evidence of a redirect
+    chain covers every exchanged pair; the response body is already capped by
+    the session reader (arch §6.4).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: 1-based hop number (``hop-1`` is the first exchange of the call).
+    hop: int = Field(ge=1)
+    request_head: bytes
+    request_body: bytes
+    response_head: bytes
+    response_body: bytes
+    response_truncated: bool = False
+    response_dropped_bytes: int | None = None
+
+
 class RequestSpec(BaseModel):
     """One outbound HTTP call of the platform client (arch §6.2).
 
     Secrets are passed **by name** from ``secrets.yaml`` through the session
     wiring — a raw credential must never be typed into tool arguments (arch
-    §12.3). The body byte limit is enforced by the limiter side
-    (``max_body_bytes``), not by the spec.
+    §12.3). The spec itself carries no size field: the *client* denies a
+    request body beyond the session ``max_body_bytes`` before the first hop
+    (arch invariant 7, Issue #31), and the response side is capped by the
+    client's reader at the same threshold.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -77,6 +102,7 @@ class ResponseRecord(BaseModel):
 
 __all__ = [
     "EvidenceDepth",
+    "HopRecord",
     "HttpMethod",
     "RequestSpec",
     "ResponseRecord",

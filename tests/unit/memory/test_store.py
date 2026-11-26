@@ -9,6 +9,7 @@ asserted implicitly by having no event/emit machinery involved at all.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING
 
@@ -37,7 +38,7 @@ from swarmy.memory.models import (
 )
 from swarmy.memory.schema import MIGRATIONS
 from swarmy.memory.search import Fts5SearchIndex
-from swarmy.memory.store import MemoryStore
+from swarmy.memory.store import MemoryStore, MemoryStoreBusy
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -343,6 +344,36 @@ async def test_add_fact_roundtrip(
     assert await _count(conn, "facts") == 1
 
 
+async def test_list_facts_returns_the_full_ledger_in_row_order(
+    memory_env: tuple[MemoryStore, aiosqlite.Connection, Database],
+) -> None:
+    """list_facts reads every row of one subject in insertion order.
+
+    A ranked/limited search result would truncate a long ledger
+    arbitrarily — the machine-readable ledger replay (judge class gates,
+    §6.7) needs the complete, deterministically ordered domain read.
+    """
+    store, _conn, _db = memory_env
+    for index in range(4):
+        await store.add_fact(
+            FactDraft(
+                subject="judge_class_gate",
+                predicate="network-write",
+                obj="escalate" if index % 2 == 0 else "reject",
+                tags=[f"gate:{index}"],
+                source="swarmy/judge",
+            )
+        )
+    await store.add_fact(
+        FactDraft(subject="other", predicate="p", obj="o", tags=[], source="s")
+    )
+    ledger = await store.list_facts("judge_class_gate")
+    assert [fact.tags[0] for fact in ledger] == ["gate:0", "gate:1", "gate:2", "gate:3"]
+    assert [fact.obj for fact in ledger] == ["escalate", "reject", "escalate", "reject"]
+    assert all(isinstance(fact, Fact) for fact in ledger)
+    assert await store.list_facts("nothing-here") == []
+
+
 async def test_add_note_roundtrip(
     memory_env: tuple[MemoryStore, aiosqlite.Connection, Database],
 ) -> None:
@@ -405,3 +436,119 @@ async def test_search_delegates_to_index(
     assert hits
     assert hits[0].entity_type is SearchableEntity.ENDPOINTS
     assert await store.search("zzzqqq") == []
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle enforcement (#12), ref validation (#63), transaction retry (#53).
+# ---------------------------------------------------------------------------
+
+
+async def test_update_finding_status_rejects_demotion_and_terminal_states(
+    memory_env: tuple[MemoryStore, aiosqlite.Connection, Database],
+) -> None:
+    """Only the documented lifecycle transitions pass (#12, RD-5).
+
+    ``verified -> candidate`` is a demotion; a ``rejected`` finding is
+    terminal. The error names current and target statuses so the agent can
+    self-correct.
+    """
+    store, _conn, _db = memory_env
+    finding = await store.save_finding(_FINDING_DRAFT)
+    verified = await store.update_finding_status(finding.id, FindingStatus.VERIFIED)
+    assert verified.status is FindingStatus.VERIFIED
+    with pytest.raises(ValueError, match=r"invalid finding status transition verified -> candidate"):
+        await store.update_finding_status(finding.id, FindingStatus.CANDIDATE)
+    rejected = await store.update_finding_status(finding.id, FindingStatus.REJECTED)
+    assert rejected.status is FindingStatus.REJECTED
+    for target in (FindingStatus.CANDIDATE, FindingStatus.VERIFIED):
+        with pytest.raises(
+            ValueError, match=rf"invalid finding status transition rejected -> {target.value}"
+        ):
+            await store.update_finding_status(finding.id, target)
+    assert [f.id for f in await store.list_findings(status=FindingStatus.REJECTED)] == [
+        finding.id
+    ]
+
+
+async def test_update_finding_status_same_status_updates_severity(
+    memory_env: tuple[MemoryStore, aiosqlite.Connection, Database],
+) -> None:
+    """Re-setting the current status stays allowed (severity-update path)."""
+    store, _conn, _db = memory_env
+    finding = await store.save_finding(_FINDING_DRAFT)
+    updated = await store.update_finding_status(
+        finding.id, FindingStatus.CANDIDATE, Severity.HIGH
+    )
+    assert updated.status is FindingStatus.CANDIDATE
+    assert updated.severity is Severity.HIGH
+
+
+async def test_save_finding_rejects_unknown_endpoint_ref(
+    memory_env: tuple[MemoryStore, aiosqlite.Connection, Database],
+) -> None:
+    """A dangling endpoint_ref is an agent-facing ValueError, not FK noise (#63)."""
+    store, _conn, _db = memory_env
+    with pytest.raises(ValueError, match=r"endpoint_ref not found in endpoints: 999"):
+        await store.save_finding(_FINDING_DRAFT.model_copy(update={"endpoint_ref": 999}))
+    endpoint = await store.upsert_endpoint(_ENDPOINT_DRAFT)
+    finding = await store.save_finding(
+        _FINDING_DRAFT.model_copy(update={"endpoint_ref": endpoint.id})
+    )
+    assert finding.endpoint_ref == endpoint.id
+
+
+async def test_link_attack_node_rejects_unknown_finding_ref(
+    memory_env: tuple[MemoryStore, aiosqlite.Connection, Database],
+) -> None:
+    """A dangling finding_ref is an agent-facing ValueError; nothing persists (#63)."""
+    store, conn, _db = memory_env
+    with pytest.raises(ValueError, match=r"finding_ref not found in findings: 999"):
+        await store.link_attack_node(
+            AttackNodeDraft(kind="finding", title="ghost node", finding_ref=999)
+        )
+    cursor = await conn.execute("SELECT COUNT(*) AS n FROM attack_nodes")
+    row = await cursor.fetchone()
+    assert row is not None
+    assert int(row["n"]) == 0, "the failed call must not persist the node"
+    finding = await store.save_finding(_FINDING_DRAFT)
+    node = await store.link_attack_node(
+        AttackNodeDraft(kind="finding", title="real node", finding_ref=finding.id)
+    )
+    assert node.finding_ref == finding.id
+
+
+async def test_begin_collision_exhausts_retries_into_memory_store_busy(
+    memory_env: tuple[MemoryStore, aiosqlite.Connection, Database],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held write transaction surfaces as agent-facing MemoryStoreBusy (#53)."""
+    store, conn, _db = memory_env
+    monkeypatch.setattr("swarmy.memory.store._TX_RETRY_BASE_DELAY_S", 0.0)
+    monkeypatch.setattr("swarmy.memory.store._TX_RETRY_JITTER_S", 0.0)
+    await conn.execute("BEGIN IMMEDIATE")  # simulate an interleaved multi-step writer
+    with pytest.raises(MemoryStoreBusy, match="memory subsystem is busy"):
+        await store.save_target("https://app.example.com")
+    await conn.rollback()  # the interleaved writer finishes
+    target = await store.save_target("https://app.example.com")  # store usable again
+    assert target.id == 1
+
+
+async def test_begin_collision_retries_until_writer_commits(
+    memory_env: tuple[MemoryStore, aiosqlite.Connection, Database],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """save_target succeeds once the colliding writer commits mid-retry (#53)."""
+    store, conn, _db = memory_env
+    monkeypatch.setattr("swarmy.memory.store._TX_RETRY_BASE_DELAY_S", 0.01)
+    monkeypatch.setattr("swarmy.memory.store._TX_RETRY_JITTER_S", 0.0)
+
+    async def finish_writer() -> None:
+        """Release the held transaction while the store call is retrying."""
+        await asyncio.sleep(0.02)
+        await conn.commit()
+
+    await conn.execute("BEGIN IMMEDIATE")
+    finisher = asyncio.create_task(finish_writer())
+    target = await store.save_target("https://app.example.com")
+    await finisher
+    assert target.id == 1

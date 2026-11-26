@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from swarmy.tools.http.models import RequestSpec, ResponseRecord
+from swarmy.tools.http.models import HopRecord, RequestSpec, ResponseRecord
 
 _SPEC_FIELDS = {"method", "url", "headers", "query", "body", "evidence", "evidence_depth"}
 _RECORD_FIELDS = {
@@ -98,3 +98,27 @@ def test_invalid_evidence_depth_is_validation_error() -> None:
             url="http://app.example.com/",
             evidence_depth="har",  # type: ignore[arg-type]
         )
+
+
+def test_hop_record_carries_raw_hop_traffic() -> None:
+    """Issue #42: a hop record holds the raw exchanged pair (frozen, 1-based)."""
+    hop = HopRecord(
+        hop=1,
+        request_head=b"GET /step2 HTTP/1.1\r\n",
+        request_body=b"",
+        response_head=b"HTTP/1.1 302 Found\r\n",
+        response_body=b"",
+    )
+    assert hop.hop == 1
+    assert hop.response_truncated is False
+    assert hop.response_dropped_bytes is None
+    with pytest.raises(ValidationError):
+        HopRecord(
+            hop=0,  # hop numbers are 1-based
+            request_head=b"",
+            request_body=b"",
+            response_head=b"",
+            response_body=b"",
+        )
+    with pytest.raises(ValidationError):
+        hop.hop = 2  # frozen: raw traffic is immutable

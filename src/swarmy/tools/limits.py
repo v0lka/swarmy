@@ -14,7 +14,7 @@ Mechanisms (arch §6.4 table):
 * ``max_concurrent_requests`` — one global ``asyncio.Semaphore``;
 * ``total_request_budget`` — an atomic counter consumed once per
   ``acquire()`` (per request, redirect hops included); exhaustion refuses
-  every further network call with the ``invariant: budget`` rule;
+  every further network call with the ``invariant:budget`` rule;
 * ``max_body_bytes`` / ``max_redirect_depth`` / ``connect_timeout_s`` /
   ``read_timeout_s`` — cut-off values *exposed* here; the HTTP client
   (P2.2) enforces them while reading responses, counting redirect hops and
@@ -35,7 +35,7 @@ from typing import Final, NamedTuple
 from pydantic import BaseModel, ConfigDict, Field
 
 #: The rule id of the budget-exhaustion denial (arch §6.4, roadmap T2.1.2).
-BUDGET_RULE_ID: Final[str] = "invariant: budget"
+BUDGET_RULE_ID: Final[str] = "invariant:budget"
 
 
 class ResourceLimits(BaseModel):
@@ -50,7 +50,9 @@ class ResourceLimits(BaseModel):
 
     rate_limit: float = Field(gt=0)  # requests per second, per host
     max_concurrent_requests: int = Field(gt=0)  # global, all hosts summed
-    max_body_bytes: int = Field(gt=0)  # response read cut-off (client-side)
+    # both directions (client-side, Issue #31): outgoing request bodies
+    # above it are denied pre-connect; response reads are cut off at it.
+    max_body_bytes: int = Field(gt=0)
     max_redirect_depth: int = Field(ge=1)  # hop counter in the client pipeline
     total_request_budget: int = Field(gt=0)  # requests per session, atomic
     connect_timeout_s: float = Field(gt=0)
@@ -158,7 +160,7 @@ class ResourceLimiter:
         return self._in_flight
 
     def budget_block_reason(self) -> str | None:
-        """The ``invariant: budget`` denial reason, or ``None`` while budget lasts.
+        """The ``invariant:budget`` denial reason, or ``None`` while budget lasts.
 
         Used by the layer-1 ``invariant: limits`` pre-check so a spent
         budget denies *before* the limiter's async waits even begin

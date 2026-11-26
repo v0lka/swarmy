@@ -195,7 +195,7 @@ def limits_invariant_check(limiter: ResourceLimiter) -> InvariantCheck:
 
     The synchronous layer-1 share of the limiter contract (arch §6.4/§6.2):
     a spent session request budget denies the call *here*, before the
-    limiter's async waits — the reason carries the ``invariant: budget``
+    limiter's async waits — the reason carries the ``invariant:budget``
     rule id. Concurrency/rate waits remain in ``ResourceLimiter.acquire``,
     which the client calls only after the whole pipeline allowed (arch
     §6.2 order: guardrails → limiter → httpx).

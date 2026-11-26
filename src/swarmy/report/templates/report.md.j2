@@ -1,12 +1,19 @@
 {# report/templates/report.md.j2 — the deterministic session report (arch §11, T5.4.2).
 
+   Escaping contract (spec §10; review Issues #40/#18): every target/LLM-
+   derived string interpolated below (finding title/description/reproduction,
+   endpoint path/host/parameters, tree text) is report-safe — neutralized by
+   ReportGenerator._report_safe in the view models; evidence paths stay
+   verbatim session-generated links. The template adds no further escaping.
+
    Mermaid subset decision (arch §19.4 / risk R8): this template renders
    trees with ONLY the constructs every widespread renderer accepts —
    `graph TD` + `-->` edges + `-->|label|` labeled edges + double-quoted
-   node labels with a sanitized character set (see ReportGenerator
-   _mermaid_label). No subgraphs, styling, or HTML labels are emitted, so
-   the block degrades to a syntax error nowhere; the plain-text rendering
-   above each block is the fallback for non-graph viewers.
+   node labels with a sanitized character set without `<`/`>` (see
+   ReportGenerator _mermaid_label). No subgraphs, styling, or HTML labels
+   are emitted, so the block degrades to a syntax error nowhere; the
+   plain-text rendering above each block is the fallback for non-graph
+   viewers.
 #}
 # swarmy session report
 

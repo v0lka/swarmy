@@ -2,9 +2,10 @@
 
 Every event of the session is one ``EventEnvelope`` carrying a typed payload
 model; the ``EventRegistry`` is the *single* place mapping the ``"TypeName"``
-string to that payload class (arch §5.2). The 13 built-in types of the v0.1
-taxonomy (arch §5.5) are registered at import time; module-defined payload
-classes register themselves the same way when their module loads (§8.4).
+string to that payload class (arch §5.2). The 14 built-in types of the v0.1
+taxonomy (arch §5.5 + the platform ``OutboundSecretWarn`` dock) are
+registered at import time; module-defined payload classes register
+themselves the same way when their module loads (§8.4).
 
 Payload discipline (arch §5.1, §5.5): payloads carry domain ids plus
 sanitized digests only — no nested domain objects, with the single documented
@@ -75,7 +76,7 @@ class EventEnvelope(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# The 13 payload models of the v0.1 taxonomy (arch §5.5).
+# The 14 payload models of the v0.1 taxonomy (arch §5.5 + OutboundSecretWarn).
 # ---------------------------------------------------------------------------
 
 _STRICT = ConfigDict(extra="forbid")  # unknown keys are rejected (arch §5.5)
@@ -168,7 +169,13 @@ class GuardrailBlockedPayload(BaseModel):
     model_config = _STRICT
 
     tool_name: str
-    rule_id: str  # rule id or "invariant:<name>" / "judge:<verdict>"
+    # Canonical machine spelling is "invariant:<name>" (guardrails.invariants
+    # slots) or "judge:<verdict>". Historical note (consolidated review #21):
+    # the http client's *own* hop checks stored the spaced prose form
+    # "invariant: <name>" (its rule-id constants) — v0.1 journal rows may
+    # therefore carry both spellings of the invariant ids, one per blocking
+    # component; prose wording belongs in `reason`, never in this field.
+    rule_id: str
     layer: Literal["invariant", "engine", "module", "judge"]
     reason: str  # human-readable reason (returned to the agent)
     tool_args_digest: str  # sanitized arguments digest (§6.8)
@@ -214,6 +221,26 @@ class OperatorDecisionPayload(BaseModel):
     edited_args_digest: str | None = None
 
 
+class OutboundSecretWarnPayload(BaseModel):
+    """Non-blocking outbound-secret hygiene warn (arch §6.2, SECURITY.md).
+
+    Appended to the journal when an operator secret value is detected in an
+    outgoing request's headers, body or query parameters. The warn never
+    blocks the request (the operator passed the credential deliberately);
+    it exists so the audit receipt chain (ASI10) records the leak attempt.
+    Registered as the 14th built-in type so every journal row is decodable
+    (consolidated review #29 ↔ F-5: an unregistered platform type used to
+    brick resume/report/TUI decoding of the whole session).
+    """
+
+    model_config = _STRICT
+
+    tool_name: str  # platform tool that carried the secret, e.g. "http_get"
+    request_id: str  # client request id (CSPRNG uuid4 hex)
+    secret_names: list[str]  # operator secret *names* whose values were seen
+    locations: list[str]  # e.g. "header:authorization", "body", "query:token"
+
+
 # ---------------------------------------------------------------------------
 # Registry: the single "TypeName" -> payload class mapping (arch §5.2).
 # ---------------------------------------------------------------------------
@@ -228,8 +255,28 @@ class EventRegistry:
     """Classmethod namespace for the event type registry (arch §5.2).
 
     Do not instantiate: the registry is process-global by design — one
-    session, one taxonomy; module payloads add themselves at load time.
+    session, one taxonomy; module payloads add themselves at load time. The
+    lifecycle is per-load: :meth:`reset` restores the built-in taxonomy, and
+    the module loader calls it at the start of every ``load()`` so a failed
+    or repeated load cannot leak its module types into later loads (F-12,
+    review #35).
     """
+
+    @classmethod
+    def reset(cls) -> None:
+        """Drop every module-added type, restoring the built-in taxonomy (F-12).
+
+        Clears the process-global registry and re-registers the v0.1
+        built-in types (the import-time bootstrap set). Called by the module
+        loader at the start of each ``load()`` — one load owns one taxonomy:
+        stale registrations from an earlier load (a retried failed load, a
+        previous session in an embedded process) can no longer collide with
+        or shadow the current module set. ``EVENT_TYPES`` stays a live view
+        of the same mapping.
+        """
+        _REGISTRY.clear()
+        for name, payload_cls in _BUILTINS:
+            EventRegistry.register(name, payload_cls)
 
     @classmethod
     def register(cls, name: str, payload_cls: type[BaseModel]) -> None:
@@ -274,8 +321,9 @@ class EventRegistry:
         return payload_cls.model_validate(payload_data)
 
 
-#: The 13 built-in types of the v0.1 taxonomy (arch §5.5), registered at
-#: import time — importing this module is the bootstrap of the taxonomy.
+#: The 14 built-in types of the v0.1 taxonomy (arch §5.5 plus the platform
+#: ``OutboundSecretWarn`` dock), registered at import time — importing this
+#: module is the bootstrap of the taxonomy.
 _BUILTINS: tuple[tuple[str, type[BaseModel]], ...] = (
     ("TargetSet", TargetSetPayload),
     ("ScopeChanged", ScopeChangedPayload),
@@ -290,10 +338,32 @@ _BUILTINS: tuple[tuple[str, type[BaseModel]], ...] = (
     ("TaskCompleted", TaskCompletedPayload),
     ("OperatorMessage", OperatorMessagePayload),
     ("OperatorDecision", OperatorDecisionPayload),
+    ("OutboundSecretWarn", OutboundSecretWarnPayload),
 )
 
 for _name, _payload_cls in _BUILTINS:
     EventRegistry.register(_name, _payload_cls)
+
+
+class UnknownEventPayload(BaseModel):
+    """Decode fallback for journal rows of a type absent from this registry.
+
+    ``JournalReader`` substitutes this payload when the stored ``type`` has
+    no registered payload class in the current process (a module was
+    removed/renamed, or the journal was written by a newer build) — one
+    unknown row must never brick resume/report/TUI reads (consolidated
+    review #7). The envelope keeps the original ``type`` string; consumers
+    that must ignore unknown events check for this payload class, while
+    statistics surfaces can still count them by type.
+
+    Deliberately NOT registered in ``EventRegistry``: it is a reader-side
+    marker, not an emittable taxonomy type.
+    """
+
+    model_config = _STRICT
+
+    original_type: str  # the stored (unregistered) event type name
+    raw_payload: str  # the stored payload JSON TEXT, kept raw (D21)
 
 
 __all__ = [
@@ -311,8 +381,10 @@ __all__ = [
     "JsonValue",
     "OperatorDecisionPayload",
     "OperatorMessagePayload",
+    "OutboundSecretWarnPayload",
     "ScopeChangedPayload",
     "TargetSetPayload",
     "TaskCompletedPayload",
     "TaskRequestedPayload",
+    "UnknownEventPayload",
 ]

@@ -229,7 +229,7 @@ async def test_wired_limits_blocks_after_budget_exhausted() -> None:
     assert feedback is not None
     assert feedback.rule_id == "invariant:limits"
     assert feedback.layer == "invariant"
-    assert "invariant: budget" in feedback.reason
+    assert "invariant:budget" in feedback.reason
 
 
 def test_wired_timeout_blocks_overwide_timeout_argument() -> None:
@@ -430,4 +430,4 @@ class TestResolvedConfigActivatesEverySlot:
         feedback = layer.evaluate("http_get", {"url": "https://target.example.com/x"})
         assert feedback is not None
         assert feedback.rule_id == "invariant:limits"
-        assert "invariant: budget" in feedback.reason
+        assert "invariant:budget" in feedback.reason

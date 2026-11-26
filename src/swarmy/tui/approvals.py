@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from rich.markup import escape
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
@@ -28,8 +28,31 @@ if TYPE_CHECKING:
 
     from swarmy.tui.state import ApprovalItem, SessionView, TuiState
 
-#: Scalar shapes the v0.1 edit form accepts for one tool argument.
-EditScalar = str | int | float | bool | None
+
+def _is_json_value(value: object) -> bool:
+    """Whether ``value`` is a JSON-shaped scalar or nested value (recursive).
+
+    The recursive JSON shape mirrors :data:`swarmy.events.models.JsonValue`
+    (Issue #45: gated calls routinely hold nested arguments — ``http_post``'s
+    ``headers`` dict, ``evidence_refs`` lists). A plain recursive alias can
+    be used in annotations only; pydantic cannot resolve it (schema
+    generation recurses forever), so the shape is enforced by this explicit
+    check — values stay PLAIN json.loads output because edited arguments
+    ride the L0 resume payload as real tool arguments.
+    """
+    stack: list[object] = [value]
+    while stack:
+        item = stack.pop()
+        if item is None or isinstance(item, (str, bool, int, float)):
+            continue
+        if isinstance(item, list):
+            stack.extend(item)
+            continue
+        if isinstance(item, dict):
+            stack.extend(item.values())
+            continue
+        return False
+    return True
 
 
 class ModalDecision(BaseModel):
@@ -39,7 +62,17 @@ class ModalDecision(BaseModel):
 
     request_id: str
     decision: ApprovalChoice
-    edited_args: dict[str, EditScalar] | None = None
+    edited_args: dict[str, object] | None = None
+
+    @field_validator("edited_args")
+    @classmethod
+    def _edited_args_are_json(
+        cls, value: dict[str, object] | None
+    ) -> dict[str, object] | None:
+        """Enforce the recursive JSON shape on every edited argument."""
+        if value is not None and not all(_is_json_value(item) for item in value.values()):
+            raise ValueError("edited args must be JSON values (scalars, lists, objects)")
+        return value
 
 
 class ApprovalModalOpen(Message):
@@ -83,8 +116,8 @@ class ApprovalsPanel(Vertical):
         for item in state.approvals:
             table.add_row(
                 item.request_id,
-                item.tool,
-                item.origin,
+                escape(item.tool),
+                escape(item.origin),
                 escape(item.rule_or_profile),
                 escape(item.args_digest),
                 key=item.request_id,
@@ -190,13 +223,16 @@ class ApprovalModal(ModalScreen[ModalDecision]):
         if not isinstance(parsed, dict):
             self._set_error("edited args must be a JSON object of tool arguments")
             return
-        self.dismiss(
-            ModalDecision(
+        try:
+            decision = ModalDecision(
                 request_id=self.item.request_id,
                 decision="edit",
                 edited_args={str(key): value for key, value in parsed.items()},
             )
-        )
+        except ValidationError:  # pragma: no cover - defensive: JSON fits JsonValue
+            self._set_error("edited args failed decision validation")
+            return
+        self.dismiss(decision)
 
     def _set_error(self, message: str) -> None:
         """Render the validation error line (empty clears it)."""

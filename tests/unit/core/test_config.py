@@ -20,6 +20,7 @@ import yaml
 from swarmy.core.config import (
     ConfigError,
     SecretsConfig,
+    SecretsConfigError,
     SessionConfig,
     load_secrets,
     snapshot_yaml,
@@ -197,3 +198,30 @@ class TestSnapshot:
         text = snapshot_yaml(config, load_secrets(secrets_path))
         assert "sk-super-secret-value-123" not in text
         assert "<masked:api_key>" in text
+
+
+# ---------------------------------------------------------------------------
+# #62: non-UTF-8 config files surface their typed errors, not raw decode.
+# ---------------------------------------------------------------------------
+
+
+def test_non_utf8_session_config_is_a_config_error(tmp_path: Path) -> None:
+    """#62: session.yaml in a non-UTF-8 encoding is one ConfigError problem line."""
+    path = tmp_path / "cfg.yaml"
+    path.write_bytes(
+        b"target:\n  base_url: 'https://t.example.com'\n  notes: '\xf2\xe5\xf1\xf2'\n"
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        SessionConfig.load(config_path=path)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "not valid UTF-8" in message
+
+
+def test_non_utf8_secrets_file_is_a_secrets_config_error(tmp_path: Path) -> None:
+    """#62: secrets.yaml in cp1251 raises the aggregated SecretsConfigError."""
+    path = tmp_path / "secrets.yaml"
+    path.write_bytes(b"tokens:\n  api_key: '\xf2\xe5\xf1\xf2'\n")
+    with pytest.raises(SecretsConfigError, match="not valid UTF-8") as excinfo:
+        load_secrets(path)
+    assert str(path) in str(excinfo.value)

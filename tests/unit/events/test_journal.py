@@ -7,6 +7,7 @@ append-only enforcement (UPDATE/DELETE rejected by schema triggers).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -20,7 +21,9 @@ from swarmy.events.models import (
     EventSource,
     FindingCandidatePayload,
     OperatorMessagePayload,
+    OutboundSecretWarnPayload,
     ScopeChangedPayload,
+    UnknownEventPayload,
 )
 from swarmy.memory.models import ScopeEntry
 from swarmy.memory.schema import MIGRATIONS
@@ -215,3 +218,147 @@ async def test_append_only_enforced_by_triggers(
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         await conn.execute("DELETE FROM events")
     await conn.rollback()
+
+
+async def test_outbound_secret_warn_round_trip(
+    journal_env: tuple[JournalWriter, JournalReader, aiosqlite.Connection, Database],
+) -> None:
+    """The platform warn dock decodes through the registry (#29 ↔ F-5).
+
+    ``Session`` journals ``type="OutboundSecretWarn"`` journal-only; before
+    the 14th built-in was registered, one warn row raised ``KeyError`` in
+    every reader and bricked resume/report/TUI decoding of the session.
+    """
+    writer, reader, _conn, _db = journal_env
+    payload = OutboundSecretWarnPayload(
+        tool_name="http_get",
+        request_id="0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        secret_names=["api_token"],
+        locations=["header:authorization", "query:token"],
+    )
+    envelope = await writer.append(
+        type="OutboundSecretWarn",
+        source=EventSource.PLATFORM,
+        source_detail="http-client",
+        correlation_id="",
+        payload=payload,
+    )
+    (decoded,) = await reader.tail(1)
+    assert decoded.id == envelope.id
+    assert decoded.type == "OutboundSecretWarn"
+    assert decoded.payload == payload
+
+
+async def test_unknown_type_row_decodes_tolerantly(
+    journal_env: tuple[JournalWriter, JournalReader, aiosqlite.Connection, Database],
+) -> None:
+    """A row of an unregistered type decodes as UnknownEventPayload (#7).
+
+    Simulates a journal written with a module event type that is not
+    registered in this process (module removed/renamed, newer build):
+    tail/range must not raise — resume/report/TUI keep working and the raw
+    payload is preserved for audit.
+    """
+    _writer, reader, conn, _db = journal_env
+    raw_payload = json.dumps({"note": "journalled by a since-removed module"})
+    await conn.execute(
+        "INSERT INTO events (ts, type, source, source_detail, correlation_id, payload)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            datetime(2026, 1, 2, tzinfo=UTC).isoformat(),
+            "ModuleCustomEvent",
+            "module",
+            "crawler",
+            "c-9",
+            raw_payload,
+        ),
+    )
+    await conn.commit()
+    tail = await reader.tail(10)
+    assert len(tail) == 1
+    (decoded,) = tail
+    assert decoded.type == "ModuleCustomEvent"
+    assert isinstance(decoded.payload, UnknownEventPayload)
+    assert decoded.payload.original_type == "ModuleCustomEvent"
+    assert decoded.payload.raw_payload == raw_payload
+    assert len(await reader.range(0)) == 1  # resume replay decodes too
+
+
+async def test_registered_rows_survive_next_to_unknown_rows(
+    journal_env: tuple[JournalWriter, JournalReader, aiosqlite.Connection, Database],
+) -> None:
+    """Tolerant decode is per-row: neighbours keep their typed payloads."""
+    writer, reader, conn, _db = journal_env
+    await _append_candidate(writer, finding_id=1)
+    await conn.execute(
+        "INSERT INTO events (ts, type, source, source_detail, correlation_id, payload)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            datetime(2026, 1, 2, tzinfo=UTC).isoformat(),
+            "VanishedModuleEvent",
+            "module",
+            "crawler",
+            "",
+            "{}",
+        ),
+    )
+    await conn.commit()
+    await _append_candidate(writer, finding_id=2)
+    tail = await reader.tail(10)
+    assert [envelope.id for envelope in tail] == [1, 2, 3]
+    assert isinstance(tail[0].payload, FindingCandidatePayload)
+    assert isinstance(tail[1].payload, UnknownEventPayload)
+    assert isinstance(tail[2].payload, FindingCandidatePayload)
+
+
+async def test_corrupt_payload_for_known_type_still_raises(
+    journal_env: tuple[JournalWriter, JournalReader, aiosqlite.Connection, Database],
+) -> None:
+    """Tolerance covers unregistered *types*, not corrupt *payloads*.
+
+    A non-object payload under a registered type is storage corruption and
+    keeps failing loudly (consolidated review #7 fix stays scoped).
+    """
+    _writer, reader, conn, _db = journal_env
+    await conn.execute(
+        "INSERT INTO events (ts, type, source, source_detail, correlation_id, payload)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            datetime(2026, 1, 2, tzinfo=UTC).isoformat(),
+            "OperatorMessage",
+            "platform",
+            "tui",
+            "",
+            "[1, 2]",  # valid JSON, but not the payload object shape
+        ),
+    )
+    await conn.commit()
+    with pytest.raises(RuntimeError, match="payload is not a JSON object"):
+        await reader.tail(10)
+
+
+async def test_append_id_points_at_its_own_row(
+    journal_env: tuple[JournalWriter, JournalReader, aiosqlite.Connection, Database],
+) -> None:
+    """Each returned envelope id resolves to the row of that very event (#52).
+
+    Regression pin for the id-acquisition race: the id must come from the
+    INSERT cursor (per-cursor ``lastrowid``), never from a follow-up
+    ``SELECT last_insert_rowid()`` that a concurrent writer could hijack.
+    """
+    writer, reader, conn, _db = journal_env
+    first = await _append_candidate(writer, finding_id=1)
+    second = await writer.append(
+        type="OperatorMessage",
+        source=EventSource.PLATFORM,
+        source_detail="tui",
+        correlation_id="",
+        payload=OperatorMessagePayload(text_digest="<digest>"),
+    )
+    for envelope in (first, second):
+        cursor = await conn.execute("SELECT type FROM events WHERE id = ?", (envelope.id,))
+        row = await cursor.fetchone()
+        assert row is not None
+        assert str(row["type"]) == envelope.type
+    types = {envelope.type for envelope in await reader.tail(10)}
+    assert types == {"FindingCandidate", "OperatorMessage"}

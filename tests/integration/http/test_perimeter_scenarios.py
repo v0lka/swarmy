@@ -16,6 +16,7 @@ Windows-CI safe: only ``pathlib``, no POSIX-only APIs, no chmod assertions.
 from __future__ import annotations
 
 import asyncio
+import socket
 from contextlib import aclosing
 from itertools import pairwise
 from typing import TYPE_CHECKING, Final
@@ -24,17 +25,19 @@ import pytest
 
 from swarmy.core.config import SecretsConfig
 from swarmy.events.models import EventEnvelope, GuardrailBlockedPayload
-from swarmy.guardrails.invariants import INVARIANT_PREFIX
+from swarmy.guardrails.invariants import INVARIANT_PREFIX, InvariantLayer, session_invariants
 from swarmy.guardrails.models import GuardrailBlocked
+from swarmy.guardrails.pipeline import GuardrailPipeline
 from swarmy.tools.http.client import (
     SCOPE_RULE_ID,
     TIMEOUT_RULE_ID,
+    TRANSPORT_RULE_ID,
     SwarmyHttpClient,
 )
+from swarmy.tools.http.evidence import EvidenceRecorder
 from swarmy.tools.http.models import RequestSpec, ResponseRecord
 from swarmy.tools.limits import BUDGET_RULE_ID, ResourceLimiter, ResourceLimits
-from swarmy.tools.projector import truncation_marker
-from swarmy.tools.scope import OutOfScopeEndpoint
+from swarmy.tools.scope import OutOfScopeEndpoint, ScopeEntries, ScopeRegistry
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -164,15 +167,56 @@ async def test_evidence_records_traffic_byte_exact(
     assert stored_body == body.encode()  # raw, exactly what went on the wire
     head, sep, stored_body = (unit_dir / "response.txt").read_bytes().partition(b"\r\n\r\n")
     assert sep
-    # The client serializes the status line as f"HTTP/{http_version} ..." and
-    # real httpx reports http_version="HTTP/1.1", so the stored head carries a
-    # duplicated "HTTP/" prefix (src observation, reported — not testable away
-    # here). Everything after it IS the wire status line; the header block is
-    # byte-exact as received (lowercase names, real server header values).
-    assert head.split(b"\r\n")[0].endswith(b" 200 OK")
+    # The client serializes the status line from the normalized http_version
+    # (real httpx reports "HTTP/1.1"; _response_head_bytes skips its own
+    # "HTTP/" when the version already carries the prefix), so the stored
+    # head carries exactly ONE "HTTP/" prefix — pinned on the mock path by
+    # tests/unit/tools/http/test_client.py. The header block is byte-exact
+    # as received (lowercase names, real server header values).
+    assert head.split(b"\r\n")[0] == b"HTTP/1.1 200 OK"
     assert b"content-type: text/plain" in head
     assert f"content-length: {len(body)}".encode() in head
     assert stored_body == body.encode()  # the echo returned exactly what was sent
+
+
+async def test_redirect_chain_evidence_covers_every_hop(
+    echo_server: EchoServer, client: SwarmyHttpClient, session_env: SessionEnv
+) -> None:
+    """Issue #42: a multi-hop chain stores one raw pair per followed hop.
+
+    The in-scope ``/redirect?n=2`` chain makes three exchanges (n=2 → n=1 →
+    n=0); the evidence unit must let a pentester audit every hop: the
+    ``hop-<i>/`` directories hold the exact rewritten request line and the
+    exact 302 responses, while the top-level pair keeps the summary semantics
+    (first request + final response).
+    """
+    spec = RequestSpec(method="GET", url=echo_server.url("/redirect"), query={"n": "2"})
+    record = await client.request(spec)
+    assert isinstance(record, ResponseRecord)
+    assert record.status == 200
+    assert len(record.redirects) == 2  # two followed 302 hops, then the landing
+    unit_dir = session_env.evidence_dir / record.request_id
+    # Top level: the first request and the final response (unchanged contract).
+    head, sep, _stored = (unit_dir / "request.txt").read_bytes().partition(b"\r\n\r\n")
+    assert sep
+    assert head.startswith(b"GET /redirect?n=2 HTTP/1.1\r\n")
+    head, sep, stored_body = (unit_dir / "response.txt").read_bytes().partition(b"\r\n\r\n")
+    assert sep
+    assert head.split(b"\r\n")[0] == b"HTTP/1.1 200 OK"
+    assert stored_body  # the landing page body was stored
+    # Every hop: the exact request/response pair exchanged on that hop.
+    for n, expected_line in ((1, b"GET /redirect?n=2 HTTP/1.1"), (2, b"GET /redirect?n=1 HTTP/1.1"), (3, b"GET /redirect?n=0 HTTP/1.1")):
+        hop_dir = unit_dir / f"hop-{n}"
+        hop_head, sep, _hop_body = (hop_dir / "request.txt").read_bytes().partition(b"\r\n\r\n")
+        assert sep
+        assert hop_head.split(b"\r\n")[0] == expected_line
+        hop_head, sep, _hop_body = (hop_dir / "response.txt").read_bytes().partition(b"\r\n\r\n")
+        assert sep
+        if n < 3:
+            assert hop_head.split(b"\r\n")[0] == b"HTTP/1.1 302 Found"
+            assert b"location: /redirect?n=" in hop_head
+        else:
+            assert hop_head.split(b"\r\n")[0] == b"HTTP/1.1 200 OK"
 
 
 async def test_body_budget_truncates_large_response(
@@ -183,8 +227,9 @@ async def test_body_budget_truncates_large_response(
     Response side: the client's capped reader keeps exactly the threshold
     bytes (byte-exact prefix in evidence; the §6.8 truncation *note* rides
     the preview, the declared full size stays on ``body_bytes``). Request
-    side: an oversized POST body is stored cut, closed by the §6.8
-    truncation marker (the recorder caps request bodies itself).
+    side: an oversized POST body is denied before the first hop (arch
+    invariant 7, Issue #31) — no byte reaches the target and no evidence is
+    written for the denied call.
     """
     spec = RequestSpec(method="GET", url=echo_server.url("/large"), query={"bytes": "4000"})
     record = await client.request(spec)
@@ -200,6 +245,7 @@ async def test_body_budget_truncates_large_response(
     # byte-exact and closes with the §6.8 truncation marker carrying the
     # exact dropped count (declared Content-Length 4000 minus kept 1024).
     assert stored_body == b"A" * 1024 + b"\n[truncated 2976 bytes]\n"
+    oversize_before = echo_server.log.count
     oversize = "B" * 1200
     spec = RequestSpec(
         method="POST",
@@ -207,13 +253,11 @@ async def test_body_budget_truncates_large_response(
         headers={"content-type": "text/plain"},
         body=oversize,
     )
-    record = await client.request(spec)
-    assert isinstance(record, ResponseRecord)
-    request_path = session_env.evidence_dir / record.request_id / "request.txt"
-    _head, sep, stored_body = request_path.read_bytes().partition(b"\r\n\r\n")
-    assert sep
-    marker = f"\n{truncation_marker(1200 - 1024)}\n".encode()
-    assert stored_body == b"B" * 1024 + marker  # byte-exact prefix + §6.8 marker
+    with pytest.raises(GuardrailBlocked) as excinfo:
+        await client.request(spec)
+    assert "max_body_bytes" in excinfo.value.feedback.reason
+    assert "1200" in excinfo.value.feedback.reason
+    assert echo_server.log.count == oversize_before  # no byte was sent
 
 
 async def test_session_budget_exhaustion_blocks_further_calls(
@@ -297,6 +341,55 @@ async def test_timeout_returns_feedback_and_journals_invariant_event(
     bus_payload = received[0].payload
     assert isinstance(bus_payload, GuardrailBlockedPayload)
     assert bus_payload.rule_id == TIMEOUT_RULE_ID  # real bus fan-out, journal-first
+
+
+async def test_transport_error_returns_feedback_and_journals_invariant_transport(
+    echo_server: EchoServer,
+    session_env: SessionEnv,
+) -> None:
+    """Entry #34: a connection refusal over a real socket takes the timeout contour.
+
+    ``ConnectError`` (an ``httpx.HTTPError`` that is not a
+    ``TimeoutException``) returns the structured feedback text and journals
+    ``invariant:transport`` — same journal-first contour as the timeout,
+    no raw exception text reaching agent or journal.
+    """
+    # A port where nothing listens: grab one from the OS, then release it.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    dead_port: int = int(probe.getsockname()[1])
+    probe.close()
+    scope = ScopeRegistry(
+        ScopeEntries(ip_subnets=["127.0.0.1/32"], ports=[dead_port], schemes=["http"])
+    )
+    limiter = ResourceLimiter(TIMEOUT_LIMITS)
+    pipeline = GuardrailPipeline(invariants=InvariantLayer(session_invariants(scope, limiter)))
+    recorder = EvidenceRecorder(
+        evidence_dir=session_env.evidence_dir, store=session_env.store, max_body_bytes=1024
+    )
+    client = SwarmyHttpClient(
+        scope=scope,
+        limiter=limiter,
+        pipeline=pipeline,
+        projector=session_env.projector,
+        secrets=SecretsConfig(),
+        evidence=recorder,
+        events=session_env.events,
+    )
+    async with aclosing(client) as scoped:
+        result = await scoped.request(
+            RequestSpec(method="GET", url=f"http://127.0.0.1:{dead_port}/refused")
+        )
+    assert isinstance(result, str)  # textual agent feedback, not an exception
+    assert TRANSPORT_RULE_ID in result
+    assert "NOT executed" in result
+    assert echo_server.log.count == 0  # nothing reached the echo app either
+    payloads = await _guardrail_events(session_env.reader)
+    assert len(payloads) == 1
+    assert payloads[0].rule_id == TRANSPORT_RULE_ID
+    assert payloads[0].layer == "invariant"
+    assert payloads[0].tool_name == "http_get"
+    assert "ConnectError" in payloads[0].reason  # type name only, no raw text
 
 
 async def test_operator_secret_masked_in_preview_raw_in_evidence(

@@ -23,6 +23,7 @@ import the L0 stack (arch §2.5) — plain structural checks only.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias, TypeVar, cast
 
@@ -60,6 +61,19 @@ _SNAPSHOT_TYPES: Final[frozenset[str]] = frozenset(
         "ScopeChanged",
     }
 )
+
+#: Default size of the bounded feed window (Issue #33: ``feed`` used to grow
+#: without bound over a long session).
+FEED_MAX: Final[int] = 1000
+
+#: Bounded buffer of worker/decision error lines surfaced in the chat feed
+#: (Issue #28 degradation path).
+SYSTEM_ERRORS_MAX: Final[int] = 20
+
+#: Bounded history of orchestrator replies rendered by the chat panel
+#: (Issue #47: only the latest reply used to survive; the transcript must
+#: keep the whole dialog, bounded like the feed window).
+REPLIES_MAX: Final[int] = 200
 
 
 class ApprovalItem(BaseModel):
@@ -257,11 +271,18 @@ class TuiState:
     never dropped — only the extra redraws collapse into one refresh.
     """
 
-    def __init__(self, view: SessionView, tail_size: int = 200) -> None:
-        """Create empty state over the facade; ``tail_size`` bounds preload."""
+    def __init__(self, view: SessionView, tail_size: int = 200, feed_max: int = FEED_MAX) -> None:
+        """Create empty state over the facade; ``tail_size`` bounds preload.
+
+        ``feed_max`` bounds the live feed window: oldest envelopes are
+        dropped beyond it, while :attr:`event_count` keeps the session total
+        for the statistics panel (Issue #33).
+        """
         self.view = view
         self.tail_size = tail_size
-        self.feed: list[EventEnvelope] = []
+        self.feed: deque[EventEnvelope] = deque(maxlen=feed_max)
+        self.event_count: int = 0
+        self.system_errors: deque[str] = deque(maxlen=SYSTEM_ERRORS_MAX)
         self.approvals: tuple[ApprovalItem, ...] = ()
         self.endpoints: list[Endpoint] = []
         self.findings: list[Finding] = []
@@ -269,6 +290,7 @@ class TuiState:
         self.attack_edges: list[AttackEdge] = []
         self.todos: list[TodoItem] = []
         self.last_reply: str = ""
+        self.replies: deque[str] = deque(maxlen=REPLIES_MAX)
         self.subagent_transcripts: dict[str, list[str]] = {}
         self._pending: list[EventEnvelope] = []
         self._dirty: set[str] = set()
@@ -324,6 +346,31 @@ class TuiState:
         """Wake the consumer immediately (operator action side effects)."""
         self._wake.set()
 
+    # ---- bounded feed window (Issue #33) ----
+
+    def extend_feed(self, batch: Sequence[EventEnvelope]) -> None:
+        """Append one coalesced batch, dropping the oldest beyond the window.
+
+        ``event_count`` keeps the session total (the statistics panel shows
+        it), so bounding the window never changes reported numbers.
+        """
+        self.feed.extend(batch)
+        self.event_count += len(batch)
+
+    def recent_feed(self, limit: int) -> list[EventEnvelope]:
+        """The newest ``limit`` envelopes of the bounded window, in order."""
+        if len(self.feed) <= limit:
+            return list(self.feed)
+        return list(self.feed)[-limit:]
+
+    def report_error(self, message: str) -> None:
+        """Record one UI/system error line (bounded; rendered by the chat).
+
+        The Issue #28 degradation path: a failed worker iteration or decision
+        surfaces here and in the operator log instead of exiting the app.
+        """
+        self.system_errors.append(message)
+
     def take_dirty(self) -> set[str]:
         """Consume the dirty-type set accumulated since the last call."""
         dirty, self._dirty = self._dirty, set()
@@ -337,7 +384,7 @@ class TuiState:
 
     async def preload(self) -> None:
         """Initial fill: journal tail + one snapshot pull (session open)."""
-        self.feed.extend(await self.view.journal_tail(self.tail_size))
+        self.extend_feed(await self.view.journal_tail(self.tail_size))
         await self.refresh()
 
     async def refresh(self) -> None:
@@ -354,12 +401,29 @@ class TuiState:
         Duck-typed on purpose: the result is an L0 state mapping and the TUI
         must not import the L0 stack (arch §2.5).
         """
-        self.last_reply = orchestrator_reply(result) or self.last_reply
+        reply = orchestrator_reply(result)
+        self.last_reply = reply or self.last_reply
+        if reply and (not self.replies or reply != self.replies[-1]):
+            # Issue #47: keep the whole reply history (bounded), not just
+            # the latest line — the chat panel renders the full dialog.
+            # A step without fresh prose (delegation turns, HITL pauses)
+            # still returns the last non-empty AI text of the WHOLE
+            # accumulated history, so an unchanged reply means "no new
+            # prose this step": appending it would re-append the previous
+            # turn — the same per-step-delta flaw the #14 snapshot
+            # semantics solved for delegation transcripts.
+            self.replies.append(reply)
         todos = orchestrator_todos(result)
         if todos:
             self.todos = todos
-        for subagent, entries in delegation_transcripts(result).items():
-            self.subagent_transcripts.setdefault(subagent, []).extend(entries)
+        transcripts = delegation_transcripts(result)
+        if transcripts:
+            # Snapshot semantics (Issue #14): the step result carries the
+            # FULL message history (langgraph accumulates ``messages``), so
+            # the re-paired transcripts are the complete set — replace, do
+            # not extend (extending re-added every historical delegation on
+            # each delegation-bearing step).
+            self.subagent_transcripts = transcripts
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +528,8 @@ def delegation_transcripts(result: object) -> dict[str, list[str]]:
 
 
 __all__ = [
+    "FEED_MAX",
+    "REPLIES_MAX",
     "ApprovalChoice",
     "ApprovalItem",
     "SessionView",

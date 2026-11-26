@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 import yaml
 from pydantic import (
@@ -30,6 +30,8 @@ from pydantic import (
     ValidationInfo,
     field_validator,
 )
+
+from swarmy.tools.projector import UNTRUSTED_BEGIN, UNTRUSTED_END
 
 # ``"<module>/tools/result.py:ClassName"`` (AD-3): exactly one module-folder
 # segment, the fixed ``tools/result.py`` suffix, then the exported class name.
@@ -49,6 +51,40 @@ class ManifestError(ValueError):
     """
 
 
+class Utf8Error(ValueError):
+    """A file that must be UTF-8 is not decodable as UTF-8 (#57, #62).
+
+    The message always names the offending path, so every typed fail-fast
+    contract (``ManifestError``, ``SecretsConfigError``, ``ConfigError``,
+    loader ``LoadProblem``) can surface the decode failure without a raw
+    ``UnicodeDecodeError`` traceback escaping the boundary.
+    """
+
+    def __init__(self, path: Path, exc: UnicodeDecodeError) -> None:
+        """Name the file, the byte offset and the codec reason of the failure."""
+        super().__init__(
+            f"{path}: not valid UTF-8 at byte {exc.start}: {exc.reason}"
+        )
+        self.path = path
+
+
+def read_utf8(path: Path) -> str:
+    """Read *path* as UTF-8 with a typed decode failure (shared #57/#62 helper).
+
+    The strict-UTF-8 read of every fail-fast config/manifest surface: bytes
+    are read first, then decoded explicitly, so a non-UTF-8 file raises the
+    typed :class:`Utf8Error` (naming the file) instead of a raw
+    ``UnicodeDecodeError`` — which is a ``ValueError`` and escapes every
+    ``except OSError`` guard. ``OSError`` propagates unchanged (unreadable
+    files keep each caller's existing handling).
+    """
+    data = path.read_bytes()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Utf8Error(path, exc) from exc
+
+
 class ResultSpec(BaseModel):
     """Parsed ``result`` reference: module folder and response-format class (AD-3)."""
 
@@ -56,6 +92,37 @@ class ResultSpec(BaseModel):
 
     module_name: str
     class_name: str
+
+
+#: Maximum length of a manifest ``description`` after normalization (F-9).
+#: The description is model-facing text (the orchestrator picks ``task()``
+#: targets by it); the cap bounds a module author's reach into the
+#: orchestrator's trusted instruction block while leaving ample room for
+#: honest routing text.
+MAX_DESCRIPTION_CHARS: Final[int] = 400
+
+#: In-content occurrences of the verbatim §6.8 markers are defused with the
+#: projector's ``[defused:...]`` form so a description cannot open or close
+#: an untrusted block inside the roster (F-9; same mechanism as D24).
+_DEFUSED_BEGIN: Final[str] = f"[defused:{UNTRUSTED_BEGIN[1:-1]}]"
+_DEFUSED_END: Final[str] = f"[defused:{UNTRUSTED_END[1:-1]}]"
+
+
+def normalize_description(text: str) -> str:
+    """Normalize a manifest description for every model-facing surface (F-9).
+
+    One shared treatment for the roster of the orchestrator prompt and the
+    ``SubAgent`` dict: control characters (including newlines) become plain
+    spaces, whitespace runs collapse, in-content occurrences of the verbatim
+    §6.8 untrusted markers are defused (D24 mechanism), and the result is
+    stripped. Length is *not* capped here — :class:`AgentModuleManifest`
+    validates the cap as a load problem so an over-long description fails
+    fast instead of being silently truncated.
+    """
+    replaced = text.translate(dict.fromkeys([*range(32), 127, *range(0x80, 0xA0)], " "))
+    replaced = replaced.replace(UNTRUSTED_BEGIN, _DEFUSED_BEGIN)
+    replaced = replaced.replace(UNTRUSTED_END, _DEFUSED_END)
+    return " ".join(replaced.split())
 
 
 def parse_result_spec(value: str) -> ResultSpec:
@@ -104,6 +171,29 @@ class AgentModuleManifest(BaseModel):
             field = info.field_name or "<unknown>"
             raise ValueError(f"field '{field}' must be a non-empty string")
         return value
+
+    @field_validator("description")
+    @classmethod
+    def _normalize_model_facing_description(
+        cls, value: str, info: ValidationInfo
+    ) -> str:
+        """Normalize and length-cap the description (F-9, review).
+
+        The description reaches the orchestrator system prompt (instruction
+        position) and the ``SubAgent`` dict; it is stored normalized (control
+        characters flattened, whitespace collapsed, embedded §6.8 markers
+        defused) and over-length descriptions are a validation error — the
+        loader aggregates them as a load problem instead of truncating
+        silently.
+        """
+        normalized = normalize_description(value)
+        if len(normalized) > MAX_DESCRIPTION_CHARS:
+            field = info.field_name or "description"
+            raise ValueError(
+                f"field '{field}' must be at most {MAX_DESCRIPTION_CHARS} "
+                f"characters after normalization (got {len(normalized)})"
+            )
+        return normalized
 
     @field_validator("result")
     @classmethod
@@ -157,7 +247,13 @@ def parse_agent_module(agent_md_path: Path) -> ParsedAgentModule:
     """
     if not agent_md_path.is_file():
         raise ManifestError(f"AGENT.md not found: {agent_md_path}")
-    text = agent_md_path.read_text(encoding="utf-8")
+    try:
+        text = read_utf8(agent_md_path)
+    except Utf8Error as exc:
+        # Non-UTF-8 module files are a ManifestError, not a raw
+        # UnicodeDecodeError: the loader's aggregate fail-fast collection
+        # keeps collecting the problems of the other modules (#57, option b).
+        raise ManifestError(str(exc)) from exc
     try:
         frontmatter, system_prompt = split_frontmatter(text)
     except ManifestError as exc:

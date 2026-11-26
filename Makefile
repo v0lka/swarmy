@@ -111,7 +111,7 @@ test-unit: ## Gate: unit suite, coverage ≥ 85% (roadmap T1.5.6)
 test-integration: ## Integration suite (echo app); coverage ≥ 70% gate ACTIVE since T2.4.3 (G5, D22)
 	$(UV) run pytest $(TESTS_DIR)/integration --cov=$(PACKAGE) --cov-report=term-missing --cov-fail-under=$(INTEGRATION_COVERAGE)
 
-test-fast: ## Fast run of all tests without gates (advisory; until gates activate in F1/F2)
+test-fast: ## Fast run of all tests without gates (advisory; D22 coverage gates run in `make test`)
 	$(UV) run pytest $(TESTS_DIR)/unit $(TESTS_DIR)/integration
 
 # ---- Smoke: F0 criterion and CI step (arch §15.4; roadmap T1.1.4) ----

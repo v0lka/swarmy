@@ -21,6 +21,7 @@ client) lands in T2.4.2; here a fake tool drives the middleware directly.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,7 @@ from langgraph.types import Command
 
 from swarmy.guardrails.models import GuardrailRule, RuleCondition, Verdict
 from swarmy.guardrails.pipeline import GuardrailPipeline, tool_args_digest
+from swarmy.modules.loader import PLATFORM_TOOL_BUDGET_CLASSES
 from swarmy.tools.projector import (
     DEFAULT_BUDGET_BYTES,
     UNTRUSTED_BEGIN,
@@ -43,6 +45,8 @@ from swarmy.tools.projector import (
 )
 
 if TYPE_CHECKING:
+    import pytest
+
     from swarmy.events.models import GuardrailBlockedPayload
 
 #: Operator secret injected through the projector constructor (the
@@ -200,7 +204,9 @@ async def test_unknown_tool_uses_default_budget() -> None:
 # ---- fail-closed projection ----
 
 
-async def test_projection_failure_returns_safe_feedback_never_raw() -> None:
+async def test_projection_failure_returns_safe_feedback_never_raw(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A projection error replaces the result with safe feedback (no leak)."""
     middleware = make_projector_middleware(_ExplodingProjector())
     raw = f"raw body with {_SECRET} inside"
@@ -208,7 +214,8 @@ async def test_projection_failure_returns_safe_feedback_never_raw() -> None:
     async def handler(request: ToolCallRequest) -> ToolMessage:
         return ToolMessage(content=raw, tool_call_id=str(request.tool_call.get("id", "")))
 
-    outcome = await middleware.awrap_tool_call(_make_request("probe", {}), handler)
+    with caplog.at_level(logging.ERROR, logger="swarmy.tools.projector"):
+        outcome = await middleware.awrap_tool_call(_make_request("probe", {}), handler)
     assert isinstance(outcome, ToolMessage)
     content = outcome.content
     assert isinstance(content, str)
@@ -216,22 +223,32 @@ async def test_projection_failure_returns_safe_feedback_never_raw() -> None:
     assert _SECRET not in content
     assert raw not in content
     assert outcome.tool_call_id == "call-1"
+    # Issue #24: the failure is diagnosable — tool name + exception in the log.
+    failure_records = [record for record in caplog.records if "projection failed" in record.message]
+    assert failure_records, "a swallowed projection failure must leave a log record"
+    assert "probe" in failure_records[0].getMessage()
+    assert failure_records[0].levelno == logging.ERROR
+    assert failure_records[0].exc_info is not None  # the traceback is recorded
 
 
-def test_sync_projection_failure_returns_safe_feedback_never_raw() -> None:
-    """The synchronous hook is fail-closed too."""
+def test_sync_projection_failure_returns_safe_feedback_never_raw(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The synchronous hook is fail-closed too (and logs, Issue #24)."""
     middleware = make_projector_middleware(_ExplodingProjector())
     raw = "raw body that must not leak"
 
     def handler(request: ToolCallRequest) -> ToolMessage:
         return ToolMessage(content=raw, tool_call_id=str(request.tool_call.get("id", "")))
 
-    outcome = middleware.wrap_tool_call(_make_request("probe", {}), handler)
+    with caplog.at_level(logging.ERROR, logger="swarmy.tools.projector"):
+        outcome = middleware.wrap_tool_call(_make_request("fetch", {}), handler)
     assert isinstance(outcome, ToolMessage)
     content = outcome.content
     assert isinstance(content, str)
     assert "[projection failed]" in content
     assert raw not in content
+    assert any("projection failed" in record.message for record in caplog.records)
 
 
 # ---- integration-level scenario (fake tool; real HTTP lands in T2.4.2) ----
@@ -338,3 +355,53 @@ async def test_default_pipeline_digest_masks_builtin_detectors() -> None:
     digest = captured[0].tool_args_digest
     assert token not in digest
     assert mask_reference("bearer") in digest
+
+
+# ---------------------------------------------------------------------------
+# Issue #58 ↔ F-6 — the production tool-class wiring applies §6.8 budgets.
+# ---------------------------------------------------------------------------
+
+
+def test_platform_tool_budget_classes_cover_http_tools() -> None:
+    """The shared wiring map classifies every platform HTTP tool (§12.1)."""
+    for tool in ("http_get", "http_post", "http_put", "http_delete"):
+        assert PLATFORM_TOOL_BUDGET_CLASSES[tool] == "http_preview"
+    for tool in ("session_info", "generate_report", "update_finding_status"):
+        assert PLATFORM_TOOL_BUDGET_CLASSES[tool] == "memory_result"
+
+
+async def test_production_tool_classes_apply_http_preview_budget() -> None:
+    """An HTTP tool envelope truncates at the configured preview budget.
+
+    The production sites wire ``PLATFORM_TOOL_BUDGET_CLASSES`` into the
+    middleware (engine builders + loader subagent list); the 500-byte
+    envelope here is cut at ``http_preview_bytes: 100`` with the verbatim
+    marker instead of silently using the 4 000-byte default.
+    """
+    projector = ContextProjector(budgets={"http_preview_bytes": 100}, mark_untrusted=False)
+    middleware = ProjectorMiddleware(projector, tool_classes=PLATFORM_TOOL_BUDGET_CLASSES)
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="x" * 500, tool_call_id=str(request.tool_call.get("id", "")))
+
+    outcome = await middleware.awrap_tool_call(_make_request("http_get", {}), handler)
+    assert isinstance(outcome, ToolMessage)
+    assert outcome.content == "x" * 100 + "\n" + truncation_marker(400)
+
+
+async def test_without_tool_classes_http_results_fall_to_default_budget() -> None:
+    """The regression being fixed: no map → the 4 000-byte default applies.
+
+    Pins the Issue #58 ↔ F-6 defect shape: with the old construction (no
+    ``tool_classes``) the same envelope passes untouched because it is under
+    ``DEFAULT_BUDGET_BYTES`` — the configured ``http_preview_bytes`` is dead.
+    """
+    projector = ContextProjector(budgets={"http_preview_bytes": 100}, mark_untrusted=False)
+    middleware = ProjectorMiddleware(projector)
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="x" * 500, tool_call_id=str(request.tool_call.get("id", "")))
+
+    outcome = await middleware.awrap_tool_call(_make_request("http_get", {}), handler)
+    assert isinstance(outcome, ToolMessage)
+    assert outcome.content == "x" * 500  # default budget never reached

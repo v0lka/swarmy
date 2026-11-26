@@ -94,7 +94,7 @@ class FindingsPanel(Vertical):
             table.add_row(
                 str(endpoint.id),
                 escape(self.masker(endpoint.host)),
-                endpoint.method,
+                escape(self.masker(endpoint.method)),
                 escape(self.masker(endpoint.path)),
                 endpoint.research_status,
                 "yes" if endpoint.out_of_scope else "",
@@ -123,7 +123,7 @@ class FindingsPanel(Vertical):
             card.update("select a finding row (enter) to open the card")
             return
         table = RichTable(show_header=False, padding=(0, 1))
-        table.add_row("[bold]finding[/]", f"#{finding.id} {finding.title}")
+        table.add_row("[bold]finding[/]", f"#{finding.id} {escape(self.masker(finding.title))}")
         table.add_row("[bold]class[/]", f"{finding.type.value} / {finding.severity.value}")
         table.add_row("[bold]status[/]", finding.status.value)
         if finding.endpoint_ref is not None:

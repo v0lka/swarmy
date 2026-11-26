@@ -132,3 +132,26 @@ def test_dummy_loads_under_yolo_profile_without_gates() -> None:
     assert gates["memory_probe"] is False
     assert gates["dummy_ping"] is False  # verify is gated by normal/paranoid only (arch §7.2)
     assert all(gate is False for gate in gates.values())  # yolo: no gates at all
+
+
+@pytest.mark.integration
+def test_two_consecutive_loads_are_independent() -> None:
+    """F-12/#35: a second ``load()`` resets the taxonomy, no ghost collisions.
+
+    The process-global ``EventRegistry`` and the session ``ToolRegistry``
+    must not leak registrations from one load into the next: a repeated (or
+    embedded-process sequential) session start re-registers the same module
+    set cleanly.
+    """
+    first: ModuleRegistry = ModuleLoader(
+        user_dirs=[FIXTURE_MODULES],
+        platform_toolset_factory=_platform_toolset_factory,
+    ).load()
+    second: ModuleRegistry = ModuleLoader(
+        user_dirs=[FIXTURE_MODULES],
+        platform_toolset_factory=_platform_toolset_factory,
+    ).load()
+    assert first.names() == second.names()
+    assert "dummy" in second.names()
+    # Fresh tool functions per load (no stale 'already registered' failures).
+    assert second.get("dummy").subagent["tools"] is not first.get("dummy").subagent["tools"]

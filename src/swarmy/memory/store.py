@@ -13,7 +13,10 @@ datetimes as UTC ISO-8601 TEXT (arch §4.3).
 
 from __future__ import annotations
 
+import asyncio
 import json
+import random
+import sqlite3
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
@@ -34,7 +37,6 @@ from swarmy.memory.models import (
 )
 
 if TYPE_CHECKING:
-    import sqlite3
     from collections.abc import Callable, Sequence
 
     import aiosqlite
@@ -253,10 +255,61 @@ def _fact_from(row: sqlite3.Row) -> Fact:
 
 
 # ---------------------------------------------------------------------------
+# Transaction discipline (#52/#53) - private.
+# ---------------------------------------------------------------------------
+
+class MemoryStoreBusy(RuntimeError):
+    """A multi-step memory mutation could not start its write transaction.
+
+    Raised after the bounded ``BEGIN IMMEDIATE`` retry budget is exhausted
+    (consolidated review #53). The message is agent-addressable: the
+    platform ``memory_*`` tool result tells the caller to retry, instead of
+    surfacing a raw sqlite error.
+    """
+
+
+#: BEGIN IMMEDIATE retry budget (consolidated review #53). The connection's
+#: ``busy_timeout`` (core.database, 5 s) already waits out cross-connection
+#: lock contention; what remains is same-connection interleaving — two
+#: coroutines reaching BEGIN on the one shared memory connection between
+#: awaits — which fails immediately with "cannot start a transaction within
+#: a transaction" until the other writer commits. A short bounded backoff
+#: with jitter rides out that window. Module constants so tests can shrink
+#: the delays.
+_TX_BEGIN_ATTEMPTS = 5
+_TX_RETRY_BASE_DELAY_S = 0.02
+_TX_RETRY_JITTER_S = 0.05
+
+#: Finding lifecycle transition matrix (RD-5, §4.2; consolidated review #12):
+#: candidate → verified | rejected, verified → rejected. Re-setting the
+#: current status is always allowed (severity update path).
+_ALLOWED_STATUS_TRANSITIONS: dict[FindingStatus, frozenset[FindingStatus]] = {
+    FindingStatus.CANDIDATE: frozenset({FindingStatus.VERIFIED, FindingStatus.REJECTED}),
+    FindingStatus.VERIFIED: frozenset({FindingStatus.REJECTED}),
+    FindingStatus.REJECTED: frozenset(),
+}
+
+
+def _insert_row_id(cursor: aiosqlite.Cursor) -> int:
+    """Return the rowid assigned to *this* INSERT cursor (#52).
+
+    ``cursor.lastrowid`` is per-cursor state and immune to concurrent
+    writers on the shared connection — unlike a follow-up
+    ``SELECT last_insert_rowid()``, which a concurrent INSERT between the
+    two awaits can hijack (the id would silently point at another row).
+    """
+    row_id = cursor.lastrowid
+    if row_id is None:
+        msg = "INSERT did not yield a rowid"
+        raise RuntimeError(msg)
+    return row_id
+
+
+# ---------------------------------------------------------------------------
 # Literal SQL (no composed table names) + the `get` dispatch table (§4.4).
 # ---------------------------------------------------------------------------
 
-_LAST_ROW_ID_SQL = "SELECT last_insert_rowid()"
+_ENDPOINT_EXISTS_SQL = "SELECT id FROM endpoints WHERE id = ?"
 _ENDPOINT_BY_KEY_SQL = "SELECT * FROM endpoints WHERE host = ? AND method = ? AND path = ?"
 _ENDPOINT_BY_ID_SQL = "SELECT * FROM endpoints WHERE id = ?"
 _ENDPOINT_INSERT_SQL = (
@@ -278,6 +331,7 @@ _PARAMETER_INSERT_SQL = (
 _PARAMETER_UPDATE_SQL = "UPDATE parameters SET type = ?, examples = ? WHERE id = ?"
 _PARAMETERS_BY_ENDPOINT_SQL = "SELECT * FROM parameters WHERE endpoint_id = ? ORDER BY id"
 _FINDING_BY_ID_SQL = "SELECT * FROM findings WHERE id = ?"
+_FINDING_EXISTS_SQL = "SELECT id FROM findings WHERE id = ?"
 _FINDING_INSERT_SQL = (
     "INSERT INTO findings"
     " (type, status, severity, cvss_vector, endpoint_ref, evidence_refs,"
@@ -300,6 +354,7 @@ _ATTACK_NODE_INSERT_SQL = (
 )
 _ATTACK_EDGE_INSERT_SQL = "INSERT INTO attack_edges (src, dst, kind) VALUES (?, ?, ?)"
 _FACT_BY_ID_SQL = "SELECT * FROM facts WHERE id = ?"
+_FACTS_BY_SUBJECT_SQL = "SELECT * FROM facts WHERE subject = ? ORDER BY id"
 _FACT_INSERT_SQL = (
     "INSERT INTO facts (subject, predicate, obj, tags, source, created_at)"
     " VALUES (?, ?, ?, ?, ?, ?)"
@@ -322,15 +377,6 @@ _GET_SPECS: dict[EntityType, tuple[str, Callable[[sqlite3.Row], _DomainModel]]] 
 }
 
 
-async def _last_row_id(conn: aiosqlite.Connection) -> int:
-    """Read ``last_insert_rowid()`` of this connection (per-connection safe)."""
-    cursor = await conn.execute(_LAST_ROW_ID_SQL)
-    row = await cursor.fetchone()
-    if row is None:
-        raise RuntimeError("last_insert_rowid() returned no row")
-    return int(row[0])
-
-
 class MemoryStore:
     """Typed facade over the domain tables - the API table of arch §4.4."""
 
@@ -346,6 +392,32 @@ class MemoryStore:
             self._conn = await self._db.connection("memory")
         return self._conn
 
+    async def _begin_write(self, conn: aiosqlite.Connection) -> None:
+        """``BEGIN IMMEDIATE`` with bounded retry + jitter (#53).
+
+        A concurrent multi-step mutation on the same shared connection can
+        leave this BEGIN arriving inside that writer's open transaction;
+        the sqlite error is transient (it clears when the other writer
+        commits), so a short bounded backoff retries it. On exhaustion the
+        failure surfaces as :class:`MemoryStoreBusy` — an agent-facing
+        message, never a raw sqlite traceback.
+        """
+        for attempt in range(1, _TX_BEGIN_ATTEMPTS + 1):
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as exc:
+                if attempt == _TX_BEGIN_ATTEMPTS:
+                    msg = (
+                        "memory subsystem is busy: could not start a write "
+                        f"transaction after {_TX_BEGIN_ATTEMPTS} attempts; "
+                        "retry the call"
+                    )
+                    raise MemoryStoreBusy(msg) from exc
+                await asyncio.sleep(
+                    _TX_RETRY_BASE_DELAY_S + random.uniform(0.0, _TX_RETRY_JITTER_S)
+                )
+
     async def save_target(self, base_url: str) -> Target:
         """Insert the session target row and return it (§4.2, T3.1.2).
 
@@ -355,10 +427,10 @@ class MemoryStore:
         no update path in v0.1: one session, one target (spec §6.1).
         """
         conn = await self._memory()
-        await conn.execute("BEGIN IMMEDIATE")
+        await self._begin_write(conn)
         try:
-            await conn.execute(_TARGET_INSERT_SQL, (base_url,))
-            target_id = await _last_row_id(conn)
+            cursor = await conn.execute(_TARGET_INSERT_SQL, (base_url,))
+            target_id = _insert_row_id(cursor)
             await conn.commit()
         except BaseException:
             await conn.rollback()
@@ -399,14 +471,14 @@ class MemoryStore:
         new ones inserted.
         """
         conn = await self._memory()
-        await conn.execute("BEGIN IMMEDIATE")
+        await self._begin_write(conn)
         try:
             cursor = await conn.execute(
                 _ENDPOINT_BY_KEY_SQL, (draft.host, draft.method, draft.path)
             )
             row = await cursor.fetchone()
             if row is None:
-                await conn.execute(
+                insert_cursor = await conn.execute(
                     _ENDPOINT_INSERT_SQL,
                     (
                         draft.host,
@@ -418,7 +490,7 @@ class MemoryStore:
                         draft.notes,
                     ),
                 )
-                endpoint_id = await _last_row_id(conn)
+                endpoint_id = _insert_row_id(insert_cursor)
             else:
                 endpoint_id = int(row["id"])
                 await conn.execute(
@@ -439,19 +511,26 @@ class MemoryStore:
         return await self._endpoint_by_id(conn, endpoint_id)
 
     async def save_finding(self, draft: FindingDraft) -> Finding:
-        """Insert a finding candidate; validate evidence refs (§4.4).
+        """Insert a finding candidate; validate evidence and endpoint refs (§4.4).
 
         Raises ``ValueError`` listing every ``evidence_refs`` id that has no
-        ``evidence`` row. On success the referenced evidence rows are attached
-        (``finding_ref``) to the new finding.
+        ``evidence`` row, and naming ``endpoint_ref`` when it has no
+        ``endpoints`` row (agent-addressable instead of a raw FK error,
+        consolidated review #63). On success the referenced evidence rows
+        are attached (``finding_ref``) to the new finding.
         """
         conn = await self._memory()
+        if draft.endpoint_ref is not None:
+            cursor = await conn.execute(_ENDPOINT_EXISTS_SQL, (draft.endpoint_ref,))
+            if await cursor.fetchone() is None:
+                msg = f"endpoint_ref not found in endpoints: {draft.endpoint_ref}"
+                raise ValueError(msg)
         missing = await self._missing_evidence(conn, draft.evidence_refs)
         if missing:
             raise ValueError(f"evidence_refs not found in evidence: {missing}")
-        await conn.execute("BEGIN IMMEDIATE")
+        await self._begin_write(conn)
         try:
-            await conn.execute(
+            insert_cursor = await conn.execute(
                 _FINDING_INSERT_SQL,
                 (
                     draft.type.value,
@@ -467,7 +546,7 @@ class MemoryStore:
                     _utcnow_iso(),  # created_at = now UTC (arch §4.3)
                 ),
             )
-            finding_id = await _last_row_id(conn)
+            finding_id = _insert_row_id(insert_cursor)
             for ref in draft.evidence_refs:
                 await conn.execute(_EVIDENCE_ATTACH_SQL, (finding_id, ref))
             await conn.commit()
@@ -481,17 +560,48 @@ class MemoryStore:
     ) -> Finding:
         """Set the lifecycle status (and optionally the severity) of a finding.
 
-        Raises ``KeyError`` for an unknown finding id.
+        Enforces the documented finding lifecycle (RD-5, §4.2; consolidated
+        review #12): allowed transitions are ``candidate -> verified``,
+        ``candidate -> rejected`` and ``verified -> rejected``; re-setting
+        the current status is allowed (the severity-update path). Any other
+        transition (e.g. demoting a verified finding back to candidate, or
+        resurrecting a rejected one) raises ``ValueError`` naming the
+        current and target statuses. Raises ``KeyError`` for an unknown
+        finding id.
         """
         conn = await self._memory()
-        if severity is None:
-            cursor = await conn.execute(_FINDING_UPDATE_STATUS_SQL, (status.value, id))
-        else:
-            cursor = await conn.execute(
-                _FINDING_UPDATE_SEVERITY_SQL, (status.value, severity.value, id)
-            )
-        if cursor.rowcount == 0:
-            raise KeyError(f"finding {id} not found")
+        # #53 discipline: the read-validate-write sequence is one multi-step
+        # mutation — under the BEGIN IMMEDIATE lock a concurrent writer
+        # cannot slip a status change between the lifecycle validation and
+        # the UPDATE (single-writer semantics of every store mutation).
+        await self._begin_write(conn)
+        try:
+            cursor = await conn.execute(_FINDING_BY_ID_SQL, (id,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(f"finding {id} not found")
+            current = FindingStatus(str(row["status"]))
+            if status != current and status not in _ALLOWED_STATUS_TRANSITIONS[current]:
+                allowed = ", ".join(
+                    f"{source.value} -> {target.value}"
+                    for source, targets in _ALLOWED_STATUS_TRANSITIONS.items()
+                    for target in sorted(targets, key=lambda item: item.value)
+                )
+                msg = (
+                    f"invalid finding status transition {current.value} -> "
+                    f"{status.value}; allowed transitions: {allowed}"
+                )
+                raise ValueError(msg)
+            if severity is None:
+                await conn.execute(_FINDING_UPDATE_STATUS_SQL, (status.value, id))
+            else:
+                await conn.execute(
+                    _FINDING_UPDATE_SEVERITY_SQL, (status.value, severity.value, id)
+                )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
         return await self._finding_by_id(conn, id)
 
     async def link_attack_node(
@@ -501,16 +611,27 @@ class MemoryStore:
 
         Edge endpoints may be ``None`` (the new node itself) or existing
         ``attack_nodes`` ids; any unknown reference rolls the whole operation
-        back - no node, no edges persist.
+        back - no node, no edges persist. A non-``None`` ``finding_ref``
+        without a ``findings`` row is rejected the same way (agent-facing
+        ``ValueError`` naming the field, consolidated review #63) instead of
+        a raw FK error.
         """
         conn = await self._memory()
-        await conn.execute("BEGIN IMMEDIATE")
+        await self._begin_write(conn)
         try:
-            await conn.execute(
+            # The schema FK on attack_nodes.finding_ref fires on the INSERT
+            # itself, so the ref is validated first — an agent-facing
+            # ValueError instead of a raw IntegrityError (#63).
+            if node.finding_ref is not None:
+                cursor = await conn.execute(_FINDING_EXISTS_SQL, (node.finding_ref,))
+                if await cursor.fetchone() is None:
+                    msg = f"finding_ref not found in findings: {node.finding_ref}"
+                    raise ValueError(msg)
+            insert_cursor = await conn.execute(
                 _ATTACK_NODE_INSERT_SQL,
                 (node.kind, node.finding_ref, node.title, node.description),
             )
-            node_id = await _last_row_id(conn)
+            node_id = _insert_row_id(insert_cursor)
             for edge in edges:
                 src = node_id if edge.src is None else edge.src
                 dst = node_id if edge.dst is None else edge.dst
@@ -534,7 +655,7 @@ class MemoryStore:
     async def add_fact(self, draft: FactDraft) -> Fact:
         """Insert one machine-readable statement and return it (§4.4)."""
         conn = await self._memory()
-        await conn.execute(
+        cursor = await conn.execute(
             _FACT_INSERT_SQL,
             (
                 draft.subject,
@@ -545,7 +666,7 @@ class MemoryStore:
                 _utcnow_iso(),
             ),
         )
-        fact_id = await _last_row_id(conn)
+        fact_id = _insert_row_id(cursor)
         cursor = await conn.execute(_FACT_BY_ID_SQL, (fact_id,))
         row = await cursor.fetchone()
         if row is None:  # pragma: no cover - committed above, defensive only
@@ -555,11 +676,11 @@ class MemoryStore:
     async def add_note(self, draft: NoteDraft) -> Note:
         """Insert one free-form observation and return it (§4.4)."""
         conn = await self._memory()
-        await conn.execute(
+        cursor = await conn.execute(
             _NOTE_INSERT_SQL,
             (draft.text, _dumps(draft.tags), draft.author, _utcnow_iso()),
         )
-        note_id = await _last_row_id(conn)
+        note_id = _insert_row_id(cursor)
         cursor = await conn.execute(_NOTE_BY_ID_SQL, (note_id,))
         row = await cursor.fetchone()
         if row is None:  # pragma: no cover - committed above, defensive only
@@ -575,7 +696,7 @@ class MemoryStore:
         not set here - findings attach evidence via ``save_finding``.
         """
         conn = await self._memory()
-        await conn.execute(
+        cursor = await conn.execute(
             _EVIDENCE_INSERT_SQL,
             (
                 draft.kind.value,
@@ -584,12 +705,25 @@ class MemoryStore:
                 _utcnow_iso(),
             ),
         )
-        evidence_id = await _last_row_id(conn)
+        evidence_id = _insert_row_id(cursor)
         cursor = await conn.execute(_EVIDENCE_BY_ID_SQL, (evidence_id,))
         row = await cursor.fetchone()
         if row is None:  # pragma: no cover - committed above, defensive only
             raise RuntimeError(f"evidence {evidence_id} vanished after its own insert")
         return _evidence_from(row)
+
+    async def list_facts(self, subject: str) -> list[Fact]:
+        """Every fact with exactly this subject, in ledger (row) order.
+
+        A direct domain-table read (not FTS): the full, deterministically
+        ordered ledger — a ranked/limited search result would truncate a
+        long ledger arbitrarily and turn the replay of machine-readable
+        statements (e.g. the judge-gate ledger, §6.7) unsound.
+        """
+        conn = await self._memory()
+        cursor = await conn.execute(_FACTS_BY_SUBJECT_SQL, (subject,))
+        rows = await cursor.fetchall()
+        return [_fact_from(row) for row in rows]
 
     async def list_endpoints(self, out_of_scope: bool | None = None) -> list[Endpoint]:
         """List endpoints, optionally filtered by scope status (read-only)."""

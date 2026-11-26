@@ -11,6 +11,7 @@ injections with one orchestrator step. Key bindings navigate the panels;
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, ClassVar
 
 from textual import on, work
@@ -116,35 +117,68 @@ class SwarmyTui(App[None]):
 
     @work(exclusive=True)
     async def _session_worker(self) -> None:
-        """Serve coalesced batches; drain runtime injections step by step."""
+        """Serve coalesced batches; drain runtime injections step by step.
+
+        Every await in the loop is guarded (Issue #28): one failed pass — a
+        provider hiccup on ``run_step``, a journal decode or render error —
+        is reported as a system line in the chat feed and the loop continues;
+        the worker used to be a bare ``while True`` whose first exception
+        exited the whole console. Idle poll ticks (no batch, no dirty types)
+        skip the panel re-render entirely (Issue #33: the console used to
+        re-render all six panels ~10x/s even when nothing happened).
+        """
         while True:
-            batch = await self.state.wait_batch(poll_after=0.1)
-            if batch:
-                self.state.feed.extend(batch)  # coalescing: nothing is lost
-            dirty = self.state.take_dirty()
-            if batch or self.state.needs_snapshot(dirty):
-                await self.state.refresh()
-            self.refresh_panels()
-            while self.view.pending_injections() > 0:
-                result = await self.view.run_step()
-                self.state.absorb(result)
-                await self.state.refresh()
+            try:
+                batch = await self.state.wait_batch(poll_after=0.1)
+                dirty = self.state.take_dirty()
+                if not batch and not dirty and self.view.pending_injections() == 0:
+                    continue  # idle poll tick: nothing new to render or drain
+                if batch:
+                    self.state.extend_feed(batch)  # coalescing: nothing is lost
+                if batch or self.state.needs_snapshot(dirty):
+                    await self.state.refresh()
                 self.refresh_panels()
+                while self.view.pending_injections() > 0:
+                    result = await self.view.run_step()
+                    self.state.absorb(result)
+                    await self.state.refresh()
+                    self.refresh_panels()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # one failed pass must not kill the TUI
+                self._report_error(exc)
+                await asyncio.sleep(0.5)  # back off before the retry pass
 
     # ---- rendering ----
 
     def refresh_panels(self) -> None:
-        """Push the current snapshot cache into every panel."""
-        panels = (
-            self.query_one("#panel-chat", ChatPanel),
-            self.query_one("#panel-activity", ActivityPanel),
-            self.query_one("#panel-findings", FindingsPanel),
-            self.query_one("#panel-approvals", ApprovalsPanel),
-            self.query_one("#panel-trees", TreesPanel),
-            self.query_one("#panel-plans", PlansPanel),
-        )
-        for panel in panels:
-            panel.refresh_state(self.state, self.view)
+        """Push the current snapshot cache into every panel.
+
+        Panel render failures are isolated (Issue #28): one broken panel is
+        reported to the error line and the others still update — a render
+        defect can no longer crash the session worker through this path.
+        """
+        for panel_id, panel_type in (
+            ("#panel-chat", ChatPanel),
+            ("#panel-activity", ActivityPanel),
+            ("#panel-findings", FindingsPanel),
+            ("#panel-approvals", ApprovalsPanel),
+            ("#panel-trees", TreesPanel),
+            ("#panel-plans", PlansPanel),
+        ):
+            try:
+                self.query_one(panel_id, panel_type).refresh_state(self.state, self.view)
+            except Exception as exc:  # per-panel isolation is the point (Issue #28)
+                self._report_error(exc)
+
+    def _report_error(self, exc: Exception) -> None:
+        """Surface one loop/render/decision failure without exiting (Issue #28).
+
+        Must never raise itself: it only logs and appends to the bounded
+        system-error buffer that the chat panel renders.
+        """
+        self.log.error(f"console failure: {type(exc).__name__}: {exc}")
+        self.state.report_error(f"{type(exc).__name__}: {exc}")
 
     # ---- navigation ----
 
@@ -160,40 +194,85 @@ class SwarmyTui(App[None]):
 
     @on(Input.Submitted)
     async def _send_chat(self, event: Input.Submitted) -> None:
-        """Send one operator message; the worker picks the injection up."""
+        """Send one operator message; the worker picks the injection up.
+
+        A ``send_operator_message`` failure (journal/bus fault) is reported
+        to the error line instead of crashing the console (Issue #28).
+        """
         if event.input.id != "chat-input":
             return
         text = event.value.strip()
         if not text:
             return
         event.input.value = ""
-        await self.view.send_operator_message(text)
+        try:
+            await self.view.send_operator_message(text)
+        except Exception as exc:  # a journaling failure must not kill the console
+            self._report_error(exc)
         self.state.kick()
 
     # ---- HITL modal (T4.3.1: modal for the operator, not for the swarm) ----
 
     @on(ApprovalModalOpen)
     def _open_approval_modal(self, event: ApprovalModalOpen) -> None:
-        """Push the decision modal for the requested FIFO entry."""
+        """Push the decision modal for the requested FIFO entry.
+
+        Re-entrancy guard (F-21): at most ONE modal at a time — a double
+        Enter (key repeat, or Enter racing the ~0.1 s panel refresh) used to
+        stack a second modal whose later dismissal addressed an
+        already-resolved request id and crashed the console.
+        """
+        if isinstance(self.screen, ApprovalModal):
+            return
         for item in self.state.approvals:
             if item.request_id == event.request_id:
                 self.push_screen(ApprovalModal(item), self._serve_decision)
                 return
 
     async def _serve_decision(self, decision: ModalDecision | None) -> None:
-        """Serve the modal decision through the facade; wake the worker."""
+        """Serve the modal decision through the facade; wake the worker.
+
+        Failure paths degrade instead of crashing (F-21 / Issue #28): an
+        unknown request id (a stale modal — the request was resolved while a
+        duplicate modal lingered) re-syncs the queue with a warning toast;
+        any resume/provider failure lands in the system error line.
+        """
         if decision is None:
             return
-        result = await self.view.submit_decision(
-            decision.request_id, decision.decision, decision.edited_args
-        )
-        # The resume continuation is a graph result like any step — fold it
-        # into the state (transcripts/todos) and wake the loop for follow-ons.
-        if result is not None:
-            self.state.absorb(result)
-            await self.state.refresh()
+        try:
+            result = await self.view.submit_decision(
+                decision.request_id, decision.decision, decision.edited_args
+            )
+            # The post-decision snapshot re-pull sits inside the same guard:
+            # a transient read error must degrade to the error line, never
+            # kill the console on the decision path (Issue #28 philosophy).
+            if result is not None:
+                self.state.absorb(result)
+                await self.state.refresh()
+        except ValueError as exc:
+            self.notify(
+                "approval already resolved — queue refreshed",
+                title="Approvals",
+                severity="warning",
+                markup=False,
+            )
+            self.log.warning(f"stale approval modal: {exc}")
+            await self._resync_after_stale_decision()
+            return
+        except Exception as exc:  # resume/provider failures keep the console up
+            self._report_error(exc)
+            self.state.kick()
+            return
         self.refresh_panels()
         self.state.kick()
+
+    async def _resync_after_stale_decision(self) -> None:
+        """Re-pull the snapshots after a stale decision (F-21b re-sync)."""
+        try:
+            await self.state.refresh()
+        except Exception as exc:  # even the re-sync must not kill the console
+            self._report_error(exc)
+        self.refresh_panels()
 
     # ---- finding cards (T4.2.3 / T4.4.1: node → finding transition) ----
 

@@ -32,8 +32,9 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
     "ruff>=0.6",
-    "ty>=0.0.1alpha5",  # F0 decision (roadmap T1.1.1): ty primary, mypy is the declared fallback
-    "aiohttp>=3.9",     # echo-app test fixture only (dev-group, arch §15.2)
+    "ty>=0.0.110",  # F0 (roadmap T1.1.1): ty primary; 0.0.110 renamed `unresolved-import` → `import-not-found` (the key [tool.ty.rules] uses)
+    "mypy>=1.11",   # the declared fallback checker (`make typecheck TYPECHECKER=mypy`)
+    "aiohttp>=3.9", # echo-app test fixture only (dev-group, arch §15.2)
 ]
 
 [build-system]

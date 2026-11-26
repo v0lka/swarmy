@@ -288,3 +288,102 @@ async def test_add_fact_and_note_return_json(
     )
     assert hits
     assert hits[0]["id"] == fact["id"]
+
+
+async def test_upsert_endpoint_normalizes_method_at_the_boundary(
+    platform_env: tuple[dict[str, object], MemoryStore, _EmitRecorder, aiosqlite.Connection],
+) -> None:
+    """Methods upper-case and RFC 9110 tokens only (F-15 handoff, option b).
+
+    A lower-case alias dedups onto the canonical row; a junk value (a
+    target-controlled or hallucinated non-token) is rejected with an
+    agent-addressable error and nothing is stored.
+    """
+    tools, _store, _recorder, conn = platform_env
+    upsert = tools["memory_upsert_endpoint"]
+    created = json.loads(str(await upsert(host="app.example.com:443", method="get", path="/")))
+    assert created["method"] == "GET"
+    # the canonical upper-case spelling dedups onto the same row
+    updated = json.loads(
+        str(await upsert(host="app.example.com:443", method="GET", path="/", notes="seen"))
+    )
+    assert updated["id"] == created["id"]
+    with pytest.raises(ValueError, match="invalid HTTP method"):
+        await upsert(host="app.example.com:443", method="[/etc/passwd]", path="/x")
+    with pytest.raises(ValueError, match="invalid HTTP method"):
+        await upsert(host="app.example.com:443", method="get /admin", path="/x")
+    with pytest.raises(ValueError, match="invalid HTTP method"):
+        await upsert(host="app.example.com:443", method="", path="/x")
+    assert await _rows(conn, "endpoints") == 1  # junk never entered memory
+
+
+async def test_upsert_endpoint_sentinels_preserve_stored_values(
+    platform_env: tuple[dict[str, object], MemoryStore, _EmitRecorder, aiosqlite.Connection],
+) -> None:
+    """Re-upserting a known endpoint keeps omitted fields (Issue #9, option a).
+
+    ``None`` is the sentinel for "keep the stored value": a crawler
+    re-discovering a known endpoint without repeating the flag/status/notes
+    must not reset them — combined with the fail-closed unmark rule this
+    keeps the ``out_of_scope`` contour state agent-proof.
+    """
+    tools, store, _recorder, _conn = platform_env
+    upsert = tools["memory_upsert_endpoint"]
+    await upsert(
+        host="app.example.com:443",
+        method="POST",
+        path="/admin/export",
+        auth_requirements=["admin_cookie"],
+        research_status="probed",
+        out_of_scope=True,
+        notes="operator excluded: corrupts production data",
+    )
+    # re-discovery with every optional field omitted (the crawler default)
+    rediscovered = json.loads(
+        str(await upsert(host="app.example.com:443", method="POST", path="/admin/export"))
+    )
+    assert rediscovered["out_of_scope"] is True
+    assert rediscovered["research_status"] == "probed"
+    assert rediscovered["notes"] == "operator excluded: corrupts production data"
+    assert rediscovered["auth_requirements"] == ["admin_cookie"]
+    rows = await store.list_endpoints()
+    assert len(rows) == 1
+    assert rows[0].out_of_scope is True
+
+
+async def test_upsert_endpoint_cannot_clear_out_of_scope_mark(
+    platform_env: tuple[dict[str, object], MemoryStore, _EmitRecorder, aiosqlite.Connection],
+) -> None:
+    """Clearing an existing mark is refused (fail-closed, arch §6.3).
+
+    ``out_of_scope=False`` on an already-marked endpoint raises an
+    agent-addressable error naming the operator decision requirement; the
+    stored flag (and the other fields) survive the refused call. Explicit
+    ``False`` on an unmarked endpoint stays a legal no-op.
+    """
+    tools, store, _recorder, _conn = platform_env
+    upsert = tools["memory_upsert_endpoint"]
+    await upsert(
+        host="app.example.com:443",
+        method="GET",
+        path="/soft",
+        out_of_scope=True,
+        notes="fragile legacy app",
+    )
+    with pytest.raises(ValueError, match="operator decision"):
+        await upsert(
+            host="app.example.com:443",
+            method="GET",
+            path="/soft",
+            out_of_scope=False,
+            notes="trying to widen the perimeter",
+        )
+    rows = await store.list_endpoints()
+    assert len(rows) == 1
+    assert rows[0].out_of_scope is True  # the deny never cleared the mark
+    assert rows[0].notes == "fragile legacy app"  # nothing was written
+    # explicit False on an *unmarked* endpoint stays legal (no widening)
+    await upsert(host="app.example.com:443", method="GET", path="/open", out_of_scope=False)
+    unmarked = [row for row in await store.list_endpoints() if row.path == "/open"]
+    assert len(unmarked) == 1
+    assert unmarked[0].out_of_scope is False

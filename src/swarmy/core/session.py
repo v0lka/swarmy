@@ -20,7 +20,7 @@ M3 session is complete without it.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol, TypeVar
+from typing import TYPE_CHECKING, Final, Protocol, TypeVar, cast
 
 import yaml
 
@@ -48,16 +48,31 @@ from swarmy.core.runtime import (
 from swarmy.events.bus import EventBus
 from swarmy.events.emit import EmitEventTool, make_emit_tool
 from swarmy.events.journal import JournalReader, JournalWriter
-from swarmy.events.models import EventSource, TargetSetPayload
+from swarmy.events.models import (
+    EndpointsDiscoveredPayload,
+    EndpointUpdatedPayload,
+    EventEnvelope,
+    EventSource,
+    ScopeChangedPayload,
+    TargetSetPayload,
+)
 from swarmy.guardrails.invariants import InvariantLayer, session_invariants
-from swarmy.guardrails.judge import LlmJudge
+from swarmy.guardrails.judge import JudgeEscalationRegistry, LlmJudge
 from swarmy.guardrails.pipeline import GuardrailPipeline, tool_args_digest
-from swarmy.memory.models import ReportStatistics
+from swarmy.memory.models import (
+    Endpoint,
+    EntityType,
+    FactDraft,
+    ReportStatistics,
+    ScopeEntry,
+)
 from swarmy.memory.schema import MIGRATIONS
 from swarmy.memory.search import Fts5SearchIndex
 from swarmy.memory.store import MemoryStore
 from swarmy.modules.loader import ModuleLoader
+from swarmy.modules.manifest import Utf8Error, read_utf8
 from swarmy.tools.http.client import (
+    GetaddrinfoHostResolver,
     HttpClientEvents,
     OutboundSecretWarn,
     SwarmyHttpClient,
@@ -65,12 +80,17 @@ from swarmy.tools.http.client import (
 from swarmy.tools.http.evidence import EvidenceRecorder
 from swarmy.tools.http.tools import make_http_tools
 from swarmy.tools.limits import ResourceLimiter
-from swarmy.tools.platform import make_memory_tools, make_session_info_tool
+from swarmy.tools.platform import (
+    bind_secret_substitution,
+    make_memory_tools,
+    make_session_info_tool,
+)
 from swarmy.tools.projector import ContextProjector
 from swarmy.tools.registry import BUILTIN_SOURCE, PLATFORM_OWNER, ToolRegistry, ToolSpec
-from swarmy.tools.scope import ScopeEntries, ScopeRegistry
+from swarmy.tools.scope import OutOfScopeEndpoint, ScopeEntries, ScopeRegistry
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from langchain_core.language_models.chat_models import BaseChatModel
@@ -89,7 +109,7 @@ class _JudgeBandAdapter:
     shared :class:`~swarmy.guardrails.judge.LlmJudge` (§6.7 wiring, T3.4.x).
     """
 
-    __slots__ = ("_gate_for", "_precall")
+    __slots__ = ("_gate_for", "_postcall", "_precall")
 
     def __init__(
         self,
@@ -98,10 +118,17 @@ class _JudgeBandAdapter:
             [str, Mapping[str, object], str],
             Awaitable[tuple[Verdict, BlockedFeedback | None] | None],
         ],
+        postcall: Callable[[str, str, str], asyncio.Task[None] | None] | None = None,
     ) -> None:
-        """Bind the two closures the session builder produced."""
+        """Bind the closures the session builder produced.
+
+        ``postcall`` is ``None`` only for exotic adapters built before the
+        T3.4.2 post-call band wiring (#54 ↔ F-19); the session adapter
+        always provides it.
+        """
         self._gate_for = gate_for
         self._precall = precall
+        self._postcall = postcall
 
     def gate_for(self, tool_name: str) -> tuple[Verdict, BlockedFeedback | None] | None:
         """Standing class verdict for the tool, or ``None`` when clear."""
@@ -112,6 +139,14 @@ class _JudgeBandAdapter:
     ) -> tuple[Verdict, BlockedFeedback | None] | None:
         """Judge one deterministically-allowed call (arch §6.7)."""
         return await self._precall(tool_name, tool_args, args_digest)
+
+    def postcall(
+        self, tool_name: str, result_text: str, args_digest: str
+    ) -> asyncio.Task[None] | None:
+        """Spawn the off-path result screen (T3.4.2, #54 ↔ F-19 wiring)."""
+        if self._postcall is None:
+            return None
+        return self._postcall(tool_name, result_text, args_digest)
 
 
 
@@ -145,6 +180,13 @@ def _write_snapshot(session_dir: Path, text: str) -> None:
 #: Journal tail window the report statistics are computed over (arch §11).
 _REPORT_STATISTICS_TAIL: Final[int] = 10_000
 
+#: ``facts.subject`` of the persisted judge class gates (F-18): every
+#: escalation closes a gate row (``obj="escalate"``) and every operator
+#: decision appends its resolution row (``obj=<decision>`` keyed by the
+#: escalate row's id in ``tags``). The subject is one FTS token group so
+#: the replay finds the gate ledger without a dedicated store API.
+_JUDGE_GATE_SUBJECT: Final[str] = "judge_class_gate"
+
 
 class ReportToolFactory(Protocol):
     """Structural type of the injected ``generate_report`` builder (RD-7).
@@ -169,8 +211,18 @@ class ReportToolFactory(Protocol):
 
 
 def _read_text(path: Path) -> str:
-    """Read one UTF-8 text file (sync helper for the ASYNC240 boundary)."""
-    return path.read_text(encoding="utf-8")
+    """Read one UTF-8 text file (sync helper for the ASYNC240 boundary).
+
+    Uses the shared strict-UTF-8 read (#57/#62); a non-UTF-8 session
+    snapshot raises the typed :class:`SessionError` naming the file — the
+    raw :class:`~swarmy.modules.manifest.Utf8Error` must not escape the
+    resume boundary as a bare ``ValueError`` traceback (arch §4.5 fail-fast).
+    """
+    try:
+        return read_utf8(path)
+    except Utf8Error as exc:
+        msg = f"session snapshot is not valid UTF-8: {exc}"
+        raise SessionError(msg) from exc
 
 
 _T = TypeVar("_T")
@@ -211,6 +263,12 @@ class Session:
         self.runtime: OrchestratorRuntime | None = None
         self._emit: EmitEventTool | None = None
         self._orchestrator_tools: dict[str, Callable[..., object]] = {}
+        self._report_tool_factory: ReportToolFactory | None = None
+        # F-18: live judge escalation id → durable gate-fact id (facts row).
+        # Keys are per-process; the fact ids are the durable identity replay
+        # matches decisions against. Also the duplicate-enqueue guard (#37):
+        # a key present here means the gate already has its queue request.
+        self._judge_gate_keys: dict[str, str] = {}
         self._closed = False
 
     # ---- open / resume / close ----
@@ -271,6 +329,7 @@ class Session:
         *,
         session_dir: Path,
         model: str | BaseChatModel | None = None,
+        judge_model: BaseChatModel | None = None,
         report_tool_factory: ReportToolFactory | None = None,
     ) -> Session:
         """Resume a session folder after a restart (arch §13.1, T3.2.4).
@@ -281,6 +340,15 @@ class Session:
         the schema version matches; the journal tail is replayed through the
         policy pipeline and the interrupted approvals are restored into the
         FIFO.
+
+        Args:
+            session_dir: the portable session folder to resume.
+            model: the orchestrator chat model override (test seam, mirrors
+                :meth:`open`).
+            judge_model: the judge chat model override (test seam, mirrors
+                :meth:`open` — the snapshot only carries the ``provider:model``
+                id, and tests must be able to inject the scripted judge).
+            report_tool_factory: the injected ``generate_report`` builder.
 
         Raises:
             SessionError: no session database in the folder, or the snapshot
@@ -297,7 +365,7 @@ class Session:
         await session._compose(
             fresh=False,
             model=model,
-            judge_model=None,
+            judge_model=judge_model,
             report_tool_factory=report_tool_factory,
         )
         runtime = session.runtime
@@ -311,15 +379,25 @@ class Session:
         """Checkpoint the WAL and close every connection (arch §3.3, T3.1.2).
 
         Idempotent. Order: bus subscriptions first (no more deliveries),
-        then the truncating WAL checkpoint (the side files fold into the
-        portable folder), then the database closes every subsystem
-        connection — including the checkpointer's (AD-6).
+        then the shared HTTP client's pool (Issue #41: the httpx pool must
+        not outlive the session — ``python -X dev`` otherwise surfaces
+        ResourceWarnings past shutdown), then the truncating WAL checkpoint
+        (the side files fold into the portable folder), then the database
+        closes every subsystem connection — including the checkpointer's
+        (AD-6).
         """
         if self._closed:
             return
         self._closed = True
+        # #54 ↔ F-19: spawned post-call judge tasks journal through the bus
+        # and append to the store — drain them before either shuts down so a
+        # shutdown race cannot drop a flag/escalation note.
+        if self.judge is not None:
+            await self.judge.wait_pending()
         if self.bus is not None:
             await self.bus.close()
+        if self.http_client is not None:
+            await self.http_client.aclose()
         database = self.database
         if database is not None:
             await database.checkpoint()
@@ -334,7 +412,17 @@ class Session:
 
         Rebuilds the ``interrupt_on`` matrix and recompiles the graph **on
         the same checkpointer** (documented L0 operation); journals the
-        operator decision and swaps the runtime onto the new graph.
+        operator decision and swaps the runtime onto the new graph. The
+        orchestrator toolset is rebuilt too (Issue #38): ``session_info`` is
+        composed with the mode baked in, so a post-switch session must hand
+        the graph the fresh toolset — the orchestrator then reports the
+        post-switch mode. The tool *registry* is untouched: names and risk
+        classes are unchanged (registration is fail-fast on duplicates and
+        carries no execution role), only the graph's bound callables change.
+
+        Seam note: v0.1 has no production caller yet — the operator surface
+        (TUI command/chat action) wires this method at M4; the seam is the
+        documented arch §9.5 runtime switch, and tests exercise it directly.
         """
         engine = self._require(self.engine)
         runtime = self._require(self.runtime)
@@ -342,6 +430,11 @@ class Session:
         if mode not in ("interactive", "mission"):
             msg = f"unknown autonomy mode {mode!r}; allowed: interactive, mission"
             raise ValueError(msg)
+        self._orchestrator_tools = self._build_orchestrator_tools(
+            emit,
+            report_tool_factory=self._report_tool_factory,
+            mode=mode,
+        )
         engine.recompile(
             profile=self.config.profile,
             mode=mode,  # type: ignore[arg-type]
@@ -364,6 +457,62 @@ class Session:
                 "edited_args_digest": None,
             },
         )
+
+    async def extend_scope(
+        self, entries: ScopeEntries, *, operator_comment: str = ""
+    ) -> None:
+        """Operator scope change: widen the allowlist mid-session (arch §6.3).
+
+        The platform contour the docs describe: the allowlist may grow only
+        through an operator decision, so this method merges ``entries`` via
+        ``ScopeRegistry.extend(origin="operator")`` — the registry rejects
+        any other origin (a module tool or agent cannot widen the scope) —
+        and journals ``ScopeChanged`` with the operator's comment. The event
+        rides the platform emit tool, whose journal-first append (arch
+        invariant 2) precedes the bus fan-out; the registry merge happens
+        before the emit so subscribers observe an already-applied change.
+
+        Seam note (same shape as :meth:`set_mode`): the v0.1 operator
+        surface is the documented M4 TUI/chat command; tests exercise this
+        method directly until that seam docks.
+
+        Resume semantics (decision D28, spec §13): operator additions are
+        journaled for audit but are **not** persisted to the ``scope_entries``
+        domain table in v0.1, so a resumed session restarts from the
+        ``session.yaml`` snapshot scope (the audit snapshot is the resume
+        source of truth, arch §13.1). Widening the resume path to replay
+        operator entries is a documented post-v0.1 seam.
+
+        Raises:
+            ScopeExtensionDenied: never (this method is the operator path),
+            but the registry keeps its origin gate for every other caller.
+        """
+        scope = self._require(self.scope)
+        # The payload is built and validated first: a malformed entry list
+        # aborts before the registry or the journal are touched (fail-fast).
+        added: list[ScopeEntry] = [
+            ScopeEntry(id=0, kind="domain", value=value, origin="operator")
+            for value in entries.domains
+        ]
+        added += [
+            ScopeEntry(id=0, kind="ip_subnet", value=value, origin="operator")
+            for value in entries.ip_subnets
+        ]
+        added += [
+            ScopeEntry(id=0, kind="port", value=str(value), origin="operator")
+            for value in entries.ports
+        ]
+        added += [
+            ScopeEntry(id=0, kind="scheme", value=value, origin="operator")
+            for value in entries.schemes
+        ]
+        payload = ScopeChangedPayload(added=added, operator_comment=operator_comment)
+        # ``id=0`` marks the synthetic record (arch §4.2 rows are
+        # server-assigned): v0.1 does not persist operator entries to the
+        # domain table (see Resume semantics) — the payload embeds the
+        # operator-authored values verbatim for TUI/runtime (§5.5).
+        scope.extend(entries, origin="operator")
+        await self._require_emit()("ScopeChanged", payload.model_dump(mode="json"))
 
     # ---- composition internals ----
 
@@ -402,6 +551,10 @@ class Session:
             correlation_provider=current_correlation_id,
         )
         self._emit = emit
+        # 3b. Out-of-scope-target contour (Issue #8 ↔ F-1): persisted flags
+        # re-mark the registry (open AND resume) and the endpoint bus events
+        # keep it current mid-session — wired before any agent can run.
+        await self._wire_scope_contours()
         # 4. Judge + approval queue (P3.4/RD-2 wiring; §7.3). The judge chat
         # model comes from ``judge_model`` (test seam) or ``init_chat_model``
         # over the configured ``provider:model`` id (fail-fast at start).
@@ -416,6 +569,10 @@ class Session:
             ),
             sanitizer=lambda args: tool_args_digest(args, self._require(self.projector)),
         )
+        # F-18: restore persisted judge class gates (escalations + standing
+        # denies) before any agent can run — fail-fast replay, §16.9. A fresh
+        # session replays an empty ledger (no-op).
+        await self._replay_judge_gates()
         # 5. HTTP perimeter (client shared by every delegation — D19).
         self.http_client = SwarmyHttpClient(
             scope=self._require(self.scope),
@@ -437,6 +594,7 @@ class Session:
             ),
             events=self._http_events(emit),
             correlation_provider=current_correlation_id,
+            host_resolver=GetaddrinfoHostResolver(),
         )
         # 6. Module loading (fail-fast over all modules, arch §8.3).
         loader = ModuleLoader(
@@ -451,6 +609,7 @@ class Session:
         self.modules = loader.load()
         # 7. Orchestrator toolset + registry (non-colliding names only —
         # the loader already registered the module-level platform names).
+        self._report_tool_factory = report_tool_factory
         self._orchestrator_tools = self._build_orchestrator_tools(
             emit, report_tool_factory=report_tool_factory
         )
@@ -511,6 +670,57 @@ class Session:
         """Non-null view of the platform emit callable."""
         return self._require(self._emit)
 
+    async def _wire_scope_contours(self) -> None:
+        """Feed the out-of-scope-target invariant (Issue #8 ↔ F-1, arch §6.3).
+
+        Two data paths keep ``ScopeRegistry.mark_out_of_scope`` current:
+
+        1. **Persistence reload** (session open **and** resume): every
+           memory ``Endpoint`` row flagged ``out_of_scope=True`` re-marks
+           the registry before the first agent runs — a resumed session
+           restores its exclusions from the database, fail-closed.
+        2. **Live feed**: the ``EndpointsDiscovered``/``EndpointUpdated``
+           bus events carry endpoint ids; the handler re-reads the flagged
+           rows and re-marks. Marks are monotone — the registry has no
+           unmark — so event ordering can never widen the perimeter, and
+           clearing a memory flag (an operator decision) does not unmark
+           the live registry (fail-closed unmarking, arch §6.3).
+        """
+        scope = self._require(self.scope)
+        store = self._require(self.memory)
+        scope.mark_out_of_scope(
+            [
+                OutOfScopeEndpoint(host=row.host, method=row.method, path=row.path)
+                for row in await store.list_endpoints(out_of_scope=True)
+            ]
+        )
+
+        async def _mark_flagged(envelope: EventEnvelope) -> None:
+            """Re-mark flagged endpoints carried by one endpoint event."""
+            if isinstance(envelope.payload, EndpointUpdatedPayload):
+                endpoint_ids: Sequence[int] = [envelope.payload.endpoint_id]
+            elif isinstance(envelope.payload, EndpointsDiscoveredPayload):
+                endpoint_ids = list(envelope.payload.endpoints)
+            else:
+                return  # type-filtered subscription: unreachable, stay safe
+            for endpoint_id in endpoint_ids:
+                try:
+                    row = await store.get(EntityType.ENDPOINT, endpoint_id)
+                except KeyError:
+                    continue  # row deleted mid-flight: nothing left to mark
+                if isinstance(row, Endpoint) and row.out_of_scope:
+                    scope.mark_out_of_scope(
+                        [
+                            OutOfScopeEndpoint(
+                                host=row.host, method=row.method, path=row.path
+                            )
+                        ]
+                    )
+
+        self._require(self.bus).subscribe(
+            _mark_flagged, types={"EndpointsDiscovered", "EndpointUpdated"}
+        )
+
     def _model_value(self) -> str | BaseChatModel | None:
         """The config model (an L0 id string) or ``None`` (L0 default)."""
         return self.config.model
@@ -534,8 +744,22 @@ class Session:
         )
 
     def _correlation_middleware(self) -> CorrelationMiddleware:
-        """The delegation-correlation middleware over the platform emit."""
-        return CorrelationMiddleware(self._require_emit())
+        """The delegation-correlation middleware over the platform emit.
+
+        The digest projector is the session projector routed through a
+        **non-marking** copy (secret-literal masking, session budgets, no
+        untrusted markers): ``Task*`` ``summary_digest`` fields are
+        journal-bound (arch §5.5), so operator secrets must mask with the
+        session's own secret rules — the module fallback knows none — while
+        a marker-carrying digest would be double-wrapped/defused at the
+        display layer (handoff: session wiring replaces the fallback).
+        """
+        digest_projector = ContextProjector(
+            budgets=self.config.context.budgets,
+            secrets=self.secrets.secret_values() if self.secrets is not None else None,
+            mark_untrusted=False,
+        )
+        return CorrelationMiddleware(self._require_emit(), projector=digest_projector)
 
     def _build_judge(
         self, emit: EmitEventTool, judge_model: BaseChatModel | None
@@ -544,9 +768,11 @@ class Session:
 
         The judge sink journals flag/escalation notes as ``GuardrailBlocked``
         payloads (``layer="judge"``, ``rule_id="judge:<verdict>"`` — the
-        §5.5-anticipated channel); the escalation hook enqueues the
-        ``origin="judge"`` approval request whose decision resolves the
-        registry gate (T3.4.x).
+        §5.5-anticipated channel) carrying the §6.8 digest of the judged
+        call (Issue #49); the escalation hook enqueues the ``origin="judge"``
+        approval request whose decision resolves the registry gate (T3.4.x)
+        and persists the gate to the ``facts`` ledger so a restart restores
+        it (F-18).
         """
         judge_config = self.config.judge
         if judge_config.model is None:
@@ -555,7 +781,7 @@ class Session:
             judge_config.model
         )
 
-        async def sink(feedback: BlockedFeedback, subject: str) -> None:
+        async def sink(feedback: BlockedFeedback, subject: str, args_digest: str) -> None:
             await emit(
                 "GuardrailBlocked",
                 {
@@ -563,25 +789,43 @@ class Session:
                     "rule_id": feedback.rule_id,
                     "layer": feedback.layer,
                     "reason": feedback.reason,
-                    "tool_args_digest": "",
+                    "tool_args_digest": args_digest,
                 },
             )
 
         async def on_escalation(tool_class: str, reason: str) -> None:
             queue = self._require(self.approvals)
-            registry = self.judge.escalation_registry if self.judge else None
-            escalation_id = registry.escalation_id_for(tool_class) if registry else None
-
-            async def resolve(decision: ApprovalDecision) -> None:
-                if registry is not None and escalation_id is not None:
-                    registry.resolve(escalation_id, decision)
-
+            registry = self._require(self.judge).escalation_registry
+            escalation_id = registry.escalation_id_for(tool_class)
+            if escalation_id in self._judge_gate_keys:
+                # #37: the class gate is already closed and its queue request
+                # is live — a second escalation of the same class (the
+                # post-call band fires regardless of a pending gate) must not
+                # orphan the first request's resolver with a duplicate entry.
+                # The skipped call still gets the ESCALATE feedback above.
+                return
+            if escalation_id is None:  # pragma: no cover - _escalate gates first
+                return
+            # F-18: persist the gate *before* the request exists — a crash
+            # in between replays the gate (re-enqueued) instead of losing it.
+            gate_fact = await self._require(self.memory).add_fact(
+                FactDraft(
+                    subject=_JUDGE_GATE_SUBJECT,
+                    predicate=tool_class,
+                    obj="escalate",
+                    tags=[reason],
+                    source="swarmy/judge",
+                )
+            )
+            self._judge_gate_keys[escalation_id] = str(gate_fact.id)
             await queue.enqueue_external(
                 tool=tool_class,
                 args_digest=reason,
                 origin="judge",
                 rule_or_profile="judge:escalate_hitl",
-                resolver=resolve,
+                resolver=self._judge_gate_resolver(
+                    registry, escalation_id, tool_class, str(gate_fact.id)
+                ),
             )
 
         return LlmJudge(
@@ -592,6 +836,125 @@ class Session:
             sink=sink,
             on_escalation=on_escalation,
         )
+
+    def _judge_gate_resolver(
+        self,
+        registry: JudgeEscalationRegistry,
+        escalation_id: str,
+        tool_class: str,
+        gate_fact_id: str,
+    ) -> Callable[[ApprovalDecision], Awaitable[None]]:
+        """Build the decision handler of one judge escalation request (F-18).
+
+        The handler persists the decision to the ``facts`` ledger **before**
+        applying it in memory (durable-first: a crash in between replays the
+        already-recorded decision instead of re-asking the operator), then
+        resolves the registry gate. An unknown escalation id is tolerated as
+        a no-op (Issue #37: a superseded duplicate path must not turn the
+        operator's decision into a ``KeyError`` after the request retired).
+        ``reject`` leaves the class standing-denied in the registry (deny
+        supremacy — approve/edit merely clear the pending gate).
+        """
+        store = self._require(self.memory)
+
+        async def resolve(decision: ApprovalDecision) -> None:
+            await store.add_fact(
+                FactDraft(
+                    subject=_JUDGE_GATE_SUBJECT,
+                    predicate=tool_class,
+                    obj=decision,
+                    tags=[f"gate:{gate_fact_id}"],
+                    source="swarmy/judge",
+                )
+            )
+            try:
+                registry.resolve(escalation_id, decision)
+            except KeyError:
+                pass  # the gate was already resolved through a superseded path
+            finally:
+                self._judge_gate_keys.pop(escalation_id, None)
+
+        return resolve
+
+    async def _replay_judge_gates(self) -> None:
+        """Restore persisted judge class gates on open/resume (F-18, §16.9).
+
+        Replays the ``judge_class_gate`` facts ledger in row order: every
+        ``escalate`` row closes the class gate again; every resolution row
+        applies its recorded decision (a ``reject`` re-establishes the
+        standing deny). The ledger is read through
+        :meth:`MemoryStore.list_facts` — the full domain-table scan in row
+        order. A ranked FTS query would truncate a long ledger (a judge
+        escalation happens per gated call, so hundreds of rows accumulate
+        over a session): a resolution row lost to truncation would either
+        fail the resume outright or silently evaporate a standing deny —
+        exactly the failure F-18 exists to prevent. Escalations without a
+        recorded decision are re-enqueued into the approval queue, so the
+        operator can still answer them — the gate never silently evaporates
+        across a restart. A resolution row naming an unknown gate fails the
+        session start (corrupted persistence is a fail-fast problem, arch
+        §16.9).
+        """
+        if self.judge is None:
+            return
+        store = self._require(self.memory)
+        registry = self.judge.escalation_registry
+        gates: dict[str, dict[str, str]] = {}  # gate fact id → state entry
+        order: list[str] = []
+        for fact in await store.list_facts(_JUDGE_GATE_SUBJECT):
+            if fact.obj == "escalate":
+                gate_id = str(fact.id)
+                gates[gate_id] = {
+                    "tool_class": fact.predicate,
+                    "reason": fact.tags[0] if fact.tags else "",
+                }
+                order.append(gate_id)
+            else:
+                gate_id = fact.tags[0].removeprefix("gate:") if fact.tags else ""
+                entry = gates.get(gate_id)
+                if entry is None:
+                    msg = (
+                        f"judge gate ledger is inconsistent: resolution fact "
+                        f"{fact.id} names unknown gate {gate_id!r}"
+                    )
+                    raise SessionError(msg)
+                entry["decision"] = fact.obj
+        # Replay in ledger order: escalate → (later) resolve. The registry's
+        # per-class idempotence (#37) keeps the live ids stable while only
+        # one gate per class can be open at a time (the enqueue dedupe).
+        live: dict[str, str] = {}  # gate fact id → live escalation id
+        for gate_id in order:
+            entry = gates[gate_id]
+            tool_class = entry["tool_class"]
+            reason = entry["reason"]
+            escalation_id = registry.escalate(tool_class, reason)
+            decision = entry.get("decision")
+            if decision is not None:
+                if decision not in ("approve", "edit", "reject"):
+                    msg = (
+                        f"judge gate ledger is inconsistent: gate {gate_id} "
+                        f"records unknown decision {decision!r}"
+                    )
+                    raise SessionError(msg)
+                try:
+                    registry.resolve(escalation_id, decision)
+                except KeyError:  # pragma: no cover - replay ordering invariant
+                    pass
+            else:
+                live[gate_id] = escalation_id
+        # Re-enqueue the still-open gates so the operator can decide them.
+        for gate_id, escalation_id in live.items():
+            entry = gates[gate_id]
+            self._judge_gate_keys[escalation_id] = gate_id
+            await self._require(self.approvals).enqueue_external(
+                tool=entry["tool_class"],
+                args_digest=entry["reason"],
+                origin="judge",
+                rule_or_profile="judge:escalate_hitl",
+                resolver=self._judge_gate_resolver(
+                    registry, escalation_id, entry["tool_class"], gate_id
+                ),
+            )
 
     def _judge_band_factory(
         self,
@@ -610,26 +973,44 @@ class Session:
 
         One adapter serves the orchestrator and every subagent pipeline: the
         global ``ToolRegistry`` is a superset of each pipeline's tools, so a
-        tool unknown to a pipeline is simply never judged there. Called only
-        when the judge is configured (T3.4.x wiring).
+        tool unknown to a pipeline is simply never judged there. Risk
+        classes are resolved through the registry's **live** ``entries()``
+        view at call time — the loader defers all registry writes until
+        after every module's ``SubAgent`` dict is built (#44 abort-path
+        hygiene), so an eager snapshot taken at pipeline-build time would
+        miss the platform tools entirely and silently unjudge them (the
+        T3.4.3 escalation regression). Called only when the judge is
+        configured (T3.4.x wiring).
         """
         assert self.judge is not None, "judge configured"
         judge = self.judge
-        risk_classes = dict(self._require(self.tool_registry).risk_classes())
+        entries = self._require(self.tool_registry).entries()
+
+        def risk_of(tool_name: str) -> RiskClass | None:
+            entry = entries.get(tool_name)
+            return None if entry is None else entry.risk_class
 
         def gate_for(tool_name: str) -> tuple[Verdict, BlockedFeedback | None] | None:
-            risk = risk_classes.get(tool_name)
+            risk = risk_of(tool_name)
             return None if risk is None else judge.gate_for(risk.value)
 
         async def precall(
             tool_name: str, _tool_args: Mapping[str, object], args_digest: str
         ) -> tuple[Verdict, BlockedFeedback | None] | None:
-            risk = risk_classes.get(tool_name)
+            risk = risk_of(tool_name)
             if risk is None or not judge.serves_class(risk.value):
                 return None
             return await judge.precall(tool_name, risk.value, args_digest)
 
-        return _JudgeBandAdapter(gate_for, precall)
+        def postcall(
+            tool_name: str, result_text: str, args_digest: str
+        ) -> asyncio.Task[None] | None:
+            risk = risk_of(tool_name)
+            if risk is None:
+                return None
+            return judge.postcall(tool_name, risk.value, result_text, args_digest)
+
+        return _JudgeBandAdapter(gate_for, precall, postcall)
 
     def _module_platform_toolset(
         self, module_name: str, declared_events: frozenset[str]
@@ -638,7 +1019,12 @@ class Session:
 
         ``memory_*`` + ``update_finding_status`` (emit bound to the module's
         declared events and identity), the four HTTP tools (the shared
-        session client — global limits, D19) and ``emit_event``.
+        session client — global limits, D19), ``emit_event`` and
+        ``session_info`` — the full arch §6.1 platform set: every subagent
+        may query the target base URL, the scope allowlist, the HITL
+        profile/mode, the request budget and the research progress before
+        planning work (Issue #2: the toolset previously omitted it,
+        contradicting arch §6.1 and the module contract).
         """
         platform_emit = make_emit_tool(
             journal=self._require(self.journal),
@@ -648,8 +1034,35 @@ class Session:
             correlation_provider=current_correlation_id,
         )
         memory_tools = make_memory_tools(self._require(self.memory), platform_emit)
-        http_tools = make_http_tools(self._require(self.http_client))
-        toolset: dict[str, Callable[..., object]] = {**memory_tools, **http_tools}
+        # Issue #11: the four HTTP tools carry the by-name secrets workflow —
+        # arguments may address operator secrets as ``<masked:secret-name>``
+        # references; the wrapper resolves them inside the tool boundary, so
+        # the guardrail pipeline and every journal digest evaluate the
+        # reference form while the client receives the real values.
+        secrets_map = self.secrets.secret_values() if self.secrets is not None else {}
+        http_tools = {
+            name: bind_secret_substitution(
+                # The four HTTP tools are async (tools/http/tools.py) but the
+                # builder types them ``Callable[..., object]`` — narrow at the
+                # substitution boundary, which awaits them.
+                cast("Callable[..., Awaitable[object]]", fn),
+                secrets_map,
+            )
+            for name, fn in make_http_tools(self._require(self.http_client)).items()
+        }
+        config = self.config
+        toolset: dict[str, Callable[..., object]] = {
+            **memory_tools,
+            **http_tools,
+            "session_info": make_session_info_tool(
+                base_url=str(config.target.base_url),
+                scope_entries=config.scope,
+                limiter=self._require(self.limiter),
+                profile=config.profile,
+                mode=config.mode,
+                store=self._require(self.memory),
+            ),
+        }
         if declared_events:
             toolset["emit_event"] = make_emit_tool(
                 journal=self._require(self.journal),
@@ -666,12 +1079,16 @@ class Session:
         emit: EmitEventTool,
         *,
         report_tool_factory: ReportToolFactory | None = None,
+        mode: str | None = None,
     ) -> dict[str, Callable[..., object]]:
         """The orchestrator's platform toolset (arch §9.1: session_info + memory).
 
         ``report_tool_factory`` (RD-7) is injected by the composition root —
         core stays report-import-free (arch §2.5); without it the engine
-        simply has no ``generate_report`` tool.
+        simply has no ``generate_report`` tool. ``mode`` overrides the config
+        mode baked into ``session_info`` (Issue #38: the on-the-fly mode
+        switch must rebuild the toolset so ``session_info`` reports the
+        post-switch mode); ``None`` uses ``config.mode``.
         """
         config = self.config
         orchestrator_emit = make_emit_tool(
@@ -688,7 +1105,7 @@ class Session:
                 scope_entries=config.scope,
                 limiter=self._require(self.limiter),
                 profile=config.profile,
-                mode=config.mode,
+                mode=mode if mode is not None else config.mode,
                 store=self._require(self.memory),
             ),
             "emit_event": orchestrator_emit,
@@ -750,7 +1167,23 @@ class Session:
             """Journal-first publisher of the client's platform events."""
 
             async def guardrail_blocked(self, payload: GuardrailBlockedPayload) -> None:
-                await emit("GuardrailBlocked", payload.model_dump(mode="json"))
+                # The client's deny reasons quote the *request* URLs verbatim,
+                # and by the time the client sees the arguments the Issue #11
+                # substitution has already resolved ``<masked:name>``
+                # references to real values — so the reason is projected here
+                # exactly like the middleware pipeline projects its own
+                # (arch §5.5/§6.8, Issue #39 contour): the journal row never
+                # carries a verbatim secret.
+                await emit(
+                    "GuardrailBlocked",
+                    payload.model_copy(
+                        update={
+                            "reason": session._require(session.projector).project(
+                                payload.reason
+                            )
+                        }
+                    ).model_dump(mode="json"),
+                )
 
             async def outbound_secret_warn(self, payload: OutboundSecretWarn) -> None:
                 await session._require(session.journal).append(

@@ -156,11 +156,40 @@ def _resume(args: Namespace) -> int:
     return asyncio.run(_launch_resume(Path(args.resume), args.model))
 
 
+def _start_error_types() -> tuple[type[Exception], ...]:
+    """Build the start-failure catch set (#30, arch §4.5: one report, exit 2, no UI).
+
+    The closed set of aggregated start failures the CLI renders instead of a
+    raw traceback: ``SessionError`` (typed session-open/resume failures),
+    ``ModuleLoadError`` (the loader's aggregate report), ``SecretsConfigError``
+    (unreadable/invalid ``secrets.yaml`` — also on the resume path, which
+    loads it after ``Session.resume``), ``ToolRegistryError`` (toolset
+    registration inside session composition) and ``DatabaseSchemaError``
+    (a session folder written by a newer schema, #30 — the typed successor
+    of the bare ``RuntimeError``). Imported lazily beside
+    ``Session`` so ``main`` with no arguments still keeps the L0 stack out of
+    the process.
+    """
+    from swarmy.core.config import SecretsConfigError
+    from swarmy.core.database import DatabaseSchemaError
+    from swarmy.core.session import SessionError
+    from swarmy.modules.registry import ModuleLoadError
+    from swarmy.tools.registry import ToolRegistryError
+
+    return (
+        SessionError,
+        ModuleLoadError,
+        SecretsConfigError,
+        ToolRegistryError,
+        DatabaseSchemaError,
+    )
+
+
 async def _launch_fresh(
     config: SessionConfig, session_dir: Path, secrets: SecretsConfig | None
 ) -> int:
     """Compose the session on the app's event loop and run the console."""
-    from swarmy.core.session import Session, SessionError  # lazy: L0 out of help
+    from swarmy.core.session import Session  # lazy: L0 out of help
     from swarmy.report.generator import make_generate_report_tool
 
     try:
@@ -170,14 +199,14 @@ async def _launch_fresh(
             secrets=secrets,
             report_tool_factory=make_generate_report_tool,
         )
-    except SessionError as exc:
+    except _start_error_types() as exc:
         return _fail([f"session could not be opened: {exc}"])
     return await _run_console(session)
 
 
 async def _launch_resume(session_dir: Path, model: str | None) -> int:
     """Resume the session on the app's event loop and run the console."""
-    from swarmy.core.session import Session, SessionError  # lazy: L0 out of help
+    from swarmy.core.session import Session  # lazy: L0 out of help
     from swarmy.report.generator import make_generate_report_tool
 
     try:
@@ -186,7 +215,7 @@ async def _launch_resume(session_dir: Path, model: str | None) -> int:
             model=model,
             report_tool_factory=make_generate_report_tool,
         )
-    except SessionError as exc:
+    except _start_error_types() as exc:
         return _fail([f"session could not be resumed: {exc}"])
     return await _run_console(session)
 

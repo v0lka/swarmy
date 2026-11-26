@@ -29,6 +29,8 @@ from swarmy.events.models import (
 )
 from swarmy.memory.models import EndpointDraft, FindingDraft, Severity
 from swarmy.tui.state import (
+    REPLIES_MAX,
+    SYSTEM_ERRORS_MAX,
     ApprovalItem,
     SessionView,
     TodoItem,
@@ -355,3 +357,161 @@ async def test_state_preload_and_refresh(session: Session) -> None:
     finally:
         state.stop()
         await session.close()
+
+
+# ---------------------------------------------------------------------------
+# Bounded feed window + system errors + transcript snapshot (#14/#28/#33)
+# ---------------------------------------------------------------------------
+
+
+async def test_feed_window_is_bounded_and_counted(session: Session) -> None:
+    """extend_feed drops the oldest beyond the window; the count keeps the total.
+
+    Issue #33: the feed used to grow without bound over a long session; the
+    window is capped while the statistics keep reporting the session total.
+    """
+    state = TuiState(SessionView(session), feed_max=5)
+    writer = session.journal
+    bus = session.bus
+    assert writer is not None
+    assert bus is not None
+    batch: list[EventEnvelope] = []
+    for index in range(8):
+        batch.append(
+            await writer.append(
+                type="GuardrailBlocked",
+                source=EventSource.PLATFORM,
+                source_detail="test",
+                correlation_id="",
+                payload=GuardrailBlockedPayload(
+                    tool_name="t",
+                    rule_id="r",
+                    layer="engine",
+                    reason=f"event {index}",
+                    tool_args_digest="",
+                ),
+            )
+        )
+    state.extend_feed(batch)
+    assert len(state.feed) == 5
+    assert state.event_count == 8
+    assert [envelope.id for envelope in state.feed] == [envelope.id for envelope in batch[3:]]
+    assert [envelope.id for envelope in state.recent_feed(3)] == [
+        envelope.id for envelope in batch[5:]
+    ]
+    assert len(state.recent_feed(100)) == 5
+    await session.close()
+
+
+async def test_absorb_treats_transcripts_as_snapshot(session: Session) -> None:
+    """Issue #14: every step result re-carries the full history — replace it.
+
+    The old ``extend`` semantics re-added every historical delegation on each
+    delegation-bearing step, duplicating transcripts ~N times after N steps.
+    """
+    state = TuiState(SessionView(session))
+    call = {
+        "name": "task",
+        "args": {"description": "crawl d", "subagent_type": "crawler"},
+        "id": "c1",
+        "type": "tool_call",
+    }
+
+    def step() -> dict[str, object]:
+        return {
+            "messages": [
+                SimpleNamespace(type="ai", tool_calls=[call]),
+                SimpleNamespace(type="tool", tool_call_id="c1", content="crawl report"),
+            ]
+        }
+
+    state.absorb(step())
+    assert state.subagent_transcripts == {"crawler": ["task: crawl d", "crawl report"]}
+    state.absorb(step())  # the next step re-pairs the SAME historical call
+    assert state.subagent_transcripts == {"crawler": ["task: crawl d", "crawl report"]}
+    await session.close()
+
+
+async def test_report_error_is_bounded(session: Session) -> None:
+    """The system-error buffer (the Issue #28 chat surface) stays bounded."""
+    state = TuiState(SessionView(session))
+    for index in range(SYSTEM_ERRORS_MAX + 5):
+        state.report_error(f"error {index}")
+    assert len(state.system_errors) == SYSTEM_ERRORS_MAX
+    assert list(state.system_errors)[-1] == f"error {SYSTEM_ERRORS_MAX + 4}"
+    await session.close()
+
+
+async def test_absorb_keeps_the_whole_reply_history(session: Session) -> None:
+    """Issue #47: the transcript keeps every orchestrator reply, bounded.
+
+    The old semantics kept only ``last_reply`` — after the second operator
+    question the first orchestrator answer disappeared from the dialog.
+    """
+    state = TuiState(SessionView(session))
+
+    def step(reply: str) -> dict[str, object]:
+        return {"messages": [SimpleNamespace(type="ai", content=reply)]}
+
+    state.absorb(step("first answer"))
+    state.absorb(step("second answer"))
+    assert state.last_reply == "second answer"
+    assert list(state.replies) == ["first answer", "second answer"]
+    state.absorb(step(""))  # a reply-less step appends nothing
+    assert list(state.replies) == ["first answer", "second answer"]
+    for index in range(REPLIES_MAX + 10):
+        state.absorb(step(f"answer {index}"))
+    assert len(state.replies) == REPLIES_MAX
+    assert next(iter(state.replies)) == "answer 10"
+    assert list(state.replies)[-1] == f"answer {REPLIES_MAX + 9}"
+    await session.close()
+
+
+async def test_absorb_does_not_reappend_the_stale_reply(session: Session) -> None:
+    """Prose-less steps must not re-append the previous reply.
+
+    The real accumulated shape: every step result carries the FULL message
+    history (langgraph accumulates ``messages``), so a delegation turn or a
+    HITL pause still ends with the *earlier* AI prose in history —
+    ``orchestrator_reply`` returns it again, and appending per step would
+    duplicate the reply (same per-step-delta flaw as the #14 transcripts).
+    """
+    state = TuiState(SessionView(session))
+    call = {
+        "name": "task",
+        "args": {"description": "crawl d", "subagent_type": "crawler"},
+        "id": "c9",
+        "type": "tool_call",
+    }
+
+    def step() -> dict[str, object]:
+        return {
+            "messages": [
+                # the earlier AI prose of the whole accumulated history …
+                SimpleNamespace(type="human", content="go"),
+                SimpleNamespace(type="ai", content="the one real answer"),
+                # … followed by this step's tool-call/tool pair (no prose)
+                SimpleNamespace(type="ai", tool_calls=[call]),
+                SimpleNamespace(type="tool", tool_call_id="c9", content="crawl report"),
+            ]
+        }
+
+    state.absorb(step())
+    state.absorb(step())  # delegation turn: history ends with tool pairs, prose unchanged
+    state.absorb(step())  # HITL pause turn: still the same stale prose
+    assert list(state.replies) == ["the one real answer"]
+    await session.close()
+
+
+async def test_chat_lines_render_the_full_reply_history(session: Session) -> None:
+    """Issue #47: the chat panel renders every reply, latest last."""
+    from swarmy.tui.panels.chat import ChatPanel
+
+    state = TuiState(SessionView(session))
+    state.absorb({"messages": [SimpleNamespace(type="ai", content="first answer")]})
+    state.absorb({"messages": [SimpleNamespace(type="ai", content="second answer")]})
+    panel = ChatPanel("chat-test", masker=lambda text: text)
+    lines = panel._lines(state)
+    orchestrator_lines = [text for tag, text in lines if tag == "orchestrator>"]
+    assert orchestrator_lines == ["first answer", "second answer"]
+    await session.close()

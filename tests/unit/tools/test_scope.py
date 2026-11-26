@@ -314,3 +314,34 @@ def test_scope_entries_validation_fails_fast(kwargs: dict[str, object], bad_valu
     del bad_value
     with pytest.raises(ValidationError):
         ScopeEntries(**kwargs)  # type: ignore[arg-type]
+
+
+# ---- resolved-IP verification of the DNS-rebinding guard (F-11, §6.3) ----
+
+
+def test_resolved_ip_inside_configured_subnets_is_allowed() -> None:
+    """A name resolving inside the allowlisted subnets passes the guard."""
+    registry = ScopeRegistry(_entries(ip_subnets=["203.0.113.0/24", "2001:db8::/32"]))
+    assert registry.resolved_ip_denial_reason("203.0.113.7") is None
+    assert registry.resolved_ip_denial_reason("2001:db8::1") is None
+
+
+def test_resolved_ip_outside_configured_subnets_denies_with_reason() -> None:
+    """An allowlisted name resolving outside the subnets is a denial."""
+    registry = ScopeRegistry(_entries(ip_subnets=["203.0.113.0/24"]))
+    reason = registry.resolved_ip_denial_reason("198.51.100.9")
+    assert reason is not None
+    assert "198.51.100.9" in reason
+    assert "203.0.113.0/24" in reason
+
+
+def test_resolved_ip_domain_only_scope_allows_any_address() -> None:
+    """No ``ip_subnets`` configured → nothing to verify against (allow)."""
+    registry = ScopeRegistry(_entries(domains=["example.com"]))
+    assert registry.resolved_ip_denial_reason("198.51.100.9") is None
+
+
+def test_resolved_ip_non_literal_input_is_ignored() -> None:
+    """A non-address string is not this guard's input (host rules judge it)."""
+    registry = ScopeRegistry(_entries(ip_subnets=["203.0.113.0/24"]))
+    assert registry.resolved_ip_denial_reason("not-an-address") is None

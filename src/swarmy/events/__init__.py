@@ -22,10 +22,12 @@ from swarmy.events.models import (
     JsonValue,
     OperatorDecisionPayload,
     OperatorMessagePayload,
+    OutboundSecretWarnPayload,
     ScopeChangedPayload,
     TargetSetPayload,
     TaskCompletedPayload,
     TaskRequestedPayload,
+    UnknownEventPayload,
 )
 
 __all__ = [
@@ -48,10 +50,12 @@ __all__ = [
     "JsonValue",
     "OperatorDecisionPayload",
     "OperatorMessagePayload",
+    "OutboundSecretWarnPayload",
     "ScopeChangedPayload",
     "Subscription",
     "TargetSetPayload",
     "TaskCompletedPayload",
     "TaskRequestedPayload",
+    "UnknownEventPayload",
     "make_emit_tool",
 ]

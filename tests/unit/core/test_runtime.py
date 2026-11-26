@@ -17,8 +17,10 @@ import asyncio
 import inspect
 from typing import TYPE_CHECKING, Any
 
+import pytest
+from langchain_core.messages import HumanMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
-from langgraph.types import StateSnapshot
+from langgraph.types import Interrupt, StateSnapshot
 
 from swarmy.core.config import PolicySpec
 from swarmy.core.hitl import ApprovalQueue
@@ -37,6 +39,7 @@ from swarmy.events.models import (
     EventSource,
     FindingCandidatePayload,
     GuardrailBlockedPayload,
+    OperatorMessagePayload,
 )
 from swarmy.tools.projector import UNTRUSTED_BEGIN, UNTRUSTED_END, ContextProjector
 
@@ -51,17 +54,40 @@ if TYPE_CHECKING:
 class MockGraph:
     """Instrumented graph: counts active invocations (the AD-8 monitor)."""
 
-    def __init__(self, delay_s: float = 0.02) -> None:
+    def __init__(
+        self,
+        delay_s: float = 0.02,
+        *,
+        state_values: object | None = None,
+        fail_invocations: bool = False,
+        commit_before_fail: bool = False,
+    ) -> None:
         self.delay_s = delay_s
         self.active = 0
         self.max_active = 0
         self.invocations: list[object] = []
+        self.state_values = state_values if state_values is not None else {}
+        self.fail_invocations = fail_invocations
+        self.commit_before_fail = commit_before_fail
 
     async def ainvoke(self, value: object, config: object, /, **kwargs: object) -> object:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
             await asyncio.sleep(self.delay_s)
+            if self.fail_invocations:
+                if self.commit_before_fail:
+                    # Model the real mid-graph failure shape (Issue #50): the
+                    # checkpointer persisted the input superstep *before* the
+                    # failing node ran — the injected HumanMessages are part
+                    # of the checkpointed state when aget_state is asked.
+                    base = self.state_values if isinstance(self.state_values, dict) else {}
+                    incoming = value.get("messages", []) if isinstance(value, dict) else []
+                    self.state_values = {
+                        **base,
+                        "messages": [*base.get("messages", []), *incoming],
+                    }
+                raise RuntimeError("provider hiccup")
             self.invocations.append(value)
             return {"messages": []}
         finally:
@@ -69,7 +95,7 @@ class MockGraph:
 
     async def aget_state(self, config: object, /) -> StateSnapshot:
         return StateSnapshot(
-            values={}, next=(), config={}, metadata=None, created_at=None,
+            values=self.state_values, next=(), config={}, metadata=None, created_at=None,
             parent_config=None, tasks=(), interrupts=(),
         )
 
@@ -275,9 +301,15 @@ class TestSingleWriter:
 
 
 class TestResumeWatermark:
-    """T3.2.4 support: the journal watermark prevents double injection."""
+    """T3.2.4 support: the resume scan seeds the watermark (Issue #27).
 
-    async def test_replayed_events_not_duplicated(self) -> None:
+    Restore replays the journal non-injectingly: notifications the
+    pre-restart process already reacted to are never re-injected, and the
+    watermark ends at the last journaled id — a fresh process no longer
+    starts at 0 and floods the orchestrator with the whole history.
+    """
+
+    async def test_replayed_events_advance_watermark_without_reinjecting(self) -> None:
         graph, emit = MockGraph(), RecordingEmit()
         runtime = _make_runtime(graph, emit)
         live = _envelope(
@@ -296,12 +328,12 @@ class TestResumeWatermark:
         )
         runtime._handle_envelope(live)  # live bus delivery (watermark at 5)
         replayed = await runtime.restore(_async_tail([live, offline]))
-        assert replayed == 1  # only the event past the watermark was replayed
-        assert runtime.pending_injections() == 2  # live one + offline one, no duplicates
+        assert replayed == 2  # the scan reads the full journal (from id 0)
+        assert runtime.pending_injections() == 1  # only the live one stays queued
         assert runtime._queue.get_nowait().startswith(UNTRUSTED_BEGIN)
-        assert runtime._queue.get_nowait().startswith(UNTRUSTED_BEGIN)
+        assert runtime._last_event_id == 6  # the scan seeded the watermark
 
-    async def test_fresh_runtime_replays_whole_tail(self) -> None:
+    async def test_fresh_runtime_does_not_flood_stale_notifications(self) -> None:
         graph, emit = MockGraph(), RecordingEmit()
         runtime = _make_runtime(graph, emit)
         offline = _envelope(
@@ -312,8 +344,39 @@ class TestResumeWatermark:
             ),
         )
         replayed = await runtime.restore(_async_tail([offline]))
-        assert replayed == 1  # a fresh process replays everything after id 0
-        assert runtime.pending_injections() == 1
+        assert replayed == 1  # a fresh process scans everything after id 0
+        assert runtime.pending_injections() == 0  # stale notifications are not re-injected
+        assert runtime._last_event_id == 7  # ... but the watermark advanced past them
+
+
+class TestRestoreOperatorMessages:
+    """Issue #46: undelivered operator chat survives the restart.
+
+    Delivery is proven by the checkpointed message history: a journal
+    ``OperatorMessage`` absent from the graph state was queued but never
+    drained — restore re-queues it; a delivered one stays silent.
+    """
+
+    async def test_undelivered_operator_message_requeued(self) -> None:
+        graph, emit = MockGraph(), RecordingEmit()
+        runtime = _make_runtime(graph, emit)
+        message = _envelope(
+            8, "OperatorMessage", OperatorMessagePayload(text_digest="steer north")
+        )
+        replayed = await runtime.restore(_async_tail([message]))
+        assert replayed == 1
+        assert runtime.pending_injections() == 1  # the steering input is not lost
+        assert runtime._queue.get_nowait() == "steer north"
+
+    async def test_delivered_operator_message_not_requeued(self) -> None:
+        graph = MockGraph(state_values={"messages": [HumanMessage(content="steer north")]})
+        runtime = _make_runtime(graph, RecordingEmit())
+        message = _envelope(
+            9, "OperatorMessage", OperatorMessagePayload(text_digest="steer north")
+        )
+        await runtime.restore(_async_tail([message]))
+        assert runtime.pending_injections() == 0  # already in the checkpointed dialog
+        assert runtime._last_event_id == 9
 
 def _async_tail(envelopes: list[EventEnvelope]) -> Any:
     """A ``JournalReader.range``-shaped tail reader over canned envelopes."""
@@ -400,3 +463,296 @@ class TestCorrelationMiddleware:
 
         await asyncio.gather(call("crawler_a"), call("crawler_b"))
         assert len(set(ids)) == 2  # isolated delegation contexts (D19)
+
+
+# ---------------------------------------------------------------------------
+# Issue #36 ↔ F-22 / Issue #55 — operator text and digests via the projector.
+# ---------------------------------------------------------------------------
+
+
+class TestOperatorMessageProjection:
+    """Issue #36 ↔ F-22: operator chat text never enters the system raw."""
+
+    async def test_digest_and_queue_both_carry_the_projection(self) -> None:
+        """The journal digest and the queued HumanMessage are the same text.
+
+        A pasted credential becomes ``<masked:api_key>`` on both surfaces:
+        the ``OperatorMessage`` journal row (arch §5.5 digest contract) and
+        the queued text injected at the step boundary (arch §16.4).
+        """
+        graph, emit = MockGraph(), RecordingEmit()
+        projector = ContextProjector(secrets={"api_key": "s3cr3t-value"}, mark_untrusted=False)
+        runtime = OrchestratorRuntime(
+            graph=graph,
+            emit=emit,
+            policies=resolve_policies(None),
+            projector=projector,
+            approvals=ApprovalQueue(),
+            thread_id="orchestrator",
+        )
+        await runtime.deliver_operator_message("retry login with cookie s3cr3t-value")
+
+        kind, payload = emit.events[0]
+        assert kind == "OperatorMessage"
+        digest = str(payload["text_digest"])
+        assert "s3cr3t-value" not in digest
+        assert "<masked:api_key>" in digest
+        queued = runtime._queue.get_nowait()
+        assert "s3cr3t-value" not in queued
+        assert "<masked:api_key>" in queued
+        assert queued == digest  # one projection serves both surfaces
+
+
+class TestCorrelationDigestProjection:
+    """Issue #55: ``Task*`` digests route through the ContextProjector."""
+
+    async def test_task_digests_mask_operator_secrets(self) -> None:
+        """Request/completion digests mask secrets instead of raw slicing."""
+        emit = RecordingEmit()
+        projector = ContextProjector(secrets={"api_key": "s3cr3t-value"}, mark_untrusted=False)
+        middleware = CorrelationMiddleware(emit, projector=projector)
+
+        async def handler(request: ToolCallRequest) -> Any:
+            return "result leaked s3cr3t-value verbatim"
+
+        request = ToolCallRequest(
+            tool_call={
+                "name": "task",
+                "args": {
+                    "description": "probe with key s3cr3t-value",
+                    "subagent_type": "crawler",
+                },
+                "id": "call-9",
+            },
+            tool=None,
+            state=None,
+            runtime=None,
+        )
+        await middleware.awrap_tool_call(request, handler)  # type: ignore[arg-type]
+
+        requested_digest = str(emit.events[0][1]["summary_digest"])
+        completed_digest = str(emit.events[1][1]["summary_digest"])
+        for digest in (requested_digest, completed_digest):
+            assert "s3cr3t-value" not in digest
+            assert "<masked:api_key>" in digest
+
+    async def test_fallback_digests_are_masked_without_markers(self) -> None:
+        """The conservative fallback masks journal digests, unwrapped.
+
+        Task* digests are journal-bound (arch §5.5: masking/budget): the
+        fallback applies masking and normalization but no untrusted wrapping
+        — the TUI display layer adds its own markers when rendering the
+        digest, and double-wrapped markers would be defused there.
+        """
+        emit = RecordingEmit()
+        middleware = CorrelationMiddleware(emit)
+
+        async def handler(request: ToolCallRequest) -> Any:
+            return "crawler saw Bearer abcdef1234567890"
+
+        request = ToolCallRequest(
+            tool_call={
+                "name": "task",
+                "args": {"description": "crawl", "subagent_type": "crawler"},
+                "id": "call-10",
+            },
+            tool=None,
+            state=None,
+            runtime=None,
+        )
+        await middleware.awrap_tool_call(request, handler)  # type: ignore[arg-type]
+
+        requested_digest = str(emit.events[0][1]["summary_digest"])
+        completed_digest = str(emit.events[1][1]["summary_digest"])
+        assert requested_digest == "crawl"  # description projected verbatim
+        assert "abcdef1234567890" not in completed_digest  # built-in detector masking
+        assert "<masked:bearer>" in completed_digest
+        assert UNTRUSTED_BEGIN not in completed_digest  # no untrusted wrapping
+
+
+# ---------------------------------------------------------------------------
+# Issue #32 — a failed delegation journals the completion outcome.
+# ---------------------------------------------------------------------------
+
+
+class TestFailedDelegationJournaling:
+    """Issue #32: a raising subagent graph leaves no dangling TaskRequested."""
+
+    async def test_failed_delegation_journals_failed_completion(self) -> None:
+        emit = RecordingEmit()
+        middleware = CorrelationMiddleware(emit)
+
+        async def handler(request: ToolCallRequest) -> Any:
+            raise RuntimeError("subagent graph exploded")
+
+        request = ToolCallRequest(
+            tool_call={
+                "name": "task",
+                "args": {"description": "probe", "subagent_type": "crawler"},
+                "id": "call-f1",
+            },
+            tool=None,
+            state=None,
+            runtime=None,
+        )
+        with pytest.raises(RuntimeError, match="exploded"):
+            await middleware.awrap_tool_call(request, handler)  # type: ignore[arg-type]
+        kinds = [kind for kind, _payload in emit.events]
+        assert kinds == ["TaskRequested", "TaskCompleted"]  # the honest pair
+        failed = emit.events[1][1]
+        assert failed["status"] == "failed"
+        assert failed["correlation_id"] == emit.events[0][1]["correlation_id"]
+        assert "RuntimeError" in str(failed["summary_digest"])
+        assert current_correlation_id() == ""  # the contextvar is still reset
+
+
+# ---------------------------------------------------------------------------
+# Handoff: run_step(user_text=...) must not bypass the §6.8 projector.
+# ---------------------------------------------------------------------------
+
+
+class TestRunStepProjection:
+    """The direct user_text seam projects like the chat contour (§16.4)."""
+
+    async def test_user_text_is_projected_before_the_graph(self) -> None:
+        graph, emit = MockGraph(), RecordingEmit()
+        projector = ContextProjector(secrets={"api_key": "s3cr3t-value"}, mark_untrusted=False)
+        runtime = OrchestratorRuntime(
+            graph=graph,
+            emit=emit,
+            policies=resolve_policies(None),
+            projector=projector,
+            approvals=ApprovalQueue(),
+        )
+        await runtime.run_step("paste s3cr3t-value here")
+        messages = graph.invocations[0]["messages"]  # type: ignore[index]
+        content = str(messages[0].content)
+        assert "s3cr3t-value" not in content
+        assert "<masked:api_key>" in content
+
+    async def test_failed_step_requeues_drained_injections(self) -> None:
+        graph, emit = MockGraph(fail_invocations=True), RecordingEmit()
+        runtime = _make_runtime(graph, emit)
+        await runtime.deliver_operator_message("retry me")
+        with pytest.raises(RuntimeError, match="hiccup"):
+            await runtime.run_step()
+        assert runtime.pending_injections() == 1  # nothing silently dropped
+        assert "retry me" in runtime._queue.get_nowait()
+
+    async def test_failed_step_keeps_committed_injection_out_of_requeue(self) -> None:
+        """Issue #50: a mid-graph failure must not duplicate committed steering.
+
+        The real failure shape: the checkpointer persists the input superstep
+        (the injected ``HumanMessage``) before the failing node runs. The
+        re-queue therefore reads the post-failure snapshot and re-queues only
+        texts the checkpoint does not already prove delivered.
+        """
+        graph, emit = MockGraph(fail_invocations=True, commit_before_fail=True), RecordingEmit()
+        runtime = _make_runtime(graph, emit)
+        await runtime.deliver_operator_message("steer once")
+        with pytest.raises(RuntimeError, match="hiccup"):
+            await runtime.run_step()
+        assert runtime.pending_injections() == 0, (
+            "a committed injection must not be re-queued (duplicate steering)"
+        )
+        # The committed text lives in the checkpointed state exactly once.
+        committed = [str(message.content) for message in graph.state_values["messages"]]
+        assert committed.count(runtime._projector.project("steer once")) == 1
+
+    async def test_failed_step_keeps_uncommitted_and_drops_committed(self) -> None:
+        """Mixed drain: the pre-commit text re-queues, the committed one not."""
+        graph, emit = MockGraph(fail_invocations=True), RecordingEmit()
+        runtime = _make_runtime(graph, emit)
+        runtime._queue.put_nowait("queued before the failure")
+        await runtime.deliver_operator_message("delivered before the failure")
+        # Simulate the checkpointer having committed only the second text
+        # (the queue carries the §6.8-projected text, so the checkpointed
+        # HumanMessage content matches it verbatim).
+        graph.state_values = {
+            "messages": [HumanMessage(content=runtime._projector.project(
+                "delivered before the failure"
+            ))]
+        }
+        with pytest.raises(RuntimeError, match="hiccup"):
+            await runtime.run_step()
+        requeued = [runtime._queue.get_nowait() for _ in range(runtime.pending_injections())]
+        assert requeued == ["queued before the failure"]
+
+    async def test_failed_step_notification_injection_dedupe(self) -> None:
+        """The same content-match contour covers policy notification injections."""
+        graph, emit = MockGraph(fail_invocations=True, commit_before_fail=True), RecordingEmit()
+        runtime = _make_runtime(graph, emit)
+        envelope = _envelope(
+            1,
+            "GuardrailBlocked",
+            GuardrailBlockedPayload(
+                tool_name="http_get",
+                rule_id="invariant:scope",
+                layer="invariant",
+                reason="outside the allowlist",
+                tool_args_digest="{}",
+            ),
+        )
+        runtime._handle_envelope(envelope)  # queues the projected notification text
+        with pytest.raises(RuntimeError, match="hiccup"):
+            await runtime.run_step()
+        assert runtime.pending_injections() == 0, (
+            "a notification committed by the input superstep must not re-queue"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #26 — a failed resume invocation reinstates the approval request.
+# ---------------------------------------------------------------------------
+
+
+class TestResumeFailureReinstatement:
+    """Issue #26: a failed resume invocation keeps the interrupt answerable."""
+
+    async def test_failed_resume_reinstates_the_request(self) -> None:
+        graph, emit = MockGraph(fail_invocations=True), RecordingEmit()
+        runtime = _make_runtime(graph, emit)
+        queue = runtime._approvals
+        snapshot = StateSnapshot(
+            values={},
+            next=(),
+            config={},
+            metadata=None,
+            created_at=None,
+            parent_config=None,
+            tasks=(),
+            interrupts=(Interrupt(value={"name": "http_post", "args": {}}, id="int-x"),),
+        )
+        queue.refresh(snapshot)
+        request = queue.pending()[0]
+        with pytest.raises(RuntimeError, match="hiccup"):
+            await runtime.submit_decision(request.request_id, "approve")
+        reinstated = queue.pending()
+        assert len(reinstated) == 1, "the failed resume must not orphan the interrupt"
+        assert reinstated[0].interrupt_id == "int-x"
+        assert reinstated[0].request_id != request.request_id  # fresh id, honest retry
+        # the retry succeeds and acks the group
+        graph.fail_invocations = False
+        await runtime.submit_decision(reinstated[0].request_id, "approve")
+        assert queue.pending() == ()
+
+    async def test_successful_resume_acknowledges_the_group(self) -> None:
+        graph, emit = MockGraph(), RecordingEmit()
+        runtime = _make_runtime(graph, emit)
+        queue = runtime._approvals
+        snapshot = StateSnapshot(
+            values={},
+            next=(),
+            config={},
+            metadata=None,
+            created_at=None,
+            parent_config=None,
+            tasks=(),
+            interrupts=(Interrupt(value={"name": "http_post", "args": {}}, id="int-y"),),
+        )
+        queue.refresh(snapshot)
+        request = queue.pending()[0]
+        await runtime.submit_decision(request.request_id, "approve")
+        assert queue.pending() == ()
+        with pytest.raises(ValueError, match="no reinstatable interrupt"):
+            queue.reinstate(request.request_id)  # acked: a consumed interrupt stays consumed

@@ -86,5 +86,5 @@ class PlansPanel(Vertical):
         rendered = ", ".join(f"{key}: {count}" for key, count in sorted(by_severity.items()))
         table.add_row("findings", rendered or "—")
         table.add_row("findings verified", str(verified))
-        table.add_row("journal events (session)", str(len(state.feed)))
+        table.add_row("journal events (session)", str(state.event_count))
         return table

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from swarmy.memory.models import EntityType, Evidence, EvidenceKind
 from swarmy.tools.http.evidence import PRODUCED_KIND, EvidenceRecorder
+from swarmy.tools.http.models import HopRecord
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -227,3 +228,113 @@ async def test_no_truncation_marker_without_cutoff(
     raw = (unit / "response.txt").read_bytes()
     assert raw == _RESPONSE_HEAD + b"\r\n" + b"small body"
     assert b"truncated" not in raw
+
+
+# ---- per-hop redirect traffic (Issue #42) ----
+
+_HOP_HEAD = b"GET /step2 HTTP/1.1\r\nHost: app.example.com\r\n"
+_HOP_RESPONSE_HEAD = b"HTTP/1.1 302 Found\r\nLocation: /step3\r\n"
+
+
+def _hop(n: int, body: bytes = b"", response_body: bytes = b"") -> HopRecord:
+    """One hop record with the shared fixture bytes."""
+    return HopRecord(
+        hop=n,
+        request_head=_HOP_HEAD,
+        request_body=body,
+        response_head=_HOP_RESPONSE_HEAD,
+        response_body=response_body,
+    )
+
+
+async def test_hop_pairs_written_byte_exact(
+    tmp_path: Path, store_env: tuple[MemoryStore, Database]
+) -> None:
+    """Each hop's pair lands in ``hop-<n>/`` with the exact exchanged bytes."""
+    store, _database = store_env
+    evidence = await recorder(tmp_path, store, max_body_bytes=1024).record(
+        request_head=_REQUEST_HEAD,
+        request_body=b"",
+        tool="http_get",
+        correlation_id="c",
+        request_id="rid-hops",
+        include_response=True,
+        response_head=_RESPONSE_HEAD,
+        response_body=b"final",
+        hops=(_hop(1), _hop(2)),
+    )
+    unit = tmp_path / "evidence" / "rid-hops"
+    for n in (1, 2):
+        hop_dir = unit / f"hop-{n}"
+        assert (hop_dir / "request.txt").read_bytes() == _HOP_HEAD + b"\r\n"
+        assert (hop_dir / "response.txt").read_bytes() == _HOP_RESPONSE_HEAD + b"\r\n"
+    assert evidence.session_paths == [
+        "evidence/rid-hops/request.txt",
+        "evidence/rid-hops/response.txt",
+        "evidence/rid-hops/hop-1/request.txt",
+        "evidence/rid-hops/hop-1/response.txt",
+        "evidence/rid-hops/hop-2/request.txt",
+        "evidence/rid-hops/hop-2/response.txt",
+    ]
+
+
+async def test_hop_bodies_respect_the_threshold(
+    tmp_path: Path, store_env: tuple[MemoryStore, Database]
+) -> None:
+    """Hop bodies are capped like the top-level ones, with the same marker."""
+    store, _database = store_env
+    await recorder(tmp_path, store, max_body_bytes=8).record(
+        request_head=_REQUEST_HEAD,
+        request_body=b"",
+        tool="http_get",
+        correlation_id="c",
+        request_id="rid-hop-capped",
+        include_response=True,
+        response_head=_RESPONSE_HEAD,
+        response_body=b"final",
+        hops=(
+            HopRecord(
+                hop=1,
+                request_head=_HOP_HEAD,
+                request_body=b"Q" * 20,
+                response_head=_HOP_RESPONSE_HEAD,
+                # Exactly at the threshold: what the client's capped reader
+                # keeps — the recorder adds the truncation note, _capped is a
+                # no-op (a hop body is never beyond the limit in practice).
+                response_body=b"B" * 8,
+                response_truncated=True,
+                response_dropped_bytes=12,
+            ),
+        ),
+    )
+    hop_dir = tmp_path / "evidence" / "rid-hop-capped" / "hop-1"
+    assert (hop_dir / "request.txt").read_bytes() == (
+        _HOP_HEAD + b"\r\n" + b"Q" * 8 + b"\n[truncated 12 bytes]\n"
+    )
+    assert (hop_dir / "response.txt").read_bytes() == (
+        _HOP_RESPONSE_HEAD + b"\r\n" + b"B" * 8 + b"\n[truncated 12 bytes]\n"
+    )
+
+
+async def test_request_only_depth_writes_no_hop_response(
+    tmp_path: Path, store_env: tuple[MemoryStore, Database]
+) -> None:
+    """``evidence_depth="request"``: hop folders carry request.txt only."""
+    store, _database = store_env
+    evidence = await recorder(tmp_path, store, max_body_bytes=1024).record(
+        request_head=_REQUEST_HEAD,
+        request_body=b"",
+        tool="http_get",
+        correlation_id="c",
+        request_id="rid-hop-request-only",
+        include_response=False,
+        hops=(_hop(1), _hop(2)),
+    )
+    hop_dir = tmp_path / "evidence" / "rid-hop-request-only" / "hop-2"
+    assert (hop_dir / "request.txt").is_file()
+    assert not (hop_dir / "response.txt").exists()
+    assert evidence.session_paths == [
+        "evidence/rid-hop-request-only/request.txt",
+        "evidence/rid-hop-request-only/hop-1/request.txt",
+        "evidence/rid-hop-request-only/hop-2/request.txt",
+    ]

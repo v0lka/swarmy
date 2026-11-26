@@ -167,3 +167,58 @@ async def test_newer_schema_file_is_rejected(tmp_path: Path) -> None:
         assert "version 1" in message, "the error must name this build's newest migration"
     finally:
         await newer.close()  # the control connection must stay closeable
+
+
+async def test_migration_ddl_with_quoted_semicolons_and_trigger_bodies(tmp_path: Path) -> None:
+    """Issue #43: statement splitting is quote/trigger-safe, bookkeeping bound.
+
+    A migration whose DDL carries a string literal with a semicolon/apostrophe
+    and a ``CREATE TRIGGER ... BEGIN ... END`` body must apply atomically and
+    record its ``schema_migrations`` row — the pre-#43 f-string interpolation
+    and a naive ``str.split(";")`` both break on exactly this shape.
+    """
+    ddl = (
+        "CREATE TABLE probe_quotes (x TEXT DEFAULT 'a;b''c');\n"
+        "CREATE TRIGGER probe_guard BEFORE INSERT ON probe_quotes\n"
+        "BEGIN\n"
+        "  SELECT RAISE(ABORT, 'no insert; allowed') WHERE NEW.x = 'end;';\n"
+        "END;"
+    )
+    migrations = [*MIGRATIONS, (99, ddl)]
+    db = Database(tmp_path / "memory.sqlite", migrations)
+    await db.open()
+    try:
+        conn = await db.connection("memory")
+        cursor = await conn.execute(
+            "SELECT applied_at FROM schema_migrations WHERE version = 99"
+        )
+        row = await cursor.fetchone()
+        assert row is not None, "the multi-statement migration must be recorded"
+        applied_at = str(row["applied_at"])
+        assert "T" in applied_at  # a plain ISO timestamp: bound, never interpolated
+        cursor = await conn.execute("SELECT x FROM probe_quotes LIMIT 1")
+        assert await cursor.fetchone() is None  # the table exists (DDL applied)
+        cursor = await conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name='probe_guard'"
+        )
+        assert await cursor.fetchone() is not None  # the trigger body survived the split
+    finally:
+        await db.close()
+
+
+def test_split_statements_respects_literals_and_trigger_bodies() -> None:
+    """The splitter never splits inside string literals or trigger bodies."""
+    from swarmy.core.database import _split_statements
+
+    script = (
+        "CREATE TABLE a (x TEXT DEFAULT 'a;b');\n"
+        "CREATE TRIGGER t BEFORE INSERT ON a BEGIN SELECT RAISE(ABORT, 'x;y') ;\n"
+        "END;\n"
+        "CREATE TABLE b (y INTEGER);"
+    )
+    statements = _split_statements(script)
+    assert len(statements) == 3  # the trigger body's semicolon did not split
+    assert statements[0] == "CREATE TABLE a (x TEXT DEFAULT 'a;b');"
+    assert statements[1].startswith("CREATE TRIGGER t")
+    assert statements[1].endswith("END;")
+    assert statements[2] == "CREATE TABLE b (y INTEGER);"

@@ -66,7 +66,7 @@ class TreesPanel(Vertical):
         kind, finding_ref, title = node.data
         if kind == "finding" and finding_ref is not None:
             self.post_message(FindingCardRequested(finding_ref))
-            self.border_title = f"Attack Trees — last node: {title}"
+            self.border_title = f"Attack Trees — last node: {escape(title)}"
 
     def refresh_state(self, state: TuiState, view: SessionView) -> None:
         """Rebuild the forest from the snapshot cache (node labels raw)."""
@@ -85,21 +85,49 @@ class TreesPanel(Vertical):
         for root in roots:
             branch = tree.root.add(self._label(root), data=self._payload(root))
             branch.expand()
-            self._attach_children(branch, root.id, children)
+            self._attach_children(branch, root.id, children, {root.id}, {root.id})
 
     def _attach_children(
-        self, branch: TreeNode[TreePayload], node_id: int, children: dict[int, list[AttackEdge]]
+        self,
+        branch: TreeNode[TreePayload],
+        node_id: int,
+        children: dict[int, list[AttackEdge]],
+        visited: set[int],
+        path: set[int],
     ) -> None:
-        """Attach the typed edges leaving ``node_id`` (requires/enables/leads_to)."""
+        """Attach the typed edges leaving ``node_id`` (requires/enables/leads_to).
+
+        ``visited`` bounds the walk (a node renders at most once per root);
+        ``path`` is the current ancestor chain. Attack edges are LLM-authored
+        and the store imposes no acyclicity constraint, so a back-edge into
+        ``path`` is a cycle and a cross-branch repeat is a diamond — both are
+        rendered as marker lines instead of descending again (Issue #15:
+        unguarded recursion used to end in ``RecursionError`` on every
+        refresh).
+        """
         for edge in children.get(node_id, ()):
             target = self._by_id.get(edge.dst)
             if target is None:  # pragma: no cover - store guarantees both rows
                 continue
+            kind = escape(edge.kind)
+            if target.id in path:
+                branch.add(
+                    f"[dim]{kind} → cycle: node #{target.id}[/]", data=self._payload(target)
+                )
+                continue
+            if target.id in visited:
+                branch.add(
+                    f"[dim]{kind} → repeat: see node #{target.id} above[/]",
+                    data=self._payload(target),
+                )
+                continue
+            visited.add(target.id)
+            path.add(target.id)
             child = branch.add(
-                f"[dim]{edge.kind}[/] → {self._label(target)}",
-                data=self._payload(target),
+                f"[dim]{kind}[/] → {self._label(target)}", data=self._payload(target)
             )
-            self._attach_children(child, target.id, children)
+            self._attach_children(child, target.id, children, visited, path)
+            path.discard(target.id)
 
     @staticmethod
     def _payload(node: AttackNode) -> TreePayload:
@@ -108,4 +136,4 @@ class TreesPanel(Vertical):
 
     def _label(self, node: AttackNode) -> str:
         """One node label (target data; secrets masked like every panel)."""
-        return f"{_KIND_MARK.get(node.kind, node.kind)} {escape(self.masker(node.title))}"
+        return f"{_KIND_MARK.get(node.kind, escape(node.kind))} {escape(self.masker(node.title))}"

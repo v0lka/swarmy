@@ -2,7 +2,7 @@
 
 Covers the roadmap acceptance criteria: rps-per-host spacing under parallel
 calls (interval measurement), the global concurrency ceiling via an active-
-request counter, budget exhaustion refusing with ``invariant: budget``, and
+request counter, budget exhaustion refusing with ``invariant:budget``, and
 event-loop responsiveness while waits are pending. Plus the cancel-refund
 contract and the client-facing limit exposure.
 """
@@ -184,9 +184,9 @@ async def test_budget_exhaustion_blocks_with_invariant_budget_reason() -> None:
     with pytest.raises(BudgetExhausted) as excinfo:
         async with limiter.acquire("h", "GET"):
             pass
-    assert excinfo.value.rule_id == BUDGET_RULE_ID == "invariant: budget"
-    assert "invariant: budget" in str(excinfo.value)
-    assert (limiter.budget_block_reason() or "").startswith("invariant: budget")
+    assert excinfo.value.rule_id == BUDGET_RULE_ID == "invariant:budget"
+    assert "invariant:budget" in str(excinfo.value)
+    assert (limiter.budget_block_reason() or "").startswith("invariant:budget")
     assert limiter.budget_used == 2  # the refused call consumed nothing
 
 

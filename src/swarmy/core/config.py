@@ -42,6 +42,7 @@ from pydantic import (
     model_validator,
 )
 
+from swarmy.modules.manifest import Utf8Error, read_utf8
 from swarmy.tools.limits import ResourceLimits
 from swarmy.tools.projector import DEFAULT_BUDGETS, mask_reference
 from swarmy.tools.scope import ScopeEntries
@@ -192,9 +193,13 @@ def load_secrets(path: Path) -> SecretsConfig:
     if not path.is_file():
         raise SecretsConfigError([f"secrets file not found: {path}"])
     try:
-        text = path.read_text(encoding="utf-8")
+        text = read_utf8(path)
     except OSError as exc:
         raise SecretsConfigError([f"secrets file {path} is unreadable: {exc}"]) from exc
+    except Utf8Error as exc:
+        # Non-UTF-8 secrets files get the documented aggregated typed error,
+        # never a raw UnicodeDecodeError traceback (#62, shared read_utf8).
+        raise SecretsConfigError([str(exc)]) from exc
     try:
         raw: object = yaml.safe_load(text)
     except yaml.YAMLError as exc:
@@ -470,9 +475,13 @@ class SessionConfig(BaseModel):
         being passed to validation.
         """
         try:
-            text = path.read_text(encoding="utf-8")
+            text = read_utf8(path)
         except OSError as exc:
             return {}, [f"session config file {path} is unreadable: {exc}"]
+        except Utf8Error as exc:
+            # A non-UTF-8 session.yaml is a ConfigError problem line naming
+            # the file, not a raw ValueError escaping the merge loop (#62).
+            return {}, [str(exc)]
         try:
             raw: object = yaml.safe_load(text)
         except yaml.YAMLError as exc:

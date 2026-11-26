@@ -1,21 +1,25 @@
 """``ContextProjector`` — sanitization of everything returned to the model (arch §6.8, D21).
 
-Principle (arch §6.8): session memory and session files stay **raw**; everything
-that reaches a model (HTTP preview, event digest, guardrail feedback, endpoint
-listing) passes through this projection first. Four steps, in the canonical
-order of arch §6.8:
+Principle (arch §6.8, decisions D23/D24): session memory and session files stay
+**raw**; everything that reaches a model (HTTP preview, event digest, guardrail
+feedback, endpoint listing) passes through this projection first. Four steps,
+in the canonical order of arch §6.8:
 
-1. **Byte budgets** per tool class (session ``context.budgets``, conservative
+1. **Operator-secret masking**: literal secret values and/or regex patterns
+   injected explicitly through the constructor (the ``secrets.yaml`` loader
+   wires them in) plus built-in detectors (``Authorization``/``Cookie``-style
+   headers, bearer tokens) → ``<masked:secret-name>``. Masking runs *before*
+   the budget (D23) so a secret straddling the truncation boundary can never
+   keep an unmasked prefix in the model context.
+2. **Byte budgets** per tool class (session ``context.budgets``, conservative
    defaults): truncation with the ``[truncated N bytes]`` marker; the full
    content remains available in the evidence files (raw, D21).
-2. **Operator-secret masking**: literal secret values and/or regex patterns
-   injected explicitly through the constructor (the ``secrets.yaml`` loader
-   wires them in; full session integration lands in T3.1.1) plus built-in
-   detectors (``Authorization``/``Cookie``-style headers, bearer tokens) →
-   ``<masked:secret-name>``.
 3. **Untrusted marking**: target content is wrapped in the verbatim
    ``[untrusted-target-content begin] ... [untrusted-target-content end]``
-   markers of arch §6.8 (prompt-injection containment).
+   markers of arch §6.8 (prompt-injection containment). Occurrences of the
+   markers *inside* the content are defused into a visibly escaped form and a
+   platform note counts them (D24) — target text can neither close its own
+   untrusted block nor fabricate a quoted one.
 4. **Normalization**: control characters and hidden Unicode (biDi overrides,
    zero-width) are escaped before the text enters any model context.
 
@@ -29,8 +33,9 @@ model context (arch §6.8 application point; engine wiring lands in M3).
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Final, TypeAlias
 
 from langchain.agents.middleware import AgentMiddleware
@@ -50,6 +55,48 @@ UNTRUSTED_BEGIN: Final[str] = "[untrusted-target-content begin]"
 
 #: Verbatim end marker wrapping untrusted target content (arch §6.8).
 UNTRUSTED_END: Final[str] = "[untrusted-target-content end]"
+
+#: Module logger — projection failures of the middleware are recorded here
+#: before the fail-closed feedback replaces the tool result (arch §6.8).
+LOG = logging.getLogger(__name__)
+
+
+def _defused_marker(marker: str) -> str:
+    """Visibly escaped form of one containment marker (D24).
+
+    ``[untrusted-target-content end]`` → ``[defused:untrusted-target-content
+    end]``: the platform's own markers stay verbatim, while the same literal
+    typed by the *target* can no longer be interpreted as the real block
+    boundary (the replacement never contains the original marker string).
+    """
+    return f"[defused:{marker[1:-1]}]"
+
+
+def _defuse_containment_markers(text: str) -> tuple[str, int]:
+    """Defuse every in-content occurrence of the §6.8 markers (D24, F-14).
+
+    Returns:
+        ``(text, spoof_count)`` — the defused copy and how many marker
+        occurrences (begin + end) were rewritten. ``spoof_count == 0`` means
+        the text is returned unchanged.
+    """
+    count = text.count(UNTRUSTED_BEGIN) + text.count(UNTRUSTED_END)
+    if count == 0:
+        return text, 0
+    defused = text.replace(UNTRUSTED_BEGIN, _defused_marker(UNTRUSTED_BEGIN))
+    defused = defused.replace(UNTRUSTED_END, _defused_marker(UNTRUSTED_END))
+    return defused, count
+
+
+def _spoof_note(count: int) -> str:
+    """Platform note counting the defused in-content markers (D24).
+
+    Appended *after* the platform's own end marker, so the model reads it as
+    projector-authored context, never as target content.
+    """
+    if count == 0:
+        return ""
+    return f"\n[note: {count} untrusted-marker spoof attempts defused]"
 
 #: Conservative byte budgets for the tool classes named in arch §12.1
 #: (``context.budgets``). Tool classes without an entry fall back to
@@ -109,22 +156,49 @@ class ProjectorConfig(BaseModel):
         return self.budgets.get(f"{tool_class}_bytes", self.default_budget_bytes)
 
 
-# ---- step 2: built-in detectors (arch §6.8) ----
+# ---- step 1: built-in detectors (arch §6.8) ----
 
-#: Header-line values that already contain a masked reference are left alone:
-#: injected-secret masking ran first, so re-masking would only erase *which*
-#: secret was substituted (``Authorization: Bearer <masked:api_key>`` stays).
-_VALUE_GUARD: Final[str] = r"(?![^\r\n]*<masked:)"
+#: Canonical masked-reference names the built-in detectors produce. The
+#: header-line guard (D24) exempts a line only when it carries a reference
+#: whose name is one of the injected secrets or one of these — a decoy
+#: ``<masked:...>`` with any other name never disables masking.
+_BUILTIN_MASK_NAMES: Final[tuple[str, ...]] = ("authorization", "bearer", "cookie")
 
-#: ``Authorization``/``Proxy-Authorization`` header lines — the value is masked.
-_AUTHORIZATION_HEADER_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b((?:proxy-)?authorization)\s*:\s*{_VALUE_GUARD}[^\r\n]+"
+#: Header-line regex templates for the authz/cookie families (arch §6.8).
+#: The ``{guard}`` slot receives the *name-tied* negative lookahead built by
+#: :func:`_masked_reference_guard`: a line is exempt from re-masking only when
+#: it already carries a masked reference **this projector could have
+#: produced** (a known secret name or a built-in detector name). A decoy
+#: ``<masked:`` with an unknown name no longer disables masking (D24) — the
+#: whole value is masked instead.
+_AUTHORIZATION_HEADER_TEMPLATE: Final[str] = (
+    r"(?i)\b((?:proxy-)?authorization)\s*:\s*{guard}[^\r\n]+"
 )
+_COOKIE_HEADER_TEMPLATE: Final[str] = r"(?i)\b(set-cookie|cookie)\s*:\s*{guard}[^\r\n]+"
 
-#: ``Cookie``/``Set-Cookie`` header lines — the value is masked.
-_COOKIE_HEADER_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)\b(set-cookie|cookie)\s*:\s*{_VALUE_GUARD}[^\r\n]+"
-)
+
+def _masked_reference_guard(known_names: Iterable[str]) -> str:
+    """Negative lookahead exempting only *known* masked references (D24).
+
+    ``(?![^\r\n]*<masked:(?:name1|name2|...)>)`` — the lookahead scans the
+    rest of the line for a reference whose name the projector itself could
+    have substituted (injected secrets + built-in detector names). An
+    attacker-chosen decoy name never matches, so the line stays masked.
+    """
+    alternation = "|".join(sorted(re.escape(name) for name in known_names))
+    return rf"(?![^\r\n]*<masked:(?:{alternation})>)"
+
+
+def _compiled_header_rules(
+    known_names: Iterable[str],
+) -> tuple[tuple[re.Pattern[str], str], ...]:
+    """Compile the authz/cookie header detectors for one projector instance."""
+    guard = _masked_reference_guard(known_names)
+    return (
+        (re.compile(_AUTHORIZATION_HEADER_TEMPLATE.format(guard=guard)), "authorization"),
+        (re.compile(_COOKIE_HEADER_TEMPLATE.format(guard=guard)), "cookie"),
+    )
+
 
 #: Bearer tokens (``Authorization: Bearer <token>`` and bare occurrences).
 #: The token charset excludes ``<``/``>``/``:`` so already-masked references
@@ -171,14 +245,15 @@ def _escape_char(match: re.Match[str]) -> str:
 class ContextProjector:
     """Pure ``str → str`` sanitizer applied to every model-bound text (arch §6.8).
 
-    The four §6.8 steps run in canonical order on :meth:`project`:
-    byte-budget truncation → secret masking → untrusted marking → control-char
+    The four §6.8 steps run in canonical order on :meth:`project` (D23:
+    masking before budget): secret masking → byte-budget truncation →
+    untrusted marking (with in-content marker defusing, D24) → control-char
     normalization. The instance is immutable after construction; secret rules
     are injected explicitly (constructor), which keeps this module free of any
     ``swarmy`` import (arch §2.5: ``tools.*`` never imports ``core``).
     """
 
-    __slots__ = ("_config", "_mark_untrusted", "_secret_rules")
+    __slots__ = ("_config", "_header_rules", "_mark_untrusted", "_secret_rules")
 
     def __init__(
         self,
@@ -225,6 +300,13 @@ class ContextProjector:
         self._secret_rules: tuple[tuple[str, re.Pattern[str]], ...] = self._compile_rules(
             secrets, secret_patterns
         )
+        # D24: the authz/cookie detectors' re-masking guard is tied to the
+        # names this projector can actually produce (injected secrets + the
+        # built-in detector names), so a decoy ``<masked:...>`` can never
+        # disable masking of a reflected credential line.
+        self._header_rules: tuple[tuple[re.Pattern[str], str], ...] = _compiled_header_rules(
+            (*{name for name, _pattern in self._secret_rules}, *_BUILTIN_MASK_NAMES)
+        )
 
     @staticmethod
     def _compile_rules(
@@ -261,6 +343,11 @@ class ContextProjector:
     def project(self, text: str, *, tool_class: str | None = None) -> str:
         """Project one model-bound text through the four §6.8 steps in order.
 
+        Canonical order (D23): masking → budget → marking → normalization.
+        Masking before truncation guarantees no secret can keep an unmasked
+        prefix when the budget cuts mid-value; the budget applies to the
+        masked text (the truncation marker counts masked-text bytes).
+
         Args:
             text: raw content destined for a model context (tool result,
                 digest, guardrail feedback, ...).
@@ -272,13 +359,13 @@ class ContextProjector:
             The sanitized projection; the raw ``text`` is left untouched for
             evidence/memory (D21).
         """
-        projected = self._apply_budget(text, tool_class)  # §6.8 step 1
-        projected = self._mask_secrets(projected)  # §6.8 step 2
+        projected = self._mask_secrets(text)  # §6.8 step 1 (D23: before the budget)
+        projected = self._apply_budget(projected, tool_class)  # §6.8 step 2
         projected = self._mark_untrusted_target(projected)  # §6.8 step 3
         return self._normalize(projected)  # §6.8 step 4
 
     def _apply_budget(self, text: str, tool_class: str | None) -> str:
-        """§6.8 step 1: truncate to the tool class budget with a marker."""
+        """§6.8 step 2: truncate to the tool class budget with a marker."""
         budget = self._config.budget_for(tool_class)
         encoded = text.encode("utf-8")
         if len(encoded) <= budget:
@@ -288,20 +375,27 @@ class ContextProjector:
         return f"{kept}\n{truncation_marker(dropped)}"
 
     def _mask_secrets(self, text: str) -> str:
-        """§6.8 step 2: replace injected secrets, then run the built-in detectors."""
+        """§6.8 step 1: replace injected secrets, then run the built-in detectors."""
         projected = text
         for name, pattern in self._secret_rules:
             masked = mask_reference(name)
             projected = pattern.sub(lambda _match, masked=masked: masked, projected)
-        projected = _AUTHORIZATION_HEADER_RE.sub(_header_masker("authorization"), projected)
-        projected = _COOKIE_HEADER_RE.sub(_header_masker("cookie"), projected)
+        for pattern, secret_name in self._header_rules:
+            projected = pattern.sub(_header_masker(secret_name), projected)
         return _BEARER_TOKEN_RE.sub(_mask_bearer, projected)
 
     def _mark_untrusted_target(self, text: str) -> str:
-        """§6.8 step 3: wrap the content in the verbatim untrusted markers."""
+        """§6.8 step 3: wrap the content in the verbatim untrusted markers.
+
+        In-content occurrences of the markers are defused first (D24): the
+        wrapped text can neither close its own block nor fabricate one, and
+        the platform note after the end marker reports the defusals.
+        """
+        defused, spoof_count = _defuse_containment_markers(text)
+        note = _spoof_note(spoof_count)
         if not self._mark_untrusted:
-            return text
-        return f"{UNTRUSTED_BEGIN} {text} {UNTRUSTED_END}"
+            return f"{defused}{note}"
+        return f"{UNTRUSTED_BEGIN} {defused} {UNTRUSTED_END}{note}"
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -315,7 +409,7 @@ class ContextProjector:
 
 #: Platform read-model tools mapped to the ``memory_result`` budget class
 #: (arch §12.1). Tools without an entry use the projector's conservative
-#: default budget — a budget is always applied, fail-safe (§6.8 step 1).
+#: default budget — a budget is always applied, fail-safe (§6.8 step 2).
 DEFAULT_TOOL_CLASSES: Final[dict[str, str]] = {
     "memory_search": "memory_result",
     "memory_get": "memory_result",
@@ -435,6 +529,10 @@ class ProjectorMiddleware(AgentMiddleware):
                 return self._project_tool_message(tool_name, result)
             return self._project_command(result, tool_name)
         except Exception:
+            # Fail-closed with a diagnostic (Issue #24): the safe feedback
+            # alone would hide a broken projector from the operator — the
+            # log line carries the tool name and the exception.
+            LOG.exception("projection failed for tool %r; returning safe feedback", tool_name)
             return ToolMessage(
                 content=_PROJECTION_FAILURE_FEEDBACK,
                 tool_call_id=str(request.tool_call.get("id", "")),

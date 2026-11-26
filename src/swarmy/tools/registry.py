@@ -6,10 +6,14 @@ owner, source}`` (arch §6.1):
 * ``owner`` — ``"platform"`` or the owning module name;
 * ``source`` — ``"builtin"`` or ``"module:<dir>"``;
 * ``risk_class`` — the HITL gate class (arch §7.2, AD-7): read from the tool
-  function's ``swarmy_risk_class`` attribute, defaulting to
-  :attr:`RiskClass.PASSIVE`; a declarative ``tool_classes`` entry from the
-  module's ``guardrails.yaml`` may override the attribute (the override is
-  passed in explicitly by the loader, AD-7).
+  function's ``swarmy_risk_class`` attribute; when the attribute is absent
+  the default is ownership-aware (D34, F-3/ASI02): a module-owned tool
+  defaults to :attr:`RiskClass.DESTRUCTIVE` — the most gated class, so a
+  forgotten declaration fails toward operator approval — while platform
+  tools keep the :attr:`RiskClass.PASSIVE` fallback (they all declare
+  explicitly; the fallback only covers non-gating readers). A declarative
+  ``tool_classes`` entry from the module's ``guardrails.yaml`` may override
+  the attribute (the override is passed in explicitly by the loader, AD-7).
 
 Fail-fast semantics (arch §6.1, spec §4.3): module tools may **not** use the
 reserved platform prefixes ``memory_*`` / ``event_*`` / ``session_*`` (the
@@ -92,8 +96,10 @@ def declared_risk_class(fn: Callable[..., object]) -> tuple[RiskClass | None, st
 
     Returns:
         ``(risk_class, problem)``: the declared class with ``None`` problem,
-        or ``(None, problem)`` when the attribute is absent (caller applies
-        the ``passive`` default) or holds an invalid value.
+        or ``(None, problem)`` when the attribute is absent (the caller
+        applies the ownership-aware default of D34 — ``destructive`` for
+        module-owned tools, ``passive`` fallback for platform tools) or
+        holds an invalid value.
 
     """
     value = getattr(fn, "swarmy_risk_class", _MISSING)
@@ -120,7 +126,10 @@ def risk_class_of(fn: Callable[..., object]) -> RiskClass:
     """Resolve the risk class of a tool function (AD-7).
 
     The declared ``swarmy_risk_class`` attribute wins; a missing attribute
-    defaults to :attr:`RiskClass.PASSIVE` (arch §6.1).
+    defaults to :attr:`RiskClass.DESTRUCTIVE` (F-3, SECURITY.md ASI02: the
+    undeclared default is the **most gated** class, so a forgotten
+    declaration fails toward operator approval — platform-owned tools all
+    declare explicitly and never rely on this fallback).
 
     Raises:
         ToolRegistryError: when the attribute holds an invalid value.
@@ -128,7 +137,7 @@ def risk_class_of(fn: Callable[..., object]) -> RiskClass:
     risk, problem = declared_risk_class(fn)
     if problem is not None:
         raise ToolRegistryError([problem])
-    return risk if risk is not None else RiskClass.PASSIVE
+    return risk if risk is not None else RiskClass.DESTRUCTIVE
 
 
 class ToolRegistry:
@@ -194,7 +203,21 @@ class ToolRegistry:
             resolved.append(
                 ToolEntry(
                     fn=spec.fn,
-                    risk_class=risk if risk is not None else RiskClass.PASSIVE,
+                    # F-3 (SECURITY.md ASI02): an undeclared class defaults to
+                    # the most gated class for module-owned tools — a forgotten
+                    # declaration must fail toward operator approval, never
+                    # toward silent execution under every strictness profile.
+                    # Platform-owned tools all declare (AD-7); their passive
+                    # fallback only covers non-gating readers.
+                    risk_class=(
+                        risk
+                        if risk is not None
+                        else (
+                            RiskClass.PASSIVE
+                            if spec.owner == PLATFORM_OWNER
+                            else RiskClass.DESTRUCTIVE
+                        )
+                    ),
                     owner=spec.owner,
                     source=spec.source,
                 )

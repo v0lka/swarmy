@@ -19,8 +19,12 @@ events package, never ``swarmy.core`` / ``swarmy.modules`` / ``swarmy.tui``.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
-from typing import TYPE_CHECKING, Literal
+import re
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Final, Literal, get_type_hints
 
 from swarmy.events import JsonValue  # noqa: TC001 - runtime: tool-call schema
 from swarmy.memory.models import (
@@ -38,7 +42,7 @@ from swarmy.memory.models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
     from pydantic import BaseModel
 
@@ -94,6 +98,33 @@ def _severity_or_none(value: str | None) -> Severity | None:
         allowed = [item.value for item in Severity]
         msg = f"severity must be one of {allowed}, got {value!r}"
         raise ValueError(msg) from exc
+
+
+#: RFC 9110 token charset (`tchar`): the grammar an HTTP method must match.
+_METHOD_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
+def _normalize_method(method: str) -> str:
+    """Normalize an HTTP method at the memory write boundary (F-15, option b).
+
+    Uppercases and validates against the RFC 9110 token grammar, so a
+    target-controlled or hallucinated junk value (``"[/etc/passwd]"``,
+    ``"get /admin"``) can never enter the ``endpoints`` table — the memory
+    stays raw (D21) but structurally sane, and the ``host:method:path``
+    dedup key cannot be poisoned by non-token methods.
+
+    Raises:
+        ValueError: agent-addressable message; nothing is stored.
+    """
+    cleaned = method.strip().upper()
+    if not cleaned or not _METHOD_TOKEN_RE.match(cleaned):
+        msg = (
+            f"invalid HTTP method {method!r}: a method must be an RFC 9110 "
+            "token (letters, digits and !#$%&'*+-.^_`|~), e.g. GET or POST; "
+            "the endpoint was not stored"
+        )
+        raise ValueError(msg)
+    return cleaned
 
 
 def _resolution_event(
@@ -169,30 +200,40 @@ def make_memory_tools(
         method: str,
         path: str,
         auth_requirements: list[str] | None = None,
-        research_status: Literal["undiscovered", "probed", "analyzed"] = "undiscovered",
-        out_of_scope: bool = False,
-        notes: str = "",
+        research_status: Literal["undiscovered", "probed", "analyzed"] | None = None,
+        out_of_scope: bool | None = None,
+        notes: str | None = None,
         parameters: list[dict[str, str | list[str]]] | None = None,
     ) -> str:
         """Insert or update one endpoint of the target (dedup key: host+method+path).
 
         Records an application endpoint you discovered. A new
-        ``(host, method, path)`` triple is created; an existing one is
-        updated (auth requirements, research status, scope flag, notes are
-        overwritten, parameters are merged). The platform publishes
-        ``EndpointsDiscovered`` for a new row and ``EndpointUpdated`` for an
-        update.
+        ``(host, method, path)`` triple is created (omitted fields take
+        their defaults); an existing one is updated with **None-sentinel
+        semantics**: every optional field left as ``None`` keeps its stored
+        value instead of resetting it, so re-discovering a known endpoint
+        never erases prior observations. ``parameters`` are always merged.
+        The platform publishes ``EndpointsDiscovered`` for a new row and
+        ``EndpointUpdated`` for an update.
 
         Args:
             host: full ``host:port`` of the target, e.g. ``app.example.com:443``.
-            method: HTTP method, e.g. ``GET`` or ``POST``.
+            method: HTTP method (RFC 9110 token), e.g. ``GET`` or ``POST``;
+                normalized to uppercase, invalid values are rejected and
+                nothing is stored.
             path: request path, e.g. ``/api/items``.
-            auth_requirements: secret/auth-scheme names this endpoint needs.
-            research_status: one of ``undiscovered`` (default), ``probed``,
-                ``analyzed``.
+            auth_requirements: secret/auth-scheme names this endpoint needs;
+                ``None`` keeps the stored list.
+            research_status: one of ``undiscovered``, ``probed``, ``analyzed``;
+                ``None`` keeps the stored status.
             out_of_scope: whether the endpoint lies outside the allowlisted
                 scope — out-of-scope records are never served by http tools.
-            notes: free-form observations.
+                ``None`` keeps the stored flag; ``True`` marks the endpoint
+                (a restriction, always allowed); ``False`` is refused with an
+                error when the endpoint is already marked — unmarking
+                widens the perimeter and requires an operator decision
+                (fail-closed, arch §6.3).
+            notes: free-form observations; ``None`` keeps the stored notes.
             parameters: known request parameters, each a JSON object
                 ``{name, location}`` with ``location`` in ``query``/``body``/
                 ``header``, optionally ``type`` and ``examples`` (list of str).
@@ -200,25 +241,58 @@ def make_memory_tools(
         Returns:
             The stored endpoint record as a JSON object (including ``id``).
         """
+        normalized_method = _normalize_method(method)
+        known = await store.list_endpoints()
+        existing = next(
+            (
+                row
+                for row in known
+                if row.host == host
+                and row.method == normalized_method
+                and row.path == path
+            ),
+            None,
+        )
+        if existing is not None:
+            if out_of_scope is False and existing.out_of_scope:
+                msg = (
+                    f"endpoint {normalized_method} {host}{path} is marked "
+                    "out_of_scope=True: clearing the flag widens the session "
+                    "perimeter and requires an operator decision (arch §6.3); "
+                    "the stored flag was kept"
+                )
+                raise ValueError(msg)
+            resolved_auth = (
+                list(existing.auth_requirements)
+                if auth_requirements is None
+                else list(auth_requirements)
+            )
+            resolved_status = (
+                existing.research_status if research_status is None else research_status
+            )
+            resolved_flag = existing.out_of_scope if out_of_scope is None else out_of_scope
+            resolved_notes = existing.notes if notes is None else notes
+        else:
+            resolved_auth = list(auth_requirements) if auth_requirements else []
+            resolved_status = (
+                "undiscovered" if research_status is None else research_status
+            )
+            resolved_flag = False if out_of_scope is None else out_of_scope
+            resolved_notes = "" if notes is None else notes
         draft = EndpointDraft(
             host=host,
-            method=method,
+            method=normalized_method,
             path=path,
-            auth_requirements=list(auth_requirements) if auth_requirements else [],
-            research_status=research_status,
-            out_of_scope=out_of_scope,
-            notes=notes,
+            auth_requirements=resolved_auth,
+            research_status=resolved_status,
+            out_of_scope=resolved_flag,
+            notes=resolved_notes,
             parameters=[
                 ParameterDraft.model_validate(item) for item in (parameters or [])
             ],
         )
-        known = await store.list_endpoints()
-        was_known = any(
-            row.host == host and row.method == method and row.path == path
-            for row in known
-        )
         endpoint = await store.upsert_endpoint(draft)
-        if was_known:
+        if existing is not None:
             payload: Mapping[str, JsonValue] = {"endpoint_id": endpoint.id}
             await emit("EndpointUpdated", payload)
         else:
@@ -499,3 +573,120 @@ def make_session_info_tool(
     )
     session_info.__doc__ = doc
     return session_info
+
+
+#: The by-name secret reference form (Issue #11, arch §12.3 + §6.8): the
+#: canonical placeholder rendered by
+#: :func:`swarmy.tools.projector.mask_reference` — the same spelling the
+#: projector masks live values to, so a digest a model read can be echoed
+#: back as an addressable reference. One capture group: the secret name.
+#: The literal is duplicated here (not imported) because ``swarmy.tools``
+#: must not import ``swarmy.core``; a format change must touch both.
+_SECRET_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(r"<masked:([^<>\s]+)>")
+
+
+def substitute_secret_references(value: str, secrets: Mapping[str, str]) -> str:
+    """Resolve ``<masked:secret-name>`` references in one string (Issue #11).
+
+    The tool-boundary half of the documented secrets workflow: agents pass
+    operator secrets **by name** (the reference form), and this function
+    swaps them for the raw values right before the platform HTTP tool hands
+    the arguments to the session client — after the guardrail pipeline has
+    evaluated the reference form, so rules and journal digests never see
+    the raw value (arch §12.3; secrets live only in ``secrets.yaml``).
+
+    Args:
+        value: one string argument (URL fragment, header value, body …).
+        secrets: ``name → raw value`` (the session's
+            ``SecretsConfig.secret_values()`` map); never journaled.
+
+    Returns:
+        The string with every reference resolved.
+
+    Raises:
+        ValueError: naming the unknown reference and the names that exist —
+            a dangling reference must fail loudly, not leak a placeholder
+            string to the target.
+    """
+
+    def _resolve(match: re.Match[str]) -> str:
+        name = match.group(1)
+        resolved = secrets.get(name)
+        if resolved is None:
+            known = ", ".join(sorted(secrets)) or "none"
+            msg = f"unknown secret reference <masked:{name}>; known secrets: {known}"
+            raise ValueError(msg)
+        return resolved
+
+    return _SECRET_REFERENCE_PATTERN.sub(_resolve, value)
+
+
+def substitute_secret_args(value: object, secrets: Mapping[str, str]) -> object:
+    """Deep-resolve secret references in every string leaf of an args tree.
+
+    Args:
+        value: one tool-argument value (string, mapping, sequence or scalar).
+        secrets: ``name → raw value`` map (see
+            :func:`substitute_secret_references`).
+
+    Returns:
+        The same tree with references substituted in string leaves;
+        non-string scalars pass through unchanged.
+    """
+    if isinstance(value, str):
+        if "<masked:" not in value:
+            return value
+        return substitute_secret_references(value, secrets)
+    if isinstance(value, Mapping):
+        return {key: substitute_secret_args(item, secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [substitute_secret_args(item, secrets) for item in value]
+    return value
+
+
+def bind_secret_substitution(
+    fn: Callable[..., Awaitable[object]], secrets: Mapping[str, str]
+) -> Callable[..., object]:
+    """Bind by-name secret substitution onto one platform HTTP tool (Issue #11).
+
+    The substitution runs **inside** the tool boundary: the guardrail
+    middleware and the approval digests evaluate the wrapped call's
+    arguments while they still carry the ``<masked:name>`` references (rules
+    see references, never values), and only the call into the session HTTP
+    client receives the resolved values. The wrapper preserves the original
+    tool's contract surface — name, docstring, resolved annotations,
+    signature and the ``swarmy_risk_class`` declaration — so the loader's
+    contract validation and the L0 tool-schema generation see exactly the
+    original tool.
+
+    Args:
+        fn: the async platform tool (one of the ``http_*`` builders).
+        secrets: ``name → raw value`` map; an empty map leaves every
+            reference dangling (an unknown-name call fails loudly, above).
+
+    Returns:
+        The wrapped tool with the substituted arguments semantics.
+    """
+    resolved_hints: dict[str, object] = dict(get_type_hints(fn))
+    original_signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    async def wrapper(*args: object, **kwargs: object) -> object:
+        substituted_args = tuple(substitute_secret_args(item, secrets) for item in args)
+        substituted_kwargs = {
+            key: substitute_secret_args(value, secrets) for key, value in kwargs.items()
+        }
+        return await fn(*substituted_args, **substituted_kwargs)
+
+    # The loader validates tools through ``get_type_hints`` +
+    # ``inspect.signature``; hand both the original's resolved surface
+    # (functools.wraps copies the raw annotation objects, which for the
+    # HTTP tools are source-level strings resolvable only in their home
+    # module). Dynamic attribute writes keep the AD-7 declaration and the
+    # introspection surface on the wrapper.
+    wrapper.__annotations__ = resolved_hints
+    wrapper.__signature__ = original_signature  # ty: ignore[missing-attribute]
+    risk = getattr(fn, "swarmy_risk_class", None)
+    if risk is not None:
+        wrapper.swarmy_risk_class = risk  # ty: ignore[missing-attribute]
+    return wrapper

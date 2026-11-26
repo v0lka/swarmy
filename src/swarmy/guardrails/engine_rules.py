@@ -8,16 +8,24 @@ flag is a build-time argument). The set follows arch §6.6 / spec §8.2:
 * ``no-true-based-sqli`` — the canonical spec §8.3 example: TRUE-construction
   payloads (``OR 1=1``, ``'=''``-style) in HTTP tool parameters are blocked
   because they corrupt target data during SQLi probing;
-* ``block-trace-connect-methods`` — HTTP methods ``TRACE``/``CONNECT`` are
-  denied (tracking/cProxy abuse, never needed by the swarm);
 * ``block-destructive-payloads`` — known destructive payload patterns
   (``DROP TABLE``-style statements, ``rm -rf``-style shell fragments).
+
+HTTP methods need no engine rule: the platform HTTP tool surface offers
+exactly GET/POST/PUT/DELETE (fixed ``Literal`` per tool), so TRACE/CONNECT
+are structurally unsendable — the former ``block-trace-connect-methods``
+rule could never observe a method value and only misfired on probe
+parameters whose value happened to be ``trace``/``connect`` (removed per
+review Issue #59; decision D30).
 
 Engine rules are ordinary :class:`~swarmy.guardrails.models.GuardrailRule`
 models evaluated by the same code path as layer-3 module rules; their ids
 are unprefixed (the ``layer`` field of the feedback/event says ``engine`` —
 only invariants carry the ``invariant:`` prefix). Compilation of the regexes
-happens once, at pipeline construction (fail-fast, arch §4.5).
+happens once, at pipeline construction (fail-fast, arch §4.5). Pattern note
+(review F-10): patterns must not contain unbounded ``.*``/``.+`` scans —
+quantifiers are bounded (``.{0,N}``) so a hostile multi-hundred-KB argument
+cannot drive quadratic regex backtracking on every tool call.
 """
 
 from __future__ import annotations
@@ -25,11 +33,9 @@ from __future__ import annotations
 from swarmy.guardrails.models import GuardrailRule, RuleCondition
 
 #: Spec §8.3 example — TRUE-constructions in SQLi probe parameters.
-_TRUE_BASED_SQLI_REGEX = r"(?i)('\s*(or|and)\s*'.*'=|1\s*=\s*1|true\s*=)"
-
-#: Methods that must never be sent by the swarm (arch §6.6 default set).
-#: Anchored so a value that merely *contains* the word is not blocked.
-_FORBIDDEN_METHOD_REGEX = r"(?i)^\s*(trace|connect)\s*$"
+#: The gap quantifier is bounded (review F-10): the engine caps the regex
+#: steps per argument leaf, keeping deny semantics for realistic payloads.
+_TRUE_BASED_SQLI_REGEX = r"(?i)('\s*(or|and)\s*'.{0,256}'=|1\s*=\s*1|true\s*=)"
 
 #: Known destructive payload fragments (spec §8.2 default set). These target
 #: data destruction on the host, not the probing payloads the xss/sql
@@ -64,22 +70,6 @@ def no_true_based_sqli_rule() -> GuardrailRule:
     )
 
 
-def block_trace_connect_methods_rule() -> GuardrailRule:
-    """Build the rule denying HTTP methods ``TRACE``/``CONNECT``.
-
-    Returns:
-        The ``block-trace-connect-methods`` guardrail rule.
-    """
-    return GuardrailRule(
-        id="block-trace-connect-methods",
-        applies_to=list(_HTTP_TOOL_NAMES),
-        condition=RuleCondition(any_param_matches=_FORBIDDEN_METHOD_REGEX),
-        action="block",
-        severity="high",
-        message="HTTP methods TRACE and CONNECT are blocked by the engine policy",
-    )
-
-
 def block_destructive_payloads_rule() -> GuardrailRule:
     """Build the rule blocking known destructive payload patterns.
 
@@ -104,14 +94,12 @@ def default_engine_rules() -> tuple[GuardrailRule, ...]:
     """
     return (
         no_true_based_sqli_rule(),
-        block_trace_connect_methods_rule(),
         block_destructive_payloads_rule(),
     )
 
 
 __all__ = [
     "block_destructive_payloads_rule",
-    "block_trace_connect_methods_rule",
     "default_engine_rules",
     "no_true_based_sqli_rule",
 ]

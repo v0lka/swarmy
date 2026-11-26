@@ -44,6 +44,50 @@ _SCHEMA_MIGRATIONS_DDL = (
 )
 
 
+def _split_statements(script: str) -> list[str]:
+    """Split a SQL script into complete statements (quote/trigger-safe).
+
+    Uses :func:`sqlite3.complete_statement` — the same boundary detection as
+    the sqlite3 shell — so semicolons inside string literals or inside
+    ``CREATE TRIGGER ... BEGIN ... END`` bodies never split a statement
+    (the plain ``str.split(";")`` of Issue #43's predecessor did exactly
+    that on the schema's trigger DDL). A trailing fragment without a
+    terminating semicolon is kept as the last statement (the caller strips
+    the script's trailing ``;`` before splitting).
+
+    Args:
+        script: one migration's DDL text (possibly multi-statement).
+
+    Returns:
+        The stripped, non-empty statements in order.
+    """
+    statements: list[str] = []
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            stripped = buffer.strip()
+            if stripped:
+                statements.append(stripped)
+            buffer = ""
+    tail = buffer.strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+class DatabaseSchemaError(RuntimeError):
+    """The session database was written by a *newer* schema (#30).
+
+    Raised by :meth:`Database.open` when ``schema_migrations`` holds versions
+    this build does not know — the portable session folder cannot be
+    downgraded, so start fails fast. Subclasses :class:`RuntimeError` (the
+    previously documented type, #30) so existing ``except RuntimeError``
+    guards keep catching it, while ``cli._start_error_types`` renders the
+    typed one-line report instead of a raw traceback.
+    """
+
+
 class Database:
     """Connection manager and migrator for one ``memory.sqlite`` file (T1.2.2).
 
@@ -82,8 +126,8 @@ class Database:
         Each pending migration runs in its own transaction together with its
         ``schema_migrations`` row; already-applied versions are skipped, so
         re-opening a session with the same schema is a no-op (arch §13.1).
-        Raises ``RuntimeError`` when the file was written by a *newer*
-        schema than this build knows (naming both versions).
+        Raises :class:`DatabaseSchemaError` when the file was written by a
+        *newer* schema than this build knows (naming both versions; #30).
         """
         if self._control is None:
             self._control = await self._new_connection()
@@ -96,7 +140,7 @@ class Database:
         max_applied = int(row[0]) if row is not None else 0
         newest = self._migrations[-1][0] if self._migrations else 0
         if max_applied > newest:
-            raise RuntimeError(
+            raise DatabaseSchemaError(
                 f"session database {self._path} has schema version {max_applied}, "
                 f"which is newer than the newest migration of this swarmy build "
                 f"(version {newest}); upgrade swarmy to open this session"
@@ -105,16 +149,20 @@ class Database:
             if version <= max_applied:
                 continue  # resume (arch §13.1): already applied - skip
             applied_at = datetime.now(UTC).isoformat()
-            ddl = ddl.strip().rstrip(";")
-            script = (
-                "BEGIN;\n"
-                f"{ddl};\n"
-                f"INSERT INTO schema_migrations(version, applied_at) "
-                f"VALUES ({int(version)}, '{applied_at}');\n"
-                "COMMIT;"
-            )
+            statements = _split_statements(ddl.strip().rstrip(";"))
             try:
-                await control.executescript(script)  # transactional DDL (arch §4.3)
+                await control.execute("BEGIN")
+                for statement in statements:  # transactional DDL (arch §4.3)
+                    await control.execute(statement)
+                # Bound parameters (Issue #43): the bookkeeping row must not
+                # interpolate values into SQL - executescript cannot bind, so
+                # the DDL and the INSERT run as separate statements inside one
+                # explicit transaction instead.
+                await control.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (int(version), applied_at),
+                )
+                await control.execute("COMMIT")
             except aiosqlite.Error:
                 await control.rollback()  # leave no half-applied transaction behind
                 raise

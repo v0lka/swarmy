@@ -20,7 +20,12 @@ import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from swarmy.events.models import EventEnvelope, EventRegistry, EventSource
+from swarmy.events.models import (
+    EventEnvelope,
+    EventRegistry,
+    EventSource,
+    UnknownEventPayload,
+)
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -30,7 +35,6 @@ _APPEND_SQL = (
     "INSERT INTO events (ts, type, source, source_detail, correlation_id, payload)"
     " VALUES (?, ?, ?, ?, ?, ?)"
 )
-_LAST_ROW_ID_SQL = "SELECT last_insert_rowid()"
 _TAIL_SQL = (
     "SELECT * FROM (SELECT * FROM events ORDER BY id DESC LIMIT ?) ORDER BY id"
 )
@@ -57,9 +61,26 @@ def _payload_dict(raw: object, event_id: int) -> dict[str, object]:
 
 
 def _envelope_from_row(row: aiosqlite.Row) -> EventEnvelope:
-    """Decode one ``events`` row into a fully typed envelope."""
+    """Decode one ``events`` row into a fully typed envelope.
+
+    Tolerant decode (consolidated review #7/#29 ↔ F-5): a row whose type is
+    absent from ``EventRegistry`` in this process (unloaded module, journal
+    written by a newer build) decodes with an :class:`UnknownEventPayload`
+    placeholder instead of raising — one unknown row must never brick
+    resume/report/TUI reads. Corruption of a *known* type (non-object JSON,
+    schema-invalid payload) still fails loudly.
+    """
     event_id = int(row["id"])
     event_type = str(row["type"])
+    raw_payload_text = str(row["payload"])
+    raw = _payload_dict(raw_payload_text, event_id)
+    try:
+        payload = EventRegistry.create(event_type, raw)
+    except KeyError:
+        payload = UnknownEventPayload(
+            original_type=event_type,
+            raw_payload=raw_payload_text,
+        )
     return EventEnvelope(
         id=event_id,
         ts=datetime.fromisoformat(str(row["ts"])),
@@ -67,7 +88,7 @@ def _envelope_from_row(row: aiosqlite.Row) -> EventEnvelope:
         source=EventSource(str(row["source"])),
         source_detail=str(row["source_detail"]),
         correlation_id=str(row["correlation_id"]),
-        payload=EventRegistry.create(event_type, _payload_dict(row["payload"], event_id)),
+        payload=payload,
     )
 
 
@@ -91,10 +112,15 @@ class JournalWriter:
 
         The INSERT is committed before this call returns — append happens
         before any fan-out (journal-first, arch §5.3). ``payload`` is stored
-        as ``model_dump_json()``; ``ts`` defaults to now (UTC).
+        as ``model_dump_json()``; ``ts`` defaults to now (UTC). The id is
+        taken from the INSERT cursor itself (``lastrowid`` — per-cursor
+        state), not from a follow-up ``SELECT last_insert_rowid()``: two
+        concurrent emissions interleave at ``await`` boundaries, and a
+        follow-up read could return another writer's row (consolidated
+        review #52).
         """
         ts_text = _utc_moment(ts)
-        await self._conn.execute(
+        cursor = await self._conn.execute(
             _APPEND_SQL,
             (
                 ts_text,
@@ -105,13 +131,13 @@ class JournalWriter:
                 payload.model_dump_json(),
             ),
         )
+        row_id = cursor.lastrowid
+        if row_id is None:
+            msg = "journal INSERT did not yield a rowid"
+            raise RuntimeError(msg)
         await self._conn.commit()  # durable before any fan-out sees the id
-        cursor = await self._conn.execute(_LAST_ROW_ID_SQL)
-        row = await cursor.fetchone()
-        if row is None:
-            raise RuntimeError("last_insert_rowid() returned no row")
         return EventEnvelope(
-            id=int(row[0]),
+            id=row_id,
             ts=datetime.fromisoformat(ts_text),
             type=type,
             source=source,

@@ -82,7 +82,18 @@ class JudgeEscalationRegistry:
         self._counter = 0
 
     def escalate(self, tool_class: str, reason: str) -> str:
-        """Close the class gate; returns the new escalation id."""
+        """Close the class gate; returns the escalation id (idempotent per class).
+
+        Escalating an already-gated class returns the **existing** id instead
+        of overwriting it (Issue #37): a second escalation of the same class
+        (the post-call band fires regardless of a pending pre-call gate) must
+        not orphan the first request's resolver — the operator's decision on
+        the superseded id would otherwise raise ``KeyError`` after retirement.
+        A duplicate escalation then resolves the same gate.
+        """
+        existing = self._escalations.get(tool_class)
+        if existing is not None:
+            return existing
         self._counter += 1
         escalation_id = f"judge-esc-{self._counter:04d}"
         self._escalations[tool_class] = escalation_id
@@ -145,7 +156,7 @@ class JudgeEscalationRegistry:
         tool_class = next(iter(gated))
         del self._escalations[tool_class]
         if decision == "reject":
-            reason = getattr(self, "_reasons", {}).get(escalation_id, "confirmed risk")
+            reason = self._reasons.get(escalation_id, "confirmed risk")
             self._denied[tool_class] = reason
         return tool_class
 
@@ -195,7 +206,7 @@ class LlmJudge:
         timeout_s: float = 15.0,
         instruction_patterns: Sequence[str] | None = None,
         escalation_registry: JudgeEscalationRegistry | None = None,
-        sink: Callable[[BlockedFeedback, str], Awaitable[None]] | None = None,
+        sink: Callable[[BlockedFeedback, str, str], Awaitable[None]] | None = None,
         on_escalation: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         """Assemble the band.
@@ -213,7 +224,10 @@ class LlmJudge:
             escalation_registry: the class-gate registry; a fresh one is
                 created when omitted (standalone use/tests).
             sink: async journaling path for the band's own notes — receives
-                ``(BlockedFeedback, tool_name)``; the session wiring appends
+                ``(BlockedFeedback, tool_name, tool_args_digest)`` (Issue #49:
+                the digest is the §6.8 projection the pipeline computed for
+                the call, so judge-layer journal rows carry it exactly like
+                deterministic rows); the session wiring appends
                 ``GuardrailBlocked`` (``layer="judge"``,
                 ``rule_id="judge:<verdict>"`` — the §5.5-anticipated channel)
                 journal-first and fans out. ``None`` keeps the band silent
@@ -279,7 +293,9 @@ class LlmJudge:
         if verdict == "ok":
             return (Verdict.ALLOW, None)
         if verdict == "flag":
-            await self._journal("judge:flag", f"judge flagged {tool_name}: {reason}", tool_name)
+            await self._journal(
+                "judge:flag", f"judge flagged {tool_name}: {reason}", tool_name, args_digest
+            )
             return (Verdict.ALLOW, None)
         # escalate_hitl — low confidence degrades to a flag (the judge adds
         # constraints; an unsure escalation must not disrupt the swarm).
@@ -288,13 +304,18 @@ class LlmJudge:
                 "judge:flag",
                 f"judge escalation below confidence {self._threshold}: {reason}",
                 tool_name,
+                args_digest,
             )
             return (Verdict.ALLOW, None)
-        return await self._escalate(tool_class, f"pre-call judge escalation on {tool_name}: {reason}")
+        return await self._escalate(
+            tool_class, f"pre-call judge escalation on {tool_name}: {reason}", args_digest
+        )
 
     # ---- post-call band (T3.4.2) ----
 
-    def postcall(self, tool_name: str, tool_class: str, result_text: str) -> asyncio.Task[None] | None:
+    def postcall(
+        self, tool_name: str, tool_class: str, result_text: str, args_digest: str = ""
+    ) -> asyncio.Task[None] | None:
         """Screen a tool result; judging happens off the execution path.
 
         The pattern screen is synchronous and cheap; only a hit spawns the
@@ -308,6 +329,9 @@ class LlmJudge:
             tool_name: the executed tool.
             tool_class: its risk class (the escalation gates the class).
             result_text: the tool result text (§6.8-projected by middleware).
+            args_digest: the §6.8 digest of the executed call's arguments
+                (Issue #49) — carried into the row the band journals.
+                Defaults to ``""`` for callers without the arguments.
 
         Returns:
             The spawned analysis task, or ``None`` when the screen found
@@ -317,12 +341,16 @@ class LlmJudge:
             return None
         if self._model is None:
             return None
-        task = asyncio.create_task(self._postcall_analyze(tool_name, tool_class, result_text))
+        task = asyncio.create_task(
+            self._postcall_analyze(tool_name, tool_class, result_text, args_digest)
+        )
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
         return task
 
-    async def _postcall_analyze(self, tool_name: str, tool_class: str, result_text: str) -> None:
+    async def _postcall_analyze(
+        self, tool_name: str, tool_class: str, result_text: str, args_digest: str
+    ) -> None:
         """The off-path judge review of one suspicious result."""
         verdict, confidence, reason = await self._ask(
             "You are the safety judge of a penetration-testing swarm. A tool result "
@@ -334,11 +362,16 @@ class LlmJudge:
         )
         if verdict == "escalate_hitl" and confidence >= self._threshold:
             await self._escalate(
-                tool_class, f"post-call judge escalation on {tool_name} result: {reason}"
+                tool_class,
+                f"post-call judge escalation on {tool_name} result: {reason}",
+                args_digest,
             )
         elif verdict in ("flag", "escalate_hitl"):
             await self._journal(
-                "judge:flag", f"post-call judge flag on {tool_name}: {reason}", tool_name
+                "judge:flag",
+                f"post-call judge flag on {tool_name}: {reason}",
+                tool_name,
+                args_digest,
             )
 
     # ---- escalation plumbing ----
@@ -353,10 +386,12 @@ class LlmJudge:
         while self._pending_tasks:
             await asyncio.gather(*list(self._pending_tasks))
 
-    async def _escalate(self, tool_class: str, reason: str) -> PreCallOutcome:
+    async def _escalate(
+        self, tool_class: str, reason: str, args_digest: str
+    ) -> PreCallOutcome:
         """Close the class gate, journal the escalation, notify the wiring."""
         self._registry.escalate(tool_class, reason)
-        await self._journal("judge:escalate_hitl", reason, tool_class)
+        await self._journal("judge:escalate_hitl", reason, tool_class, args_digest)
         if self._on_escalation is not None:
             await self._on_escalation(tool_class, reason)
         return (
@@ -368,15 +403,23 @@ class LlmJudge:
             ),
         )
 
-    async def _journal(self, rule_id: str, reason: str, subject: str) -> None:
+    async def _journal(
+        self, rule_id: str, reason: str, subject: str, args_digest: str = ""
+    ) -> None:
         """Journal one judge note through the injected sink (fire-and-forget safe).
 
         ``subject`` is the tool name (flag notes) or the risk class (the
         escalation record); the sink builds the ``GuardrailBlocked`` payload.
+        ``args_digest`` is the §6.8-projected digest of the judged call's
+        arguments (Issue #49) — pre-call rows carry the digest the pipeline
+        computed; post-call rows carry the digest the projector middleware
+        computed for the executed call (empty only when no arguments exist).
         """
         if self._sink is not None:
             await self._sink(
-                BlockedFeedback(rule_id=rule_id, layer="judge", reason=reason), subject
+                BlockedFeedback(rule_id=rule_id, layer="judge", reason=reason),
+                subject,
+                args_digest,
             )
 
     async def _ask(self, instruction: str) -> tuple[JudgeVerdict, float, str]:

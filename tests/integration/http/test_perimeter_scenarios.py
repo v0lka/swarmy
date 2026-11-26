@@ -87,6 +87,12 @@ TIMEOUT_LIMITS: Final = ResourceLimits(
     connect_timeout_s=1.0,
     read_timeout_s=0.3,
 )
+#: Entry #34 (connection refused): the refusal has to be *reported* before the
+#: connect budget expires. Windows retries the SYN for a couple of seconds
+#: before refusing a closed loopback port, so the 1 s budget above would turn
+#: that refusal into a timeout there; Linux/macOS refuse immediately, so the
+#: scenario stays fast. The read budget is irrelevant (no response arrives).
+REFUSED_CONNECT_LIMITS: Final = TIMEOUT_LIMITS.model_copy(update={"connect_timeout_s": 20.0})
 
 
 async def _guardrail_events(reader: JournalReader) -> list[GuardrailBlockedPayload]:
@@ -362,7 +368,7 @@ async def test_transport_error_returns_feedback_and_journals_invariant_transport
     scope = ScopeRegistry(
         ScopeEntries(ip_subnets=["127.0.0.1/32"], ports=[dead_port], schemes=["http"])
     )
-    limiter = ResourceLimiter(TIMEOUT_LIMITS)
+    limiter = ResourceLimiter(REFUSED_CONNECT_LIMITS)
     pipeline = GuardrailPipeline(invariants=InvariantLayer(session_invariants(scope, limiter)))
     recorder = EvidenceRecorder(
         evidence_dir=session_env.evidence_dir, store=session_env.store, max_body_bytes=1024

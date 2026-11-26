@@ -19,6 +19,7 @@ from swarmy.guardrails.pipeline import GuardrailMiddleware
 from swarmy.modules import loader as loader_module
 from swarmy.modules.loader import ModuleLoader, PlatformToolsetFactory
 from swarmy.modules.registry import ModuleLoadError
+from swarmy.tools.errors import ToolErrorFeedbackMiddleware
 from swarmy.tools.projector import ProjectorMiddleware
 
 if TYPE_CHECKING:
@@ -36,6 +37,7 @@ def _clean_event_taxonomy() -> Iterator[None]:
     """
     yield
     EventRegistry.reset()
+
 
 EXPECTED_SUBAGENT_KEYS = {
     "name",
@@ -125,7 +127,9 @@ def _recording_factory() -> tuple[PlatformToolsetFactory, list[frozenset[str]]]:
     """Build a platform toolset factory recording the declarations it receives."""
     calls: list[frozenset[str]] = []
 
-    def factory(module_name: str, declared_event_types: frozenset[str]) -> dict[str, Callable[..., str]]:
+    def factory(
+        module_name: str, declared_event_types: frozenset[str]
+    ) -> dict[str, Callable[..., str]]:
         calls.append(declared_event_types)
 
         async def memory_probe() -> str:
@@ -154,7 +158,9 @@ def test_valid_module_loads_with_exact_subagent_keys(tmp_path: Path) -> None:
         guardrails=GOOD_GUARDRAILS,
     )
     factory, _calls = _recording_factory()
-    registry = ModuleLoader(user_dirs=[root], platform_toolset_factory=factory, include_builtins=False).load()
+    registry = ModuleLoader(
+        user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
+    ).load()
     assert "good" in registry
     module = registry.get("good")
     # ``model`` is NotRequired (T3.1.3 wiring): the key is present only when
@@ -169,9 +175,10 @@ def test_valid_module_loads_with_exact_subagent_keys(tmp_path: Path) -> None:
     assert tool_names == {"memory_probe", "good_probe"}  # platform + module tools (arch §6.1)
     middleware = module.subagent["middleware"]
     assert isinstance(middleware, list)
-    assert len(middleware) == 2
+    assert len(middleware) == 3
     assert isinstance(middleware[0], GuardrailMiddleware)  # pre-tool-call gate (arch §6.5)
     assert isinstance(middleware[1], ProjectorMiddleware)  # post-tool-call §6.8 (T2.3.2)
+    assert isinstance(middleware[2], ToolErrorFeedbackMiddleware)  # tool-body failures → feedback
     assert module.subagent["interrupt_on"] == {"memory_probe": False, "good_probe": True}
     assert module.subagent["skills"] == []
     assert module.subagent["response_format"] is None
@@ -181,7 +188,9 @@ def test_valid_module_loads_with_exact_subagent_keys(tmp_path: Path) -> None:
 def test_five_violation_kinds_produce_exact_lines(tmp_path: Path) -> None:
     """AC (T1.5.3): each violation kind yields its exact aggregated-error line."""
     root = tmp_path / "agents"
-    _make_module(root, "no_doc", tool_files={"naked.py": "def naked(x: int) -> int:\n    return x\n"})
+    _make_module(
+        root, "no_doc", tool_files={"naked.py": "def naked(x: int) -> int:\n    return x\n"}
+    )
     _make_module(
         root,
         "any_ann",
@@ -226,10 +235,7 @@ def test_five_violation_kinds_produce_exact_lines(tmp_path: Path) -> None:
         "are forbidden (arch §8.5)" in message
     )
     # 5: declared but unregistered event type (arch §8.4)
-    assert (
-        "declared event type 'NeverRegistered' is not registered in the EventRegistry"
-        in message
-    )
+    assert "declared event type 'NeverRegistered' is not registered in the EventRegistry" in message
     for name in ("no_doc", "any_ann", "prefix", "netimport", "ghostevent"):
         assert f"{root / name}:" in message  # every problem names its module directory
 
@@ -237,7 +243,9 @@ def test_five_violation_kinds_produce_exact_lines(tmp_path: Path) -> None:
 def test_one_bad_module_does_not_stop_collection(tmp_path: Path) -> None:
     """AC (T1.5.3): problems of ALL modules are collected into one report."""
     root = tmp_path / "agents"
-    _make_module(root, "bad_a", tool_files={"naked.py": "def naked(x: int) -> int:\n    return x\n"})
+    _make_module(
+        root, "bad_a", tool_files={"naked.py": "def naked(x: int) -> int:\n    return x\n"}
+    )
     _make_module(
         root,
         "bad_b",
@@ -261,7 +269,9 @@ def test_one_bad_module_does_not_stop_collection(tmp_path: Path) -> None:
     message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
     assert f"{root / 'bad_a'}: tool 'naked' has no docstring" in message
     assert f"{root / 'bad_b'}: tool 'loose': parameter 'x' uses Any" in message
-    assert f"{root / 'bad_c'}: tool name 'event_sneaky' uses the reserved platform prefix" in message
+    assert (
+        f"{root / 'bad_c'}: tool name 'event_sneaky' uses the reserved platform prefix" in message
+    )
     assert "module loading failed, 3 problem(s)" in message
 
 
@@ -314,7 +324,9 @@ def test_guardrails_crosschecked_against_tool_registry(tmp_path: Path) -> None:
     )
     assert "rule 'crossed-unknown': applies_to names unknown tool 'no_such_tool'" in message
     assert "ToolRegistry cross-check, T1.4.2" in message
-    assert "tool_classes declares 'memory_probe' which is not a tool of this module (AD-7)" in message
+    assert (
+        "tool_classes declares 'memory_probe' which is not a tool of this module (AD-7)" in message
+    )
 
 
 def test_invalid_guardrails_yaml_is_collected(tmp_path: Path) -> None:
@@ -338,10 +350,7 @@ def test_tool_classes_override_gates_by_profile(tmp_path: Path) -> None:
                 '    """Heavy tool marked destructive by the module config."""\n    return x\n'
             )
         },
-        guardrails=(
-            "tool_classes:\n  heavy_probe: destructive\n"
-            "rules: []\n"
-        ),
+        guardrails=("tool_classes:\n  heavy_probe: destructive\nrules: []\n"),
     )
     factory, _calls = _recording_factory()
     registry = ModuleLoader(
@@ -479,7 +488,9 @@ def test_response_format_imported_from_result_py(tmp_path: Path) -> None:
         result_py=result_py,
     )
     factory, _calls = _recording_factory()
-    registry = ModuleLoader(user_dirs=[root], platform_toolset_factory=factory, include_builtins=False).load()
+    registry = ModuleLoader(
+        user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
+    ).load()
     fmt = registry.get("shaped").subagent["response_format"]
     assert getattr(fmt, "__name__", None) == "ProbeResult"
     assert getattr(fmt, "model_fields", {}).keys() == {"score", "label"}  # type: ignore[union-attr]
@@ -520,7 +531,9 @@ def test_event_models_register_and_factory_receives_declarations(tmp_path: Path)
         ),
     )
     factory, calls = _recording_factory()
-    registry = ModuleLoader(user_dirs=[root], platform_toolset_factory=factory, include_builtins=False).load()
+    registry = ModuleLoader(
+        user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
+    ).load()
     assert "emitter" in registry
     assert calls == [frozenset({"LoaderProbeEvent"})]  # arch §8.4 → allowed_types wiring
     assert "LoaderProbeEvent" in EVENT_TYPES
@@ -603,7 +616,9 @@ def test_annotation_gaps_and_nested_any(tmp_path: Path) -> None:
         },
     )
     message = _load_error_message(ModuleLoader(user_dirs=[root], include_builtins=False))
-    assert "tool 'half': parameter 'x' is not annotated (full typing required, spec §4.3)" in message
+    assert (
+        "tool 'half': parameter 'x' is not annotated (full typing required, spec §4.3)" in message
+    )
     assert "tool 'half': return type is not annotated (spec §4.3)" in message
     assert "tool 'no_return': return type is not annotated" in message
     assert "tool 'dictany': parameter 'x' uses dict[str, Any]" in message
@@ -615,7 +630,9 @@ def test_skills_dir_is_attached_when_present(tmp_path: Path) -> None:
     root = tmp_path / "agents"
     module_dir = _make_module(root, "skilled", skills=True)
     factory, _calls = _recording_factory()
-    registry = ModuleLoader(user_dirs=[root], platform_toolset_factory=factory, include_builtins=False).load()
+    registry = ModuleLoader(
+        user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
+    ).load()
     assert registry.get("skilled").subagent["skills"] == [str(module_dir / "skills")]
 
 
@@ -623,7 +640,9 @@ def test_bare_module_without_tools_loads_with_platform_toolset(tmp_path: Path) -
     """``tools/`` is optional (arch §8.1); the platform toolset is still included."""
     root = tmp_path / "agents"
     _make_module(root, "bare")
-    loader = ModuleLoader(user_dirs=[root], include_builtins=False)  # default factory: empty platform toolset
+    loader = ModuleLoader(
+        user_dirs=[root], include_builtins=False
+    )  # default factory: empty platform toolset
     registry = loader.load()
     module = registry.get("bare")
     assert module.subagent["tools"] == []
@@ -632,7 +651,9 @@ def test_bare_module_without_tools_loads_with_platform_toolset(tmp_path: Path) -
 
 def test_missing_agents_root_and_empty_loader(tmp_path: Path) -> None:
     """A missing user root is a load problem; an empty loader loads nothing."""
-    message = _load_error_message(ModuleLoader(user_dirs=[tmp_path / "nope"], include_builtins=False))
+    message = _load_error_message(
+        ModuleLoader(user_dirs=[tmp_path / "nope"], include_builtins=False)
+    )
     assert f"agents root directory does not exist: {tmp_path / 'nope'}" in message
     registry = ModuleLoader(include_builtins=False).load()
     assert len(registry) == 0
@@ -640,9 +661,7 @@ def test_missing_agents_root_and_empty_loader(tmp_path: Path) -> None:
     assert registry.subagent_dicts() == []
 
 
-def test_builtin_scan_edge_cases(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_builtin_scan_edge_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Built-in scanning tolerates a missing package and a non-directory root."""
     from contextlib import ExitStack
     from types import SimpleNamespace
@@ -919,15 +938,11 @@ def test_two_consecutive_loads_with_colliding_event_types(tmp_path: Path) -> Non
         event_models_py=_PROBE_EVENT_PY,
     )
     factory, _calls = _recording_factory()
-    ModuleLoader(
-        user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
-    ).load()
+    ModuleLoader(user_dirs=[root], platform_toolset_factory=factory, include_builtins=False).load()
     first_cls = EVENT_TYPES["ProbeStarted"]
     assert first_cls.model_fields.keys() == {"detail"}  # type: ignore[union-attr]
     # The module ships a new schema of the same event type between sessions.
-    (root / "prober" / "tools" / "event_models.py").write_text(
-        _PROBE_EVENT_PY_V2, encoding="utf-8"
-    )
+    (root / "prober" / "tools" / "event_models.py").write_text(_PROBE_EVENT_PY_V2, encoding="utf-8")
     second = ModuleLoader(
         user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
     ).load()

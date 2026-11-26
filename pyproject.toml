@@ -36,6 +36,8 @@ dev = [
     "mypy>=1.11",   # the declared fallback checker (`make typecheck TYPECHECKER=mypy`)
     "aiohttp>=3.9", # echo-app test fixture only (dev-group, arch §15.2)
 ]
+# Optional demo provider: `init_chat_model("deepseek:...")` (not installed by default).
+demo = ["langchain-deepseek>=1.0"]
 
 [build-system]
 requires = ["hatchling>=1.26"]

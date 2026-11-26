@@ -1,0 +1,65 @@
+# ShopVault demo session — authorized LOCAL testing only.
+#
+# Session configuration consumed by headless_run.py via
+# swarmy.core.config.SessionConfig.load (arch §12). The target is the
+# loopback ShopVault demo stack from demos/shop_vault/target/ — never
+# point this config at a host you do not own or are not authorized to
+# test (D15: swarmy has no authorization gate; the legal disclaimer in
+# demos/shop_vault/README.md applies).
+
+target:
+  base_url: http://127.0.0.1:3001/  # ShopVault backend API on loopback
+  notes: >
+    Authorized local pentest demo against the ShopVault demo stack
+    started from demos/shop_vault/target (loopback only).
+
+scope:
+  domains:
+    - localhost
+  ip_subnets:
+    - 127.0.0.1/32
+  ports:
+    - 3000 # ShopVault SPA (docker compose frontend service)
+    - 3001 # ShopVault backend API (single-binary embedded SPA port)
+  schemes:
+    - http
+
+# yolo + mission: the headless driver expects no gates but the most
+# destructive risk class (arch §7.2 strictness matrix). Gates are not
+# expected in this demo; the driver auto-approves any surprise and every
+# decision is journaled as OperatorDecision.
+profile: yolo
+mode: mission
+
+# D1: "provider:model" id resolved through langchain init_chat_model.
+# The deepseek provider ships in the optional demo dependency group
+# (pyproject [dependency-groups].demo) and needs DEEPSEEK_API_KEY in the
+# environment. The LLM judge band stays switched off: the judge section
+# is omitted, so judge.model keeps its null default (arch §12.1).
+model: deepseek:deepseek-flash
+
+# Event policies (arch §9.3) — the F5-demo set that keeps the mission
+# orchestrator steering on discoveries, findings and guardrail events.
+# The notify_tui trio of the built-in defaults (AttackTreeUpdated /
+# TaskRequested / TaskCompleted) is dropped: the headless demo has no TUI.
+policies:
+  - on: EndpointsDiscovered
+    action: notify_orchestrator
+    template: generic
+  - on: FindingCandidate
+    action: notify_orchestrator
+    template: verify_finding
+  - on: FindingVerified
+    action: notify_orchestrator
+    template: tree_proposal
+  - on: GuardrailBlocked
+    action: notify_orchestrator
+    template: generic
+  - on: ScopeChanged
+    action: notify_orchestrator
+    template: generic
+
+# The limits and judge sections are intentionally omitted: the
+# conservative code defaults apply (arch §12.2, last resolution layer —
+# 5 rps/host, 8 concurrent requests, 5 MiB bodies, redirect depth 5,
+# 5000-request session budget, 10s/30s timeouts; judge off).

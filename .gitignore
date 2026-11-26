@@ -24,3 +24,8 @@ swarmy-session/
 demo-session/
 .DS_Store
 tmp
+
+# Demo run artifacts (demos/<name>): session data and the run log are not
+# committed; the archived reports under reports/ are kept.
+demos/*/session/
+demos/*/run.log

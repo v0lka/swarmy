@@ -1,0 +1,3 @@
+[submodule "demos/shop_vault/target"]
+	path = demos/shop_vault/target
+	url = https://github.com/v0lka/ShopVault.git

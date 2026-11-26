@@ -7,7 +7,7 @@ Roadmap T3.1.2:
 * ``swarmy.core`` does not import ``swarmy.tui`` (architecture invariant 8).
 Roadmap T3.1.3:
 * the graph compiles and the checkpointer tables appear in ``memory.sqlite``;
-* the orchestrator carries the same middleware pair as the subagents.
+* the orchestrator carries the same middleware stack as the subagents.
 """
 
 from __future__ import annotations
@@ -94,7 +94,9 @@ async def test_double_open_is_error_resume_is_separate(
         await Session.resume(session_dir=tmp_path / "empty")
 
 
-async def test_close_folds_wal_copy_opens_elsewhere(tmp_path: Path, model: ScriptedChatModel) -> None:
+async def test_close_folds_wal_copy_opens_elsewhere(
+    tmp_path: Path, model: ScriptedChatModel
+) -> None:
     original = tmp_path / "original"
     session = await Session.open(config=_config(tmp_path), session_dir=original, model=model)
     await session.close()
@@ -128,12 +130,13 @@ async def test_graph_compiles_and_checkpointer_tables_appear(
         await session.runtime.run_step("hello")
         with sqlite3.connect(session_dir / "memory.sqlite") as conn:
             tables = {
-                row[0]
-                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
         assert "checkpoints" in tables  # the L0 saver owns these (arch §7.1)
         assert tables & {"checkpoint_writes", "checkpoint_blobs"} in (
-            {"checkpoint_writes"}, {"checkpoint_blobs"}, set(),
+            {"checkpoint_writes"},
+            {"checkpoint_blobs"},
+            set(),
         )  # write-side tables appear lazily with the first pending write
         # the domain tables are NOT the checkpointer's (one file, two owners)
         assert "events" in tables
@@ -142,7 +145,7 @@ async def test_graph_compiles_and_checkpointer_tables_appear(
         await session.close()
 
 
-async def test_orchestrator_has_the_subagent_middleware_pair(
+async def test_orchestrator_has_the_subagent_middleware_stack(
     tmp_path: Path, module_dir: Path, model: ScriptedChatModel
 ) -> None:
     session = await Session.open(
@@ -152,11 +155,15 @@ async def test_orchestrator_has_the_subagent_middleware_pair(
         subagent_middleware = session.modules.modules()[0].subagent["middleware"]
         subagent_types = [type(middleware) for middleware in subagent_middleware]
         engine_types = [type(middleware) for middleware in session.engine.middleware]
-        # same pair (guardrails + projector) plus the correlation contour:
-        assert engine_types[:2] == subagent_types
+        # the subagents carry the same stack minus the orchestrator-only
+        # correlation contour; the tool-error feedback wrapper is innermost
+        # in both lists:
+        assert engine_types[:2] == subagent_types[:2]
         from swarmy.core.runtime import CorrelationMiddleware
 
         assert isinstance(session.engine.middleware[2], CorrelationMiddleware)
+        assert engine_types[-1] is subagent_types[-1]
+        assert engine_types[-1].__name__ == "ToolErrorFeedbackMiddleware"
     finally:
         await session.close()
 
@@ -220,9 +227,7 @@ async def test_set_mode_rebuilds_the_orchestrator_toolset(
         # the runtime runs on the recompiled graph (the checkpointer carried over)
         assert await session.runtime.run_step() is not None or True  # step executes
         decisions = await session.reader.by_type("OperatorDecision")
-        assert any(
-            entry.payload.request_id == "mode-switch:mission" for entry in decisions
-        )
+        assert any(entry.payload.request_id == "mode-switch:mission" for entry in decisions)
     finally:
         await session.close()
 
@@ -250,9 +255,7 @@ def test_subagent_gates_carry_the_swarmy_decision_set() -> None:
     assert isinstance(crawler_gates, dict)
     assert crawler_gates["http_get"] == {
         "allowed_decisions": ["approve", "edit", "reject"],
-        "description": (
-            "Tool 'http_get' requires operator approval (module-declared gate)."
-        ),
+        "description": ("Tool 'http_get' requires operator approval (module-declared gate)."),
     }
     assert crawler_gates["memory_get"] is False  # explicit False passes through
     custom_gates = normalized[1]["interrupt_on"]
@@ -261,4 +264,7 @@ def test_subagent_gates_carry_the_swarmy_decision_set() -> None:
     assert isinstance(entry, dict)
     assert entry["allowed_decisions"] == ["approve"]  # respond stripped
     assert "interrupt_on" not in normalized[2]  # gate-less dicts pass through
-    assert subagents[0]["interrupt_on"] == {"http_get": True, "memory_get": False}  # inputs untouched
+    assert subagents[0]["interrupt_on"] == {
+        "http_get": True,
+        "memory_get": False,
+    }  # inputs untouched

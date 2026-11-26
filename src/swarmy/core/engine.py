@@ -38,6 +38,7 @@ from swarmy.core.hitl import (
 )
 from swarmy.guardrails.pipeline import GuardrailMiddleware, GuardrailPipeline
 from swarmy.modules.loader import PLATFORM_TOOL_BUDGET_CLASSES
+from swarmy.tools.errors import ToolErrorFeedbackMiddleware
 from swarmy.tools.projector import ProjectorMiddleware
 
 if TYPE_CHECKING:
@@ -151,6 +152,10 @@ class Engine:
             GuardrailMiddleware(pipeline, projector=projector),
             ProjectorMiddleware(projector, tool_classes=PLATFORM_TOOL_BUDGET_CLASSES),
             correlation_middleware,
+            # Innermost: recoverable tool-body failures reach the model as
+            # error feedback instead of aborting the run (see
+            # swarmy.tools.errors).
+            ToolErrorFeedbackMiddleware(),
         ]
         graph = cls._compile(
             model=model,
@@ -199,6 +204,10 @@ class Engine:
             GuardrailMiddleware(pipeline, projector=projector),
             ProjectorMiddleware(projector, tool_classes=PLATFORM_TOOL_BUDGET_CLASSES),
             correlation_middleware,
+            # Innermost: recoverable tool-body failures reach the model as
+            # error feedback instead of aborting the run (see
+            # swarmy.tools.errors).
+            ToolErrorFeedbackMiddleware(),
         ]
         self.graph = self._compile(
             model=model,
@@ -263,8 +272,7 @@ class Engine:
                     rewritten[str(tool_name)] = {
                         "allowed_decisions": list(ALLOWED_DECISIONS),
                         "description": (
-                            f"Tool {tool_name!r} requires operator approval "
-                            "(module-declared gate)."
+                            f"Tool {tool_name!r} requires operator approval (module-declared gate)."
                         ),
                     }
                 elif isinstance(entry, Mapping):
@@ -301,9 +309,7 @@ class Engine:
             model=model,
             system_prompt=system_prompt,
             tools=list(orchestrator_tools),
-            subagents=Engine._normalize_subagent_gates(
-                list(subagents)
-            ),  # ty: ignore[invalid-argument-type]
+            subagents=Engine._normalize_subagent_gates(list(subagents)),  # ty: ignore[invalid-argument-type]
             middleware=middleware,  # ty: ignore[invalid-argument-type]
             interrupt_on=interrupt_config,
             checkpointer=AsyncSqliteSaver(checkpointer_connection),

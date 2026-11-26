@@ -86,6 +86,7 @@ from swarmy.modules.manifest import (
     read_utf8,
 )
 from swarmy.modules.registry import LoadedModule, ModuleLoadError, ModuleRegistry
+from swarmy.tools.errors import ToolErrorFeedbackMiddleware
 from swarmy.tools.projector import ContextProjector, ProjectorMiddleware
 from swarmy.tools.registry import (
     BUILTIN_SOURCE,
@@ -158,14 +159,10 @@ _OS_SPAWN_ATTRS: Final[frozenset[str]] = frozenset({"system", "popen"})
 #: asyncio's raw stream APIs — direct TCP sockets bypassing the platform
 #: client (F-2). Both the ``asyncio.open_connection(...)`` attribute-call
 #: shape and ``from asyncio import open_connection`` are forbidden.
-_ASYNCIO_STREAM_ATTRS: Final[frozenset[str]] = frozenset(
-    {"open_connection", "start_server"}
-)
+_ASYNCIO_STREAM_ATTRS: Final[frozenset[str]] = frozenset({"open_connection", "start_server"})
 
 #: Files inside ``tools/`` that are not tool modules.
-_SKIP_TOOL_FILES: Final[frozenset[str]] = frozenset(
-    {"__init__.py", "event_models.py", "result.py"}
-)
+_SKIP_TOOL_FILES: Final[frozenset[str]] = frozenset({"__init__.py", "event_models.py", "result.py"})
 
 _MODULE_COUNTER = itertools.count()
 
@@ -204,9 +201,7 @@ ProjectorFactory: TypeAlias = Callable[[str], "ContextProjector"]
 
 #: Factory building the module pipeline's judge band (arch §6.7, P3.4/RD-2):
 #: ``risk_classes → band`` over the session's shared judge.
-JudgeBandFactory: TypeAlias = Callable[
-    [Mapping[str, RiskClass]], "JudgeBand"
-]
+JudgeBandFactory: TypeAlias = Callable[[Mapping[str, RiskClass]], "JudgeBand"]
 
 #: HITL strictness profile (arch §7.2).
 StrictnessProfile: TypeAlias = Literal["paranoid", "normal", "yolo"]
@@ -280,7 +275,9 @@ def _user_module_dirs(user_dirs: Sequence[Path]) -> tuple[list[Path], list[LoadP
             continue
         dirs.extend(
             sorted(
-                path for path in root_dir.iterdir() if path.is_dir() and (path / "AGENT.md").is_file()
+                path
+                for path in root_dir.iterdir()
+                if path.is_dir() and (path / "AGENT.md").is_file()
             )
         )
     return dirs, problems
@@ -525,12 +522,13 @@ def _forbidden_call_problems(tree: ast.Module, path: Path, source: str) -> list[
 
 def _static_scan_problems(tree: ast.Module, path: Path, source: str) -> list[LoadProblem]:
     """The full static scan of one Python file: imports + call shapes."""
-    return [*_forbidden_import_problems(tree, path, source), *_forbidden_call_problems(tree, path, source)]
+    return [
+        *_forbidden_import_problems(tree, path, source),
+        *_forbidden_call_problems(tree, path, source),
+    ]
 
 
-def _register_event_models(
-    module: ModuleType, unique_name: str, source: str
-) -> list[LoadProblem]:
+def _register_event_models(module: ModuleType, unique_name: str, source: str) -> list[LoadProblem]:
     """Register the public payload models of ``tools/event_models.py`` (arch §8.4).
 
     Every public ``BaseModel`` subclass *defined in the file* registers under
@@ -650,9 +648,7 @@ class ModuleLoader:
         problems: list[LoadProblem] = []
         loaded: list[LoadedModule] = []
         with ExitStack() as stack:
-            builtin_dirs = (
-                _builtin_module_dirs(stack) if self._include_builtins else []
-            )
+            builtin_dirs = _builtin_module_dirs(stack) if self._include_builtins else []
             user_dirs, scan_problems = _user_module_dirs(self._user_dirs)
             problems.extend(scan_problems)
             state = _LoadState(
@@ -662,9 +658,9 @@ class ModuleLoader:
             )
             # name → (source, dir): collision detection incl. AD-4 (built-ins first)
             known_names: dict[str, tuple[str, str]] = {}
-            plan: list[tuple[Path, str]] = [
-                (path, BUILTIN_SOURCE) for path in builtin_dirs
-            ] + [(path, f"module:{path}") for path in user_dirs]
+            plan: list[tuple[Path, str]] = [(path, BUILTIN_SOURCE) for path in builtin_dirs] + [
+                (path, f"module:{path}") for path in user_dirs
+            ]
             for module_dir, source in plan:
                 module_problems, module_loaded = self._load_module(
                     module_dir, source, state, known_names
@@ -698,9 +694,7 @@ class ModuleLoader:
             try:
                 state.tool_registry.register_many(specs)
             except ToolRegistryError as exc:
-                flush_problems.extend(
-                    LoadProblem(source, problem) for problem in exc.problems
-                )
+                flush_problems.extend(LoadProblem(source, problem) for problem in exc.problems)
         if flush_problems:
             raise ModuleLoadError([str(problem) for problem in flush_problems])
 
@@ -743,9 +737,7 @@ class ModuleLoader:
             )
         known_names[name] = (source, str(module_dir))
 
-        platform_tools = dict(
-            self._platform_factory(name, frozenset(manifest.events))
-        )
+        platform_tools = dict(self._platform_factory(name, frozenset(manifest.events)))
         self._register_platform_tools(platform_tools, state)
 
         tools_dir = module_dir / "tools"
@@ -766,8 +758,14 @@ class ModuleLoader:
         if problems:
             return problems, None
         subagent = self._build_subagent(
-            module_dir, manifest, parsed, platform_tools, module_tools, guardrails,
-            response_format, risks,
+            module_dir,
+            manifest,
+            parsed,
+            platform_tools,
+            module_tools,
+            guardrails,
+            response_format,
+            risks,
         )
         module = LoadedModule(
             manifest=manifest,
@@ -870,18 +868,14 @@ class ModuleLoader:
         if not path.is_file():
             return None
         try:
-            return parse_module_guardrails(
-                read_utf8(path), source=str(path)
-            )
+            return parse_module_guardrails(read_utf8(path), source=str(path))
         except Utf8Error as exc:
             # Mirror conversion of #57: a non-UTF-8 guardrails file joins the
             # module's problem list instead of aborting the aggregation.
             problems.append(LoadProblem(source, str(exc)))
             return None
         except GuardrailsDslError as exc:
-            problems.extend(
-                LoadProblem(source, problem.message) for problem in exc.problems
-            )
+            problems.extend(LoadProblem(source, problem.message) for problem in exc.problems)
             return None
 
     def _scan_skill_scripts(
@@ -1057,9 +1051,7 @@ class ModuleLoader:
         for tool_name, fn in toolset.items():
             entry_risk: RiskClass | None = state.risk_overrides.get(tool_name)
             declared = declared_risk_class(fn)[0]
-            default = (
-                RiskClass.PASSIVE if tool_name in platform_tools else RiskClass.DESTRUCTIVE
-            )
+            default = RiskClass.PASSIVE if tool_name in platform_tools else RiskClass.DESTRUCTIVE
             risks[tool_name] = (
                 entry_risk
                 if entry_risk is not None
@@ -1163,6 +1155,10 @@ class ModuleLoader:
             "middleware": [
                 GuardrailMiddleware(pipeline, projector=projector),
                 ProjectorMiddleware(projector, tool_classes=PLATFORM_TOOL_BUDGET_CLASSES),
+                # Innermost: recoverable tool-body failures reach the model
+                # as error feedback instead of aborting the run (see
+                # swarmy.tools.errors).
+                ToolErrorFeedbackMiddleware(),
             ],
             "interrupt_on": interrupt_on,
             "skills": [str(skills_dir)] if skills_dir.is_dir() else [],

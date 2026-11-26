@@ -125,6 +125,20 @@ The built-in `crawler` and `xss-detector` modules are the reference implementati
 - Operator secrets live **only** in `secrets.yaml` (mode 600) and are referenced as `<masked:secret-name>`; they are masked in LLM context, TUI, and journal, and never committed. Secrets discovered on the target are findings: stored raw in evidence, truncated/masked in model context.
 - There is no authorization gate by design (D15) — the README and the first session chat message must carry the legal disclaimer; responsibility for authorized testing lies with the operator.
 
+## Security Policy
+
+This project maintains a security policy in [SECURITY.md](./SECURITY.md).
+All AI coding agents MUST read and follow SECURITY.md before making changes.
+It contains:
+
+- Threat model and trust boundaries (the target under test is an adversarial content source; module installation is a code-execution trust decision)
+- Secure coding guidelines specific to this project's stack (Python/Pydantic v2/deepagents) and its raw-vs-sanitized data boundary (D21)
+- Hard constraints and forbidden patterns for AI agents (the security reading of arch §16/§17 invariants)
+- Vulnerability reporting procedures (GitHub private vulnerability reporting — never public issues)
+- Agentic security controls following the OWASP Top 10 for Agentic Applications (ASI01–ASI10)
+
+Any code contribution that violates the rules in SECURITY.md will be rejected.
+
 ## Testing
 
 - pytest + pytest-asyncio (`asyncio_mode = "auto"`; markers `unit` / `integration`). `tests/unit/` mirrors packages; `tests/integration/` runs end-to-end scenarios against the local echo app fixture (`tests/fixtures/echo_app`, aiohttp, dev-group only).

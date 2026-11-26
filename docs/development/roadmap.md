@@ -81,7 +81,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 | # | Решение | Обоснование |
 |---|---|---|
 | RD-1 | Майлстоуны группируют фазы spec §12.3: M1 = F0+F1; M2 = F2; M3 = F3; M4 = F4; M5 = F5+F6+релиз. Крупные фазы spec разбиты на под-фазы (F0 → P1.1; F1 → P1.2–P1.5; F2 → P2.1–P2.4; F3 → P3.1–P3.5; F4 → P4.1–P4.4; F5 → P5.1–P5.3; F6 → P5.4) | Трёхуровневая структура «майлстоун → фаза → задача» при сохранении F0–F6 как скелета и их критериев как DoD |
-| RD-2 | LLM-судья (arch §6.7) отнесён к P3.4 (майлстоун F3), а не к F1/F2 | arch §18.3 не назначает §6.7 фазе явно; эскалации судьи требуют ApprovalQueue и «временных врат» `JudgeEscalationRegistry` — зависимость от HITL |
+| RD-2 | LLM-судья (arch §6.7) отнесён к P3.4 (майлстоун F3); в F1/F2 он не входит | arch §18.3 не назначает §6.7 фазе явно; эскалации судьи требуют ApprovalQueue и «временных врат» `JudgeEscalationRegistry` — зависимость от HITL |
 | RD-3 | ToolRegistry (arch §6.1) отнесён к P1.5 (фаза лоадера) | arch §18.3 не назначает §6.1; коллизии имён и risk-классы нужны лоадеру для fail-fast сборки SubAgent-словарей (§8.3) |
 | RD-4 | В M1 дайджесты аргументов в `GuardrailBlocked` — тривиальное усечение; с P2.3 (T2.3.2) заменяются на ContextProjector | §5.5 arch требует projector для всех дайджестов, но ContextProjector реализуется в F2; в F1 шина/журнал уже нужны |
 | RD-5 | «Верификатор» демо-сценария — без нового встроенного модуля: повторная делегация `xss-detector` с безопасными пейлоадами + платформенный `update_finding_status` | §4.6 spec фиксирует ровно два встроенных модуля v0.1; arch §13.4 упоминает `task(верификатор)` без определения отдельного модуля |
@@ -267,7 +267,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 #### T1.3.3 — Шина (`events/bus.py`)
 - **What:** `EventBus` — in-memory asyncio pub/sub с журнально-первым порядком доставки.
 - **Where:** `src/swarmy/events/bus.py`.
-- **How:** очередь на подписчика; journal-first: append в `events` до fan-out → доставка по возрастанию `id` (arch §5.3); `subscribe(types: set[str] | None)`; изоляция ошибок обработчика (логирование, доставка остальным продолжается); режим coalescing для UI-подписчика (слияние обновлений: теряется лишняя перерисовка, не события).
+- **How:** очередь на подписчика; journal-first: append в `events` до fan-out → доставка по возрастанию `id` (arch §5.3); `subscribe(types: set[str] | None)`; изоляция ошибок обработчика (логирование, доставка остальным продолжается); режим coalescing для UI-подписчика (слияние обновлений: лишние перерисовки схлопываются, события доставляются полностью).
 - **Acceptance criteria:**
   - [x] при конкурентной публикации подписчик получает события по возрастанию id (тест)
   - [x] исключение обработчика одного подписчика не мешает другим (тест)
@@ -311,7 +311,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 #### T1.4.2 — DSL `guardrails.yaml` (`guardrails/dsl.py`)
 - **What:** парсинг и валидация файла модульных правил.
 - **Where:** `src/swarmy/guardrails/dsl.py`.
-- **How:** YAML → `ModuleGuardrails` (Pydantic); fail-fast — список ВСЕХ проблем файла, а не первой (arch §4.5); компиляция всех regex при валидации; проверка уникальности id; сверка `applies_to` против ToolRegistry — доступна с P1.5, до того структурная проверка имён.
+- **How:** YAML → `ModuleGuardrails` (Pydantic); fail-fast — список ВСЕХ проблем файла сразу (arch §4.5); компиляция всех regex при валидации; проверка уникальности id; сверка `applies_to` против ToolRegistry — доступна с P1.5, до того структурная проверка имён.
 - **Acceptance criteria:**
   - [x] пример spec §8.3 (`no-true-based-sqli`) парсится без ошибок
   - [x] файл с тремя разными ошибками даёт три записи в отчёте (тест)
@@ -501,7 +501,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 #### T2.2.4 — EvidenceRecorder (`tools/http/evidence.py`)
 - **What:** файлы улик сессии + записи `Evidence`.
 - **Where:** `src/swarmy/tools/http/evidence.py`.
-- **How:** `evidence/<uuid>/request.txt` + `response.txt` — сырые, целиком (тело до порога `max_body_bytes`, дальше — маркер обрезки); запись `Evidence` (`kind=http_request_response`, `session_paths`, metadata: ts, инструмент, correlation_id); глубина `request` | `request_response` — по `evidence_depth` (D20: другие kind — зарезервированы, не порождаются).
+- **How:** `evidence/<uuid>/request.txt` + `response.txt` — сырые, целиком (тело до порога `max_body_bytes`, дальше — маркер обрезки); запись `Evidence` (`kind=http_request_response`, `session_paths`, metadata: ts, инструмент, correlation_id); глубина `request` | `request_response` — по `evidence_depth` (D20: прочие kind зарезервированы; v0.1 порождает только перечисленные).
 - **Acceptance criteria:**
   - [x] файлы улик байт-в-байт соответствуют трафику до порога (тест)
   - [x] запись Evidence связана с `ResponseRecord.evidence_id` (тест)
@@ -1212,7 +1212,7 @@ P1.1 ─▶ P1.2 ─▶ P1.3 ─▶ P1.4 ─▶ P1.5 ──┐
 - **движок корреляции деревьев атак**;
 - **не-HTTP улики** — `screenshot`/`har`/`grpc_file`: значения уже зарезервированы в `EvidenceKind` без миграции схем (D20).
 
-Зарезервированные в v0.1 точки расширения, которые делают Post-MVP аддитивным: enum `EvidenceKind` (D20), интерфейс `SearchIndex` (arch §4.5), `action: review/allow` в DSL гардрейлов (v0.1 — только `block`, arch §6.6), `metadata.include_tools` скиллов (arch §8.6), MCP-серверы через конфиг сессии (arch §12.1).
+Зарезервированные в v0.1 точки расширения сохраняют аддитивность Post-MVP: enum `EvidenceKind` (D20), интерфейс `SearchIndex` (arch §4.5), `action: review/allow` в DSL гардрейлов (v0.1 — только `block`, arch §6.6), `metadata.include_tools` скиллов (arch §8.6), MCP-серверы через конфиг сессии (arch §12.1).
 
 ---
 

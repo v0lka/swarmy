@@ -1,5 +1,8 @@
 # swarmy CI — platform matrix + quality gates (arch §15.4, roadmap T1.1.4/T1.1.5/T1.5.6/T2.4.3).
 #
+# Runs on EVERY push to ANY branch (plus pull_request and workflow_dispatch), so a
+# red gate shows up on a feature branch before anything reaches main.
+#
 # The pipeline mirrors `make check` (CI parity): lock-check → sync → ruff → ty →
 # unit (coverage gate ≥85%) → integration (coverage gate ≥70%, echo app) → smoke.
 # A dedicated job smoke-tests the Python 3.15 runtime target (spec §11).
@@ -8,14 +11,19 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"] # every branch, not only main
   pull_request:
   workflow_dispatch:
+
+# Least privilege: the workflow only needs to read the repository contents.
+permissions:
+  contents: read
 
 jobs:
   quality:
     name: ${{ matrix.os }} / ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +47,10 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          # One interpreter for the whole matrix — the same as the developer
+          # environment; uv downloads a managed CPython when the runner image
+          # has none. The 3.15 runtime target is covered by smoke-py315 below.
+          python-version: "3.13"
 
       - name: Lock file is up to date (D18)
         run: uv lock --check
@@ -60,15 +72,19 @@ jobs:
       - name: Integration suite with coverage gate (D22)
         run: uv run pytest tests/integration --cov=swarmy --cov-report=term-missing --cov-fail-under=${{ env.INTEGRATION_COVERAGE }}
 
-      - name: Smoke — CLI responds (F0)
-        run: |
-          uv run python -m swarmy --version
-          uv run python -m swarmy --help
+      # Two steps on purpose: a multi-line `run` under the Windows default
+      # (PowerShell) would mask a failing first line behind a passing second one.
+      - name: Smoke — CLI reports its version (F0)
+        run: uv run python -m swarmy --version
+
+      - name: Smoke — CLI prints help (F0)
+        run: uv run python -m swarmy --help
 
   smoke-py315:
     # Runtime target (spec §11): deepagents classifiers stop at 3.14; this job
     # proves actual compatibility (roadmap T1.1.4).
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

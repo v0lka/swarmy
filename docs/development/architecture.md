@@ -1412,7 +1412,8 @@ Gate считаются **по каждому набору отдельно** (`
 
 ### 15.4. CI
 
-GitHub Actions, матрица: `windows/amd64`, `macos/arm64`, `linux/amd64`, `linux/arm64`;
+GitHub Actions — запуск при каждом push в любую ветку, а также по `pull_request` и
+`workflow_dispatch`; матрица: `windows/amd64`, `macos/arm64`, `linux/amd64`, `linux/arm64`;
 шаги: `uv sync` → ruff → ty → unit (gate 85) → integration (gate 70, эхо-приложение) →
 smoke `swarmy --version` (+ Py3.15-джоб как runtime-цель). Никаких POSIX-only API в ядре
 (§11 spec) — пути через `pathlib`, процессы не форкаются.

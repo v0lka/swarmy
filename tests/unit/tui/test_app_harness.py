@@ -8,6 +8,7 @@ coalesced batches exactly like in production.
 
 from __future__ import annotations
 
+import asyncio
 import io
 from typing import TYPE_CHECKING, Any
 
@@ -157,6 +158,91 @@ async def test_workers_do_not_block_ui(tmp_path: Path) -> None:
         await pilot.pause()
         assert isinstance(app.focused, Input)
     await session.close()
+
+
+# ---------------------------------------------------------------------------
+# T4.2.2 — the delegation table reconciles against the journal
+# ---------------------------------------------------------------------------
+
+
+async def test_delegation_table_matches_the_journal(tmp_path: Path) -> None:
+    """AC T4.2.2: the delegation tree mirrors TaskRequested/TaskCompleted.
+
+    The Swarm Activity delegation table is compared row-by-row with the
+    journal (the source of truth): one row per TaskRequested correlation_id,
+    the subagent name from the request, and the status/digest taken from the
+    matching TaskCompleted payload.
+    """
+    session = await make_session(
+        tmp_path,
+        {
+            "orchestrator": [
+                _ai(
+                    _tool_call(
+                        "task",
+                        {"description": "probe once", "subagent_type": "probe_mod"},
+                        "call-o1",
+                    )
+                ),
+                final_reply("delegation finished"),
+            ],
+            "probe_mod": [
+                _ai(_tool_call("probe_mod_probe", {"message": "ping"}, "m1")),
+                final_reply("probe done"),
+            ],
+        },
+        risk="passive",
+    )
+    app = SwarmyTui(session)
+    try:
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause(0.2)
+            await pilot.press("1")  # focus the chat input
+            app.query_one("#chat-input", Input).value = "run the probe"
+            await pilot.press("enter")
+            # wait until the delegation completes per the journal (truth)
+            reader = session.reader
+            assert reader is not None
+            completed: list = []
+            for _ in range(100):
+                completed = await reader.by_type("TaskCompleted")
+                if completed:
+                    break
+                await asyncio.sleep(0.1)
+            requested = await reader.by_type("TaskRequested")
+            assert len(requested) == 1, "the delegation never reached the journal"
+            assert len(completed) == 1, "the delegation never completed"
+            request_payload = requested[0].payload
+            completion_payload = completed[0].payload
+            assert completion_payload.correlation_id == request_payload.correlation_id
+            # settle: the session worker must finish draining the step
+            # before close, otherwise the app worker dies mid-run_step
+            runtime = session.runtime
+            assert runtime is not None
+            for _ in range(100):
+                if app.view.pending_injections() == 0 and runtime.active_calls == 0:
+                    break
+                await pilot.pause(0.1)
+            # reconcile the on-screen delegation table against the journal
+            app.refresh_panels()
+            await pilot.pause(0.3)
+            table = app.query_one("#delegation-table", DataTable)
+            assert table.row_count == 1
+            row_keys = list(table.rows)
+            cells = table.get_row(row_keys[0])
+            assert str(row_keys[0].value) == request_payload.correlation_id
+            assert cells[0] == request_payload.correlation_id[:8]
+            assert cells[1] == request_payload.subagent
+            assert cells[2] == completion_payload.status
+            # the digest cell is the projected summary: masked (masker) and
+            # wrapped in untrusted-target-content markers (arch §6.8); the
+            # panel renders through rich-escape, so brackets appear as \[...]
+            digest_cell = str(cells[3])
+            assert completion_payload.summary_digest in digest_cell
+            assert "untrusted-target-content begin" in digest_cell
+            assert "untrusted-target-content end" in digest_cell
+    finally:
+        await session.close()
 
 
 # ---------------------------------------------------------------------------

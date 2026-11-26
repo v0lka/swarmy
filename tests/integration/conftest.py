@@ -19,11 +19,35 @@ runtime import of ``swarmy`` (T2.4.1 AC, asserted by a dedicated test).
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 
 import pytest
+
+if os.environ.get("SWARMY_TEST_BLOCK_TUI") == "1":
+
+    class _BlockSwarmyTui:
+        """Meta-path finder that forbids any ``swarmy.tui`` import.
+
+        Active only when ``SWARMY_TEST_BLOCK_TUI=1`` (set by the T4.1.1
+        dependency-inversion test): the M3 integration set must pass in an
+        environment that never imports the TUI package (arch §2.5 — the
+        core must not depend on the interface layer; the dependency points
+        the other way).
+        """
+
+        def find_spec(self, fullname: str, path: object = None, target: object = None) -> object:
+            if fullname == "swarmy.tui" or fullname.startswith("swarmy.tui."):
+                msg = (
+                    f"import of {fullname!r} is forbidden here: the M3 "
+                    "integration set must run without swarmy.tui (T4.1.1 AC 3)"
+                )
+                raise ImportError(msg)
+            return None
+
+    sys.meta_path.insert(0, _BlockSwarmyTui())  # type: ignore[arg-type]
 
 from swarmy.core.config import SecretsConfig
 from swarmy.core.database import Database

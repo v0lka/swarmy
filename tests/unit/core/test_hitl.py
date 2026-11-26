@@ -1,12 +1,16 @@
 """T3.3.1/T3.3.2 acceptance criteria: the HITL matrix and the ApprovalQueue.
 
 Roadmap T3.3.1: the profile x class matrix matches arch §7.2 (parametrized),
-module entries win the merge, rebuilding with another profile changes the
-gate set.
-Roadmap T3.3.2: FIFO across several parallel interrupts, the decision is
-delivered to the addressed ``interrupt_id``, ``edit`` swaps the arguments,
-``reject`` feeds the agent an operator-rejection text, and every step lands
-in the journal as an ``OperatorDecision``.
+module entries win the merge, rebuilding with another profile or mode changes
+the gate set — both on the flat L0 mapping and on the session-wide
+``InterruptConfig`` views (orchestrator + per-module merges).
+Roadmap T3.3.2: FIFO across several parallel interrupts (through direct
+snapshot refresh and through a scripted fake graph behind the queue's
+``state_reader`` seam), the decision is delivered to the addressed
+``interrupt_id``, ``edit`` swaps the arguments, ``reject`` feeds the agent
+an operator-rejection text, the built command reaches the injected
+``graph_runner``, and every step lands in the journal as an
+``OperatorDecision``.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from swarmy.core.hitl import (
     ApprovalQueue,
     ApprovalRequest,
     build_interrupt_config,
+    build_session_interrupt_config,
     merge_interrupt_config,
 )
 from swarmy.guardrails.models import RiskClass
@@ -60,6 +65,7 @@ def _snapshot(*interrupt_values: tuple[str, str, dict[str, Any]]) -> StateSnapsh
 
 def _recording_queue(
     sanitizer: Any = None,
+    state_reader: Any = None,
 ) -> tuple[ApprovalQueue, list[tuple[str, Mapping[str, object]]]]:
     """A queue whose OperatorDecision events are captured (no journal/db)."""
     calls: list[tuple[str, Mapping[str, object]]] = []
@@ -68,7 +74,7 @@ def _recording_queue(
         calls.append((event_type, payload))
         return f"journalled {event_type}"
 
-    queue = ApprovalQueue(emit=emit, sanitizer=sanitizer)
+    queue = ApprovalQueue(emit=emit, sanitizer=sanitizer, state_reader=state_reader)
     return queue, calls
 
 
@@ -141,6 +147,67 @@ class TestMergeAndRebuild:
         assert set(normal) == set(paranoid)  # same tool coverage, different verdicts
 
 
+class TestSessionInterruptConfig:
+    """AC: the session-wide views — orchestrator matrix, per-module merge, rebuild."""
+
+    @pytest.mark.parametrize(
+        ("profile", "gated"),
+        [
+            ("paranoid", {"http_post", "verify_probe", "wipe_form"}),
+            ("normal", {"verify_probe", "wipe_form"}),
+            ("yolo", {"wipe_form"}),
+        ],
+    )
+    def test_orchestrator_view_matches_matrix(self, profile: str, gated: set[str]) -> None:
+        config = build_session_interrupt_config(profile, _CLASSES, mode="mission")
+        gated_view = {tool for tool, gate in config.orchestrator.items() if gate is not False}
+        assert gated_view == gated
+
+    def test_per_module_merge_replaces_profile_entries(self) -> None:
+        config = build_session_interrupt_config(
+            "normal",
+            _CLASSES,
+            mode="mission",
+            module_overrides={"crawler": {"verify_probe": False}},
+        )
+        assert config.orchestrator["verify_probe"] is not False  # orchestrator untouched
+        assert config.per_module["crawler"]["verify_probe"] is False  # module entry wins
+        module_gate = config.per_module["crawler"]["wipe_form"]
+        assert module_gate == config.orchestrator["wipe_form"]  # others keep the profile gate
+
+    def test_module_gate_entry_replaces_whole_config(self) -> None:
+        gate = {"allowed_decisions": ["approve", "edit", "reject"], "description": "module gate"}
+        config = build_session_interrupt_config(
+            "yolo", _CLASSES, mode="mission", module_overrides={"fuzzer": {"http_get": gate}}
+        )
+        assert config.per_module["fuzzer"]["http_get"] == gate
+
+    def test_modules_without_overrides_inherit_orchestrator(self) -> None:
+        config = build_session_interrupt_config(
+            "normal", _CLASSES, mode="mission", module_overrides={"crawler": {}}
+        )
+        assert set(config.per_module) == {"crawler"}  # only named modules get entries
+        assert config.per_module["crawler"] == config.orchestrator
+
+    def test_rebuild_on_another_profile_changes_views(self) -> None:
+        normal = build_session_interrupt_config("normal", _CLASSES, mode="mission")
+        paranoid = build_session_interrupt_config("paranoid", _CLASSES, mode="mission")
+        assert paranoid.orchestrator["http_post"] is not False  # newly gated
+        assert normal.orchestrator["http_post"] is False
+        assert normal != paranoid  # AC: rebuild yields a different gate set
+
+    def test_rebuild_on_another_mode_changes_gates(self) -> None:
+        mission = build_session_interrupt_config("yolo", _CLASSES, mode="mission")
+        interactive = build_session_interrupt_config(
+            "yolo", _CLASSES, mode="interactive", significant_tools={"http_get"}
+        )
+        assert interactive.orchestrator["verify_probe"] is not False  # verify-class floor
+        assert mission.orchestrator["verify_probe"] is False
+        assert interactive.orchestrator["http_get"] is not False  # decision point gated
+        assert mission.orchestrator["http_get"] is False  # mission: profile gates only
+        assert interactive != mission  # AC: mode change → different gate set
+
+
 # ---------------------------------------------------------------------------
 # T3.3.2 — the queue
 # ---------------------------------------------------------------------------
@@ -189,6 +256,81 @@ class TestFifoAndAddressing:
         with pytest.raises(ValueError, match="unknown request_id"):
             await queue.submit_decision("apr-9999", "approve")
         assert len(queue.pending()) == 1  # retriable
+
+
+class _FakeGraph:
+    """Scripted fake graph: ``aget_state`` replays pre-scripted snapshots."""
+
+    def __init__(self, *snapshots: StateSnapshot) -> None:
+        self._snapshots = list(snapshots)
+        self._last = snapshots[0]
+        self.configs: list[object] = []
+
+    async def aget_state(self, thread_config: object) -> StateSnapshot:
+        self.configs.append(thread_config)
+        if self._snapshots:
+            self._last = self._snapshots.pop(0)
+        return self._last
+
+
+class TestStateReaderPolling:
+    """AC (delegation path): the queue polls a scripted fake graph itself."""
+
+    async def test_poll_orders_three_interrupts_fifo(self) -> None:
+        graph = _FakeGraph(
+            _snapshot(
+                ("int-a", "verify_probe", {"url": "https://t/1"}),
+                ("int-b", "wipe_form", {"url": "https://t/2"}),
+                ("int-c", "http_post", {"url": "https://t/3"}),
+            )
+        )
+        queue, _calls = _recording_queue(state_reader=graph.aget_state)
+        thread = {"configurable": {"thread_id": "t"}}
+        requests = await queue.refresh_from_config(thread)
+        assert graph.configs == [thread]  # the config reached the graph seam
+        assert [request.interrupt_id for request in requests] == ["int-a", "int-b", "int-c"]
+        again = await queue.refresh_from_config(thread)
+        assert [request.interrupt_id for request in again] == ["int-a", "int-b", "int-c"]
+        assert again == list(queue.pending())  # idempotent: no duplicates on re-poll
+
+    async def test_poll_requires_state_reader(self) -> None:
+        queue, _calls = _recording_queue()
+        with pytest.raises(TypeError, match="state_reader"):
+            await queue.refresh_from_config({"configurable": {"thread_id": "t"}})
+
+    async def test_decision_flows_to_graph_runner(self) -> None:
+        graph = _FakeGraph(_snapshot(("int-a", "http_post", {"url": "https://t/old"})))
+        queue, calls = _recording_queue(state_reader=graph.aget_state)
+        await queue.refresh_from_config({"configurable": {"thread_id": "t"}})
+        handed: list[Command] = []
+
+        async def runner(command: Command) -> object:
+            handed.append(command)
+            return "resumed"
+
+        command = await queue.submit_decision(
+            "apr-0001", "edit", edited_args={"url": "https://t/new"}, graph_runner=runner
+        )
+        assert handed == [command]  # the exact built command reaches the runtime seam
+        assert list(command.resume) == ["int-a"]  # addressed interrupt_id
+        payload = command.resume["int-a"]
+        assert payload["type"] == "edit"  # edit substitutes the arguments
+        assert payload["edited_action"] == {"name": "http_post", "args": {"url": "https://t/new"}}
+        decisions = [entry for kind, entry in calls if kind == "OperatorDecision"]
+        assert decisions[0]["decision"] == "edit"  # journalled before the runner ran
+
+    async def test_graph_runner_skipped_for_external_request(self) -> None:
+        queue, _calls = _recording_queue()
+        handed: list[Command] = []
+
+        async def runner(command: Command) -> object:
+            handed.append(command)
+            return None
+
+        request = await queue.enqueue_external("network-write", "judge escalation")
+        await queue.submit_decision(request.request_id, "approve", graph_runner=runner)
+        assert handed == []  # not interrupt-backed: the runtime skips the graph
+        assert queue.pending() == ()
 
 
 class TestEditAndReject:

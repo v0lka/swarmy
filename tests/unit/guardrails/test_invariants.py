@@ -7,13 +7,21 @@ real checks are injected. The wired half (T2.1.3) proves the real scope /
 limits / timeout / out-of-scope-target checks: out-of-scope requests are
 denied with ``layer="invariant"`` *before* any connection, and the
 invariants evaluate before ``ResourceLimiter.acquire`` (pipeline order
-arch §6.2: guardrails → limiter → httpx).
+arch §6.2: guardrails → limiter → httpx). The final section is the
+T1.4.3 leftover acceptance (closed after T3.1.1): the config schema has
+no invariant slot, and a real resolved ``SessionConfig`` activates every
+slot — out-of-scope targets, scope violations, timeouts and spent budgets
+deny with ``invariant:*`` rules.
 """
 
 from __future__ import annotations
 
-import pytest
+from typing import TYPE_CHECKING
 
+import pytest
+import yaml
+
+from swarmy.core.config import ConfigError, SessionConfig, snapshot_yaml
 from swarmy.guardrails.invariants import (
     INVARIANT_PREFIX,
     Invariant,
@@ -30,6 +38,9 @@ from swarmy.tools.scope import (
     ScopeEntries,
     ScopeRegistry,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _session_scope() -> ScopeRegistry:
@@ -298,3 +309,125 @@ async def test_pipeline_denies_before_limiter_acquire_is_reached() -> None:
     async with spy.acquire("target.example.com", "GET"):  # the arch §6.2 next stage
         pass
     assert spy.acquire_calls == [("target.example.com", "GET")]
+
+
+# ---- T1.4.3 leftover (closed after T3.1.1): invariants are not configurable,
+# ---- and a real resolved SessionConfig activates every slot.
+
+_CONFIG_EXAMPLE = """
+target:
+  base_url: "https://target.example.com"
+scope:
+  domains: ["target.example.com"]
+  ip_subnets: ["203.0.113.0/24"]
+  ports: [80, 443]
+  schemes: ["https"]
+profile: normal
+limits:
+  rate_limit: 5
+  max_concurrent_requests: 8
+  max_body_bytes: 5242880
+  max_redirect_depth: 5
+  total_request_budget: 5000
+  connect_timeout_s: 10
+  read_timeout_s: 30
+"""
+
+
+def _resolved_config(tmp_path: Path, text: str = _CONFIG_EXAMPLE) -> SessionConfig:
+    """Resolve a config document through the real ``SessionConfig.load`` path."""
+    path = tmp_path / "cfg.yaml"
+    path.write_text(text, encoding="utf-8")
+    return SessionConfig.load(config_path=path)
+
+
+def _wired_from_config(config: SessionConfig, scope: ScopeRegistry) -> InvariantLayer:
+    """Activate every slot exactly the way the session composition root does."""
+    return InvariantLayer(session_invariants(scope, ResourceLimiter(config.limits)))
+
+
+class TestConfigHasNoInvariantSlot:
+    """T1.4.3 AC: layer 1 is not a config slot (schema test after T3.1.1)."""
+
+    def test_no_invariant_field_in_the_schema_or_snapshot(self, tmp_path: Path) -> None:
+        """No ``SessionConfig`` field or snapshot section mentions invariants."""
+        config = _resolved_config(tmp_path)
+        assert not any("invariant" in name for name in SessionConfig.model_fields)
+        document = yaml.safe_load(snapshot_yaml(config))
+        assert isinstance(document, dict)
+        assert not any("invariant" in str(key) for key in document)
+
+    def test_invariants_section_is_rejected(self, tmp_path: Path) -> None:
+        """``extra="forbid"``: an invented ``invariants:`` block cannot turn layer 1 off."""
+        with pytest.raises(ConfigError, match="invariants"):
+            _resolved_config(tmp_path, _CONFIG_EXAMPLE + "\ninvariants:\n  scope: false\n")
+
+
+class TestResolvedConfigActivatesEverySlot:
+    """T1.4.3 leftover AC: the real SessionConfig wires scope/limits/timeout/
+    out-of-scope-target checks; violations deny with ``invariant:*`` rules."""
+
+    def test_out_of_scope_target_denied_by_scope_invariant(self, tmp_path: Path) -> None:
+        """The resolved allowlist denies a foreign host, allows the real target."""
+        config = _resolved_config(tmp_path)
+        layer = _wired_from_config(config, ScopeRegistry(config.scope))
+        assert layer.evaluate("http_get", {"url": "https://target.example.com/login"}) is None
+        feedback = layer.evaluate("http_get", {"url": "https://off.example.net/login"})
+        assert feedback is not None
+        assert feedback.rule_id == "invariant:scope"
+        assert feedback.layer == "invariant"
+
+    def test_marked_target_endpoint_denied_by_out_of_scope_invariant(
+        self, tmp_path: Path
+    ) -> None:
+        """A marked out-of-scope endpoint of the target itself is denied."""
+        config = _resolved_config(tmp_path)
+        scope = ScopeRegistry(config.scope)
+        scope.mark_out_of_scope(
+            [OutOfScopeEndpoint(host="target.example.com:443", method="POST", path="/logout")]
+        )
+        layer = _wired_from_config(config, scope)
+        feedback = layer.evaluate("http_post", {"url": "https://target.example.com/logout"})
+        assert feedback is not None
+        assert feedback.rule_id == "invariant:out-of-scope-target"
+
+    def test_timeout_invariant_uses_the_resolved_limit(self, tmp_path: Path) -> None:
+        """A timeout wider than the resolved ``read_timeout_s`` budget is denied."""
+        config = _resolved_config(tmp_path)  # read_timeout_s: 30 from the file
+        layer = _wired_from_config(config, ScopeRegistry(config.scope))
+        feedback = layer.evaluate(
+            "http_post", {"url": "https://target.example.com/x", "read_timeout_s": 999}
+        )
+        assert feedback is not None
+        assert feedback.rule_id == "invariant:timeout"
+        assert layer.evaluate("http_post", {"url": "https://target.example.com/x"}) is None
+
+    async def test_budget_invariant_uses_the_resolved_budget(self, tmp_path: Path) -> None:
+        """A spent resolved budget denies with ``invariant:limits``."""
+        config = SessionConfig.load(
+            cli_overrides={
+                "target": {"base_url": "https://target.example.com"},
+                "scope": {
+                    "domains": ["target.example.com"],
+                    "ports": [443],
+                    "schemes": ["https"],
+                },
+                "limits": {
+                    "rate_limit": 5,
+                    "max_concurrent_requests": 8,
+                    "max_body_bytes": 5242880,
+                    "max_redirect_depth": 5,
+                    "total_request_budget": 1,
+                    "connect_timeout_s": 10,
+                    "read_timeout_s": 30,
+                },
+            }
+        )
+        limiter = ResourceLimiter(config.limits)
+        layer = InvariantLayer(session_invariants(ScopeRegistry(config.scope), limiter))
+        async with limiter.acquire("target.example.com", "GET"):
+            pass
+        feedback = layer.evaluate("http_get", {"url": "https://target.example.com/x"})
+        assert feedback is not None
+        assert feedback.rule_id == "invariant:limits"
+        assert "invariant: budget" in feedback.reason

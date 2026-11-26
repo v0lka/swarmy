@@ -10,6 +10,10 @@ Two responsibilities of the human-in-the-loop subsystem live here:
   designated significant-fork tools, ``mission`` keeps profile gates only.
   :func:`merge_interrupt_config` applies explicit module ``interrupt_on``
   entries over profile entries with the L0 replacement semantics.
+* :func:`build_session_interrupt_config` composes the session-wide views:
+  the orchestrator's own gates plus, per named subagent module, the profile
+  gates merged with that module's explicit ``interrupt_on`` overrides
+  (arch §7.1) as a frozen :class:`InterruptConfig`.
 * :class:`ApprovalQueue` polls ``snapshot.interrupts`` (L0 resume cycle,
   arch §7.1), maintains the FIFO of :class:`ApprovalRequest` visible to the
   TUI (arch §7.3), and turns operator decisions into
@@ -26,7 +30,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
 from langgraph.types import Command
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from swarmy.events.models import EventSource, OperatorDecisionPayload
 from swarmy.guardrails.models import RiskClass
@@ -52,6 +56,11 @@ ApprovalDecision: TypeAlias = Literal["approve", "edit", "reject"]
 #: escalations of T3.4.x.
 ApprovalOrigin: TypeAlias = Literal["profile", "module", "judge", "mode"]
 
+#: Duck-typed graph state accessor (arch §7.1): an async
+#: ``thread_config → snapshot`` callable — the ``graph.aget_state(config)``
+#: seam of the L0 resume cycle. The queue never imports or holds a graph.
+StateReader: TypeAlias = Callable[[object], Awaitable["StateSnapshot"]]
+
 #: The L0 decision vocabulary of ``InterruptOnConfig.allowed_decisions``
 #: (``langchain.agents.middleware.human_in_the_loop.DecisionType`` — a private
 #: re-export, mirrored here structurally).
@@ -76,6 +85,15 @@ _PROFILE_GATES: Final[Mapping[StrictnessProfile, frozenset[RiskClass]]] = {
     "yolo": frozenset({RiskClass.DESTRUCTIVE}),
 }
 
+#: The verify/destructive floor the ``interactive`` mode gates regardless of
+#: the profile (arch §7.2 bottom, spec §5.5: significant forks are launching a
+#: vulnerability-class test run and verification). A ``yolo`` *mission* run
+#: stays destructive-only; a ``yolo`` *interactive* run still gates
+#: verify-class calls and the designated decision points.
+_INTERACTIVE_CLASS_FLOOR: Final[frozenset[RiskClass]] = frozenset(
+    {RiskClass.VERIFY, RiskClass.DESTRUCTIVE}
+)
+
 #: Byte-safe length cap of the default args digest (§6.8 conservative default).
 _DIGEST_LIMIT: Final[int] = 512
 
@@ -92,7 +110,7 @@ def build_interrupt_config(
     profile: StrictnessProfile,
     risk_classes: Mapping[str, RiskClass],
     *,
-    mode: AutonomyMode = "interactive",
+    mode: AutonomyMode = "mission",
     significant_tools: Iterable[str] = (),
     module_overrides: Mapping[str, bool | InterruptOnConfig] | None = None,
     allowed_decisions: Sequence[DecisionType] = ALLOWED_DECISIONS,
@@ -100,15 +118,20 @@ def build_interrupt_config(
     """Render the arch §7.2 "class x profile" matrix over a tool registry.
 
     Every registered tool name gets exactly one entry: ``False`` when the
-    profile leaves its risk class ungated (``passive`` is never gated), or an
+    gates leave its risk class ungated (``passive`` is never gated), or an
     ``InterruptOnConfig`` literal offering :data:`ALLOWED_DECISIONS` (arch
     §7.2: ``approve``/``edit``/``reject`` — L0 ``respond`` is not used).
-    ``mode="interactive"`` additionally gates the designated significant-fork
-    tools regardless of their risk class (arch §7.2, spec §5.5: launching a
-    vulnerability-class test run, verification, scope changes);
-    ``mode="mission"`` keeps profile gates only. ``module_overrides`` replace
-    the entries of the tools they name (L0 semantics, see
-    :func:`merge_interrupt_config`).
+    Non-gated tools keep an explicit ``False`` entry — chosen over absence so
+    the mapping stays total over the registry; for the L0 middleware an
+    absent key and a ``False`` entry are equivalent (not gated).
+
+    ``mode="interactive"`` layers the arch §7.2 significant forks over the
+    profile (spec §5.5): the verify/destructive class floor
+    (:data:`_INTERACTIVE_CLASS_FLOOR`) is gated regardless of the profile,
+    and every ``significant_tools`` name (the decision-point markers) is
+    gated regardless of its risk class. ``mode="mission"`` — the default —
+    keeps the pure profile matrix. ``module_overrides`` replace the entries
+    of the tools they name (L0 semantics, see :func:`merge_interrupt_config`).
 
     The result feeds ``create_deep_agent(interrupt_on=...)`` directly (the L0
     parameter type is ``dict[str, bool | InterruptOnConfig]``; user entries
@@ -120,8 +143,9 @@ def build_interrupt_config(
         profile: strictness profile (arch §7.2).
         risk_classes: registered tool name → declared risk class (AD-7: the
             class is authored with the tool, never inferred).
-        mode: autonomy mode; ``interactive`` layers significant-fork gates
-            over the profile (default), ``mission`` keeps profile gates only.
+        mode: autonomy mode; ``interactive`` layers the class floor and the
+            significant-fork decision points over the profile, ``mission``
+            keeps profile gates only (default).
         significant_tools: tool names ``interactive`` gates as significant
             forks (e.g. ``update_finding_status``, verification HTTP calls);
             injectable so call sites stay in control; ignored by ``mission``.
@@ -141,6 +165,8 @@ def build_interrupt_config(
         known = ", ".join(sorted(_PROFILE_GATES))
         msg = f"unknown strictness profile {profile!r}; known profiles: {known}"
         raise ValueError(msg)
+    if mode == "interactive":
+        gates = gates | _INTERACTIVE_CLASS_FLOOR
     significant = frozenset(significant_tools)
     config: dict[str, bool | InterruptOnConfig] = {}
     for tool_name, risk in risk_classes.items():
@@ -185,6 +211,91 @@ def merge_interrupt_config(
     merged: dict[str, bool | InterruptOnConfig] = dict(base)
     merged.update(module_overrides)
     return merged
+
+
+class InterruptConfig(BaseModel):
+    """Session-wide ``interrupt_on`` views (arch §7.1-§7.2, T3.3.1).
+
+    ``orchestrator`` holds the gate mapping for the orchestrator's own tools;
+    ``per_module`` carries, per named subagent module, the profile gates
+    merged with that module's explicit ``interrupt_on`` overrides (arch
+    §7.1: module entries replace profile entries per tool). Modules without
+    overrides get no ``per_module`` entry — they inherit the orchestrator
+    view as-is. Entries are plain dicts (``False`` or an
+    ``InterruptOnConfig``-shaped mapping); rebuild the config on a
+    profile/mode change and recompile the graph (documented L0 operation).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    orchestrator: dict[str, bool | dict[str, object]]
+    per_module: dict[str, dict[str, bool | dict[str, object]]] = Field(default_factory=dict)
+
+
+def _plain_gate_view(
+    gates: Mapping[str, bool | InterruptOnConfig],
+) -> dict[str, bool | dict[str, object]]:
+    """Copy a gate mapping into the plain-dict entry shape of InterruptConfig."""
+    view: dict[str, bool | dict[str, object]] = {}
+    for tool_name, entry in gates.items():
+        view[tool_name] = False if isinstance(entry, bool) else dict(entry)
+    return view
+
+
+def build_session_interrupt_config(
+    profile: StrictnessProfile,
+    tool_risk_classes: Mapping[str, RiskClass],
+    *,
+    mode: AutonomyMode = "mission",
+    significant_tools: Iterable[str] = (),
+    module_overrides: Mapping[str, Mapping[str, bool | InterruptOnConfig]] | None = None,
+    allowed_decisions: Sequence[DecisionType] = ALLOWED_DECISIONS,
+) -> InterruptConfig:
+    """Build the session-wide orchestrator and per-module gate views (T3.3.1).
+
+    The orchestrator view is :func:`build_interrupt_config` over the whole
+    tool registry. Each module named in ``module_overrides`` gets the same
+    profile gates with its explicit entries overlaid per tool (arch §7.1 —
+    an explicit module entry fully replaces the profile entry for that tool,
+    including its allowed decisions; L0 replacement semantics). Modules
+    absent from ``module_overrides`` get no ``per_module`` entry and inherit
+    the orchestrator view unchanged.
+
+    Args:
+        profile: strictness profile (arch §7.2).
+        tool_risk_classes: registered tool name → declared risk class (AD-7).
+        mode: autonomy mode (arch §7.2): ``mission`` — the default — keeps
+            the pure profile matrix; ``interactive`` additionally gates the
+            verify/destructive class floor and the ``significant_tools``
+            decision points regardless of the profile.
+        significant_tools: decision-point tool names ``interactive`` gates
+            (e.g. vulnerability-class test runs, verification, scope
+            changes); ignored by ``mission``.
+        module_overrides: per-module ``interrupt_on`` entries replacing the
+            profile entries of the tools they name.
+        allowed_decisions: decisions offered on each generated gate;
+            defaults to :data:`ALLOWED_DECISIONS`.
+
+    Returns:
+        A frozen :class:`InterruptConfig` (orchestrator + per-module views).
+    """
+    orchestrator = build_interrupt_config(
+        profile,
+        tool_risk_classes,
+        mode=mode,
+        significant_tools=significant_tools,
+        allowed_decisions=allowed_decisions,
+    )
+    per_module: dict[str, dict[str, bool | dict[str, object]]] = {}
+    if module_overrides is not None:
+        for module_name, overrides in module_overrides.items():
+            per_module[module_name] = _plain_gate_view(
+                merge_interrupt_config(orchestrator, overrides)
+            )
+    return InterruptConfig(
+        orchestrator=_plain_gate_view(orchestrator),
+        per_module=per_module,
+    )
 
 
 def default_args_digest(args: Mapping[str, object]) -> str:
@@ -314,14 +425,14 @@ class ApprovalRequest(BaseModel):
     ``judge`` (LLM-judge escalation, T3.4.x).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     request_id: str
     interrupt_id: str
     tool: str
     args_digest: str
     rule_or_profile: str
-    origin: ApprovalOrigin
+    origin: ApprovalOrigin = "profile"
 
 
 class ApprovalQueue:
@@ -342,6 +453,12 @@ class ApprovalQueue:
     appended directly without fan-out. With neither, decisions proceed
     unjournaled (headless unit tests).
 
+    Polling (arch §7.1): the caller may pass ``snapshot.interrupts``
+    directly to :meth:`refresh` (the committed runtime path), or the queue
+    is built with a ``state_reader`` and polls itself through
+    :meth:`refresh_from_config` — the duck-typed ``graph.aget_state`` seam;
+    both merges are idempotent on interrupt ids.
+
     ``submit_decision`` is async because the journaling API is async; a lock
     serializes the journal+retire critical section so concurrent submissions
     keep FIFO decision order.
@@ -356,6 +473,7 @@ class ApprovalQueue:
         emit: EmitEventTool | None = None,
         sanitizer: Callable[[Mapping[str, object]], str] | None = None,
         *,
+        state_reader: StateReader | None = None,
         origin: ApprovalOrigin = "profile",
         rule_or_profile: str = "profile",
     ) -> None:
@@ -368,12 +486,16 @@ class ApprovalQueue:
                 the preferred journaling path (journal-first + fan-out).
             sanitizer: ``args → digest`` projection (§6.8); defaults to
                 :func:`default_args_digest` (no secret masking).
+            state_reader: duck-typed graph accessor — async
+                ``thread_config → snapshot`` (the ``graph.aget_state`` API,
+                arch §7.1); enables :meth:`refresh_from_config` polling.
             origin: origin stamped on refreshed requests without a per-tool
                 override.
             rule_or_profile: rule/profile label stamped likewise.
         """
         self._journal = journal
         self._emit = emit
+        self._state_reader = state_reader
         self._digest = sanitizer if sanitizer is not None else default_args_digest
         self._origin = origin
         self._rule_or_profile = rule_or_profile
@@ -471,6 +593,34 @@ class ApprovalQueue:
             self._pending.append(request)
             self._by_request_id[request.request_id] = request
 
+    async def refresh_from_config(self, thread_config: object) -> list[ApprovalRequest]:
+        """Poll the graph through the injected ``state_reader`` (arch §7.1).
+
+        The delegation-shaped polling entry: fetches
+        ``state_reader(thread_config)`` — the ``graph.aget_state(config)``
+        seam — then runs the same idempotent :meth:`refresh` merge and
+        returns the FIFO. Deliberately *not* named ``refresh``: the committed
+        runtime polls snapshots directly through the synchronous
+        :meth:`refresh`, and an un-awaited coroutine of a same-named async
+        replacement would silently no-op those call sites.
+
+        Args:
+            thread_config: langgraph thread config (``{"configurable":
+                {"thread_id": ...}}``); passed to the state reader verbatim.
+
+        Returns:
+            The pending requests in FIFO order after the poll.
+
+        Raises:
+            TypeError: the queue was built without a ``state_reader``.
+        """
+        if self._state_reader is None:
+            msg = "refresh_from_config requires a state_reader (constructor argument)"
+            raise TypeError(msg)
+        snapshot = await self._state_reader(thread_config)
+        self.refresh(snapshot)
+        return list(self.pending())
+
     def pending(self) -> tuple[ApprovalRequest, ...]:
         """FIFO view of the requests awaiting an operator decision."""
         return tuple(self._pending)
@@ -480,6 +630,8 @@ class ApprovalQueue:
         request_id: str,
         decision: ApprovalDecision,
         edited_args: Mapping[str, object] | None = None,
+        *,
+        graph_runner: Callable[[Command[str]], Awaitable[object]] | None = None,
     ) -> Command[str]:
         """Apply one operator decision and resume its interrupt (arch §7.3-7.4).
 
@@ -501,10 +653,17 @@ class ApprovalQueue:
             decision: the operator's decision.
             edited_args: replacement arguments — required for ``edit``; their
                 digest is journaled as ``edited_args_digest``.
+            graph_runner: optional async sink for the built command (the
+                runtime's ``graph.ainvoke(command, config)`` seam, arch
+                §7.1). The queue never invokes the graph itself; when the
+                runner is injected and the request is interrupt-backed, the
+                command is handed to it after journaling and retirement.
 
         Returns:
             ``Command(resume={interrupt_id: decision_payload})`` addressing
-            exactly the interrupted tool call.
+            exactly the interrupted tool call (empty resume mapping for
+            external judge requests). The same command is handed to
+            ``graph_runner`` when one is injected.
 
         Raises:
             ValueError: unknown ``request_id``, or ``edit`` without
@@ -538,7 +697,11 @@ class ApprovalQueue:
             await resolver(decision)
         # N subscripted explicitly: the ``resume`` mapping does not constrain
         # Command's TypeVar, and the runtime resume state here is graph state.
-        return Command[str](resume={request.interrupt_id: payload} if request.interrupt_id else {})
+        resume = {request.interrupt_id: payload} if request.interrupt_id else {}
+        command = Command[str](resume=resume)
+        if graph_runner is not None and request.interrupt_id:
+            await graph_runner(command)
+        return command
 
     async def _journal_decision(
         self,
@@ -572,8 +735,11 @@ __all__ = [
     "ApprovalRequest",
     "AutonomyMode",
     "DecisionType",
+    "InterruptConfig",
+    "StateReader",
     "StrictnessProfile",
     "build_interrupt_config",
+    "build_session_interrupt_config",
     "default_args_digest",
     "merge_interrupt_config",
 ]

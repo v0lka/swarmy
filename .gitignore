@@ -29,3 +29,4 @@ tmp
 # committed; the archived reports under reports/ are kept.
 demos/*/session/
 demos/*/run.log
+demoes/*/reports/

@@ -344,7 +344,9 @@ async def test_finding_card_shows_raw_values_and_evidence(tmp_path: Path) -> Non
         findings = app.query_one("#panel-findings", FindingsPanel)
         card_text = static_text(findings.query_one("#finding-card", Static))
         assert "EVIL_XSS_PAYLOAD" in card_text  # RAW (arch §6.8)
-        assert raw_file.as_posix() in card_text
+        # The card shows the OS-native absolute path (what an operator pastes
+        # into a shell) — backslashes on Windows, so no as_posix() here.
+        assert str(raw_file) in card_text
         assert raw_file.is_file()
         assert (await memory.list_findings())[0].status.value == "candidate"
     await session.close()

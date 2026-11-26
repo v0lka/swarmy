@@ -6,8 +6,7 @@ arch §4.2 — enum members, mandatory severity (D14), int-key references and th
 Draft models used by the store (§4.4).
 """
 
-from datetime import UTC, datetime
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -116,7 +115,9 @@ def test_utc_timestamps_accepted_with_offset() -> None:
         created_by="m",
     )
     draft.created_by = draft.created_by  # drafts carry no timestamps (store stamps them)
-    aware = datetime(2026, 1, 1, tzinfo=ZoneInfo("Europe/Moscow"))
+    # A fixed UTC+3 offset (MSK) instead of ZoneInfo("Europe/Moscow"): Windows ships
+    # no system tz database, and the runtime never needs one.
+    aware = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=3)))
     finding = Finding(
         id=2,
         type=FindingType.XSS,

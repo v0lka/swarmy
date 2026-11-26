@@ -11,6 +11,7 @@ Roadmap T3.1.1:
 from __future__ import annotations
 
 import contextlib
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -194,7 +195,10 @@ class TestSnapshot:
         secrets = SecretsConfig(tokens={"api_key": "sk-super-secret-value-123"})
         secrets_path = tmp_path / "secrets.yaml"
         write_secrets(secrets_path, secrets)
-        assert (secrets_path.stat().st_mode & 0o777) == 0o600  # POSIX mode kept
+        if sys.platform != "win32":
+            # POSIX 0600 modes are not expressible on Windows (documented
+            # T2.3.3 limitation; the dedicated mode tests live in test_secrets).
+            assert (secrets_path.stat().st_mode & 0o777) == 0o600
         text = snapshot_yaml(config, load_secrets(secrets_path))
         assert "sk-super-secret-value-123" not in text
         assert "<masked:api_key>" in text

@@ -7,6 +7,7 @@ the markers must be derivable from the file location without per-test decorators
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -16,9 +17,14 @@ if TYPE_CHECKING:
 
 
 def pytest_collection_modifyitems(items: Iterable[pytest.Item]) -> None:
-    """Tag every collected test with its suite marker based on its path."""
+    """Tag every collected test with its suite marker based on its path.
+
+    The path is normalised to POSIX separators first: ``item.fspath`` is
+    OS-native (``\\`` on Windows), and the CI matrix includes windows/amd64
+    (arch §15.4) — a raw substring check would silently skip every test there.
+    """
     for item in items:
-        path = str(item.fspath)
+        path = Path(str(item.fspath)).as_posix()
         if "/tests/unit/" in path:
             item.add_marker(pytest.mark.unit)
         elif "/tests/integration/" in path:

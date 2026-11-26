@@ -73,7 +73,7 @@ Sensitivity rationale: everything that can unlock the *target* (credentials, fin
 Everything below is an actual v0.1 entry point, verified against the source tree:
 
 - **CLI arguments and session config** — `swarmy.cli` parses flags plus `session.yaml` (resolution CLI → file → defaults, fail-fast) and `secrets.yaml` (mode 0600, POSIX enforcement).
-- **Module loading** — `--agents-dir` directories and built-in `src/swarmy/agents/`: `AGENT.md` frontmatter + system prompt, `tools/*.py` **imported and executed in-process** via `importlib.util.spec_from_file_location`, `guardrails.yaml`, optional `skills/` (SKILL.md + scripts).
+- **Module loading** — `--agents-dir` directories and built-in `agents/` (shipped as `swarmy/agents`): `AGENT.md` frontmatter + system prompt, `tools/*.py` **imported and executed in-process** via `importlib.util.spec_from_file_location`, `guardrails.yaml`, optional `skills/` (SKILL.md + scripts).
 - **MCP servers** — `SessionConfig.mcp_servers` integrates external tool servers into the harness (ASI04).
 - **Platform HTTP tools** — `http_get` / `http_post` / `http_put` / `http_delete`: the **only** sanctioned egress to the target; each call passes the guardrail pipeline, scope check, and resource limits *before* the first byte is sent.
 - **LLM provider APIs** — orchestrator, subagents, and the LLM judge all send model context (sanitized projections) to third-party inference endpoints.
@@ -427,7 +427,7 @@ These directives are non-negotiable for any AI agent (Copilot, Cursor, Qoder, et
 | `.github/workflows/ci.yml` | 4-platform CI matrix; lock check, lint, type check, coverage gates, smoke tests |
 | `Makefile` | Developer gate entry point (`make check`), D18 deepagents upgrade procedure |
 | `.gitignore` | Excludes session folders, `.venv`, coverage artifacts |
-| `src/swarmy/agents/*/guardrails.yaml` | Built-in modules' deterministic deny rules (reference examples of the module rule DSL) |
+| `agents/*/guardrails.yaml` | Built-in modules' deterministic deny rules (reference examples of the module rule DSL; shipped as `swarmy/agents`) |
 | `docs/development/spec.md` §8, `architecture.md` §6–§7 | Canonical security design: threat model, guardrail layers, sanitization boundary, pipelines |
 | *(session-time, never committed)* `session.yaml` / `secrets.yaml` / `memory.sqlite` / `evidence/` | The portable session folder — raw persistence boundary |
 

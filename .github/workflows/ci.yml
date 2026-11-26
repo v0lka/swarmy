@@ -47,7 +47,7 @@ jobs:
         run: uv sync
 
       - name: Lint (ruff strict)
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests agents
 
       - name: Type check (ty strict)
         run: uv run ty check src

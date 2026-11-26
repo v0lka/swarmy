@@ -382,7 +382,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 #### T1.5.3 — Лоадер (`modules/loader.py`)
 - **What:** `ModuleLoader` — сканирование, импорт, валидация, сборка SubAgent-словарей.
 - **Where:** `src/swarmy/modules/loader.py`.
-- **How:** конвейер arch §8.3: scan (пользовательские каталоги + `importlib.resources(swarmy.agents)`); импорт `tools/*.py` через `importlib.util.spec_from_file_location` (не в `sys.path`); runtime-проверка типов (`typing.get_type_hints`: запрет `Any`/`dict[str, Any]`/неаннотированных параметров, обязательный docstring); парсинг `guardrails.yaml` (T1.4.2); регистрация модульных event-моделей из `tools/event_models.py`; fail-fast — единый список проблем по ВСЕМ модулям → `ModuleLoadError` (старт сессии прерван); сборка словаря: `name, description, system_prompt, model, mode, tools=[platform+module], middleware=[GuardrailMiddleware(...)], interrupt_on=merge(профиль, манифест), skills=[<dir>/skills/], response_format`; статический анализ импортов модуля: `socket`/`urllib`/`http.client` — ошибка (arch §8.5); коллизия имени с встроенным — ошибка без override (AD-4).
+- **How:** конвейер arch §8.3: scan (пользовательские каталоги + встроенные модули: `<package>/agents` в wheel или `<repo>/agents` в editable-checkout); импорт `tools/*.py` через `importlib.util.spec_from_file_location` (не в `sys.path`); runtime-проверка типов (`typing.get_type_hints`: запрет `Any`/`dict[str, Any]`/неаннотированных параметров, обязательный docstring); парсинг `guardrails.yaml` (T1.4.2); регистрация модульных event-моделей из `tools/event_models.py`; fail-fast — единый список проблем по ВСЕМ модулям → `ModuleLoadError` (старт сессии прерван); сборка словаря: `name, description, system_prompt, model, mode, tools=[platform+module], middleware=[GuardrailMiddleware(...)], interrupt_on=merge(профиль, манифест), skills=[<dir>/skills/], response_format`; статический анализ импортов модуля: `socket`/`urllib`/`http.client` — ошибка (arch §8.5); коллизия имени с встроенным — ошибка без override (AD-4).
 - **Acceptance criteria:**
   - [x] фикстурный модуль с валидными AGENT.md/tools/guardrails.yaml загружается; словарь соответствует arch §8.3 (сверка ключей)
   - [x] пять видов нарушений (нет docstring; `Any`-аннотация; зарезервированный префикс; сетевой импорт; незарегистрированный тип события) — каждое даёт точную строку в агрегированной ошибке (тесты)
@@ -970,7 +970,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 
 #### T5.1.1 — Каркас модуля crawler
 - **What:** папка `AGENT.md` + `guardrails.yaml` + `tools/`.
-- **Where:** `src/swarmy/agents/crawler/`.
+- **Where:** `agents/crawler/`.
 - **How:** фронтматтер: `name`, `description`, `events: [EndpointsDiscovered, EndpointUpdated]` (arch §8.7); системный промпт пассивного recon (robots.txt, sitemap, обход ссылок, формы/параметры, карта эндпоинтов — spec §4.6); `guardrails.yaml`: ограничение глубины обхода через `url_matches`; `tools/parsers.py` — robots/sitemap/forms/links с `swarmy_risk_class = passive`.
 - **Acceptance criteria:**
   - [x] модуль загружается лоадером; объявления событий сверены с реестром
@@ -978,7 +978,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 
 #### T5.1.2 — Логика обхода
 - **What:** рекогносцировка и запись карты эндпоинтов.
-- **Where:** `src/swarmy/agents/crawler/tools/`.
+- **Where:** `agents/crawler/tools/`.
 - **How:** `http_get` через платформу; парсеры → `memory_upsert_endpoint` (дедуп, параметры append); события `EndpointsDiscovered`/`EndpointUpdated`; скоуп-гарантии — платформенные (вне скоупа блокируется инвариантом, `out_of_scope` помечается — T2.1.1).
 - **Acceptance criteria:**
   - [x] против эхо-приложения: эндпоинты и параметры найдены и записаны в память (тест)
@@ -987,7 +987,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 
 #### T5.1.3 — Референс-качество (dogfooding)
 - **What:** crawler как канонический пример авторского модуля.
-- **Where:** `src/swarmy/agents/crawler/`, раздел README/docs.
+- **Where:** `agents/crawler/`, раздел README/docs.
 - **How:** соответствие arch §8.5 (полная типизация, docstrings, запрет сетевых импортов); краткий туториал «как написать модуль» на реальном коде crawler.
 - **Acceptance criteria:**
   - [x] лоадер и линтер не выдают замечаний к модулю
@@ -1004,7 +1004,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 
 #### T5.2.1 — Каркас модуля xss-detector
 - **What:** папка `AGENT.md` + `guardrails.yaml` + `tools/`.
-- **Where:** `src/swarmy/agents/xss-detector/`.
+- **Where:** `agents/xss-detector/`.
 - **How:** события: `[FindingCandidate]` (arch §8.7); `guardrails.yaml`: блок TRUE-конструкций и известных опасных пейлоадов (пример spec §8.3); `tools/marker.py` (постановка маркеров), `tools/reflection.py` (контекстный анализ отражений); POST-зонды автоматически `network-write` (AD-7 → врата профиля).
 - **Acceptance criteria:**
   - [x] модуль загружается; события сверены
@@ -1012,7 +1012,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 
 #### T5.2.2 — Логика детектора
 - **What:** маркеры → отражения → безопасные пейлоады → кандидат находки.
-- **Where:** `src/swarmy/agents/xss-detector/tools/`.
+- **Where:** `agents/xss-detector/tools/`.
 - **How:** выбор параметров (`memory_search` по эндпоинтам crawler), `http_get` с маркерами, контекстный анализ отражений, верификация безопасными пейлоадами (spec §4.6); `memory_save_finding(candidate)` → `FindingCandidate`; улики — автоматически (`evidence=True`).
 - **Acceptance criteria:**
   - [x] против эхо-приложения: отражения → кандидаты с уликами (тест)
@@ -1030,7 +1030,7 @@ M5 (референсный рой, отчёт, релиз: F5+F6)
 
 #### T5.3.1 — Связывание узлов дерева
 - **What:** минимальные деревья атак из верифицированных находок.
-- **Where:** `src/swarmy/agents/xss-detector/tools/` (link-вызовы), политики в `core/prompts.py` (tree_proposal).
+- **Where:** `agents/xss-detector/tools/` (link-вызовы), политики в `core/prompts.py` (tree_proposal).
 - **How:** `FindingVerified` → политика `tree_proposal` → оркестратор делегирует связывание → `memory_link_attack_node` (узел находки + предусловия + цель, рёбра `requires`/`enables`/`leads_to`) → `AttackTreeUpdated` (arch §13.4).
 - **Acceptance criteria:**
   - [x] демо-дерево: предусловие → находка → цель с типизированными рёбрами (тест данных памяти)

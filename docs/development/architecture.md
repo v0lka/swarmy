@@ -36,7 +36,8 @@ D1–D22). Этот документ фиксирует **как** специф�
 │ L1  Доменное ядро swarmy (src/swarmy/*, наш код):                    │
 │     core (session/engine/runtime/hitl/config) · events · memory ·    │
 │     tools (http, platform, projector) · guardrails · modules ·       │
-│     report · agents (встроенные модули)                              │
+│     report · agents (встроенные модули: данные, исходники в          │
+│     `<repo>/agents`, в поставке — `swarmy/agents`)                   │
 ├──────────────────────────────────────────────────────────────────────┤
 │ L0  Harness: deepagents >=0.7.41,<0.8 (LangChain + LangGraph)        │
 └──────────────────────────────────────────────────────────────────────┘
@@ -223,26 +224,25 @@ swarmy2/
 │       │   ├── generator.py        # ReportGenerator (§11)
 │       │   └── templates/
 │       │       └── report.md.j2    # jinja2-шаблон отчёта
-│       ├── tui/
-│       │   ├── app.py              # SwarmyTui: раскладка, workers (§10)
-│       │   ├── state.py            # TuiState + SessionView (фасад)
-│       │   ├── approvals.py        # панель+модалки HITL-очереди
-│       │   └── panels/
-│       │       ├── chat.py         # Chat
-│       │       ├── activity.py     # Swarm Activity
-│       │       ├── findings.py     # Findings & Endpoints
-│       │       ├── trees.py        # Attack Trees
-│       │       └── plans.py        # Progress & Plans
-│       └── agents/                 # встроенные модули (importlib.resources, §8.7)
-│           ├── crawler/
-│           │   ├── AGENT.md
-│           │   ├── guardrails.yaml
-│           │   └── tools/
-│           └── xss-detector/
-│               ├── AGENT.md
-│               ├── guardrails.yaml
-│               └── tools/
-├── agents/                         # пользовательские модули (дефолт: cwd/agents)
+│       └── tui/
+│           ├── app.py              # SwarmyTui: раскладка, workers (§10)
+│           ├── state.py            # TuiState + SessionView (фасад)
+│           ├── approvals.py        # панель+модалки HITL-очереди
+│           └── panels/
+│               ├── chat.py         # Chat
+│               ├── activity.py     # Swarm Activity
+│               ├── findings.py     # Findings & Endpoints
+│               ├── trees.py        # Attack Trees
+│               └── plans.py        # Progress & Plans
+├── agents/                         # встроенные модули: crawler, xss-detector (§8.7)
+│   ├── crawler/
+│   │   ├── AGENT.md
+│   │   ├── guardrails.yaml
+│   │   └── tools/
+│   └── xss-detector/
+│       ├── AGENT.md
+│       ├── guardrails.yaml
+│       └── tools/
 └── tests/
     ├── unit/                       # зеркалят пакеты; gate ≥ 85 % (§15)
     ├── integration/                # сквозные сценарии; gate ≥ 70 %
@@ -252,10 +252,11 @@ swarmy2/
 
 Пояснения:
 
-- `agents/` в корне репозитория — **пример пользовательского каталога** (тесты используют
-  собственные фикстуры модулей); встроенные модули живут в пакете `swarmy.agents` и
-  подгружаются через `importlib.resources`.
-- `docs/` не входит в дистрибуцию; пакет собирается из `src/swarmy`.
+- `agents/` в корне репозитория — **источник встроенных модулей** (`crawler`, `xss-detector`).
+  Сборка маппит каталог в `swarmy/agents` внутри wheel (`force-include`), а лоадер
+  находит его и в установленном пакете, и в editable-checkout. Пользовательские модули
+  в этот каталог не кладутся — для них используется отдельный каталог (`--agents-dir`).
+- `docs/` не входит в дистрибуцию; пакет собирается из `src/swarmy` + `agents`.
 
 ### 3.2. `pyproject.toml`
 
@@ -265,6 +266,8 @@ swarmy2/
 | `[project.scripts]` | `swarmy = "swarmy.cli:main"` |
 | `[project] dependencies` | `deepagents>=0.7.41,<0.8` (D18), `pydantic>=2,<3` (D9), `httpx`, `textual`, `rich`, `jinja2>=3.1`, `aiosqlite`, `langgraph-checkpoint-sqlite` |
 | `[dependency-groups] dev` | `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `ty` (типчекер; запасной вариант — `mypy`, выбирается в F0), `aiohttp` (эхо-приложение фикстур) |
+| `[tool.hatch.build.targets.wheel]` | `packages = ["src/swarmy"]`, `force-include = {"agents" = "swarmy/agents"}` — встроенные модули из корневого `agents/` поставляются внутри пакета |
+| `[tool.hatch.build.targets.sdist]` | `include = ["src/swarmy", "agents", "README.md", "LICENSE", "pyproject.toml"]` — исходники модулей входят в sdist |
 | `[tool.ruff]` | strict-набор в духе upstream deepagents: запрет `Any` в доменном коде (`ANN401`), обязательные аннотации, `I`, `UP`, `B` |
 | `[tool.ty]` / `[tool.mypy]` | strict: `disallow_any_explicit`, `disallow_untyped_defs`, `warn_return_any` |
 | `[tool.pytest.ini_options]` | `asyncio_mode = "auto"`, маркеры `unit` / `integration` |
@@ -992,7 +995,7 @@ spec и ограничения L0).
 ### 8.3. Загрузка и сборка (`ModuleLoader`, `modules/loader.py`)
 
 ```
-scan (user dirs + importlib.resources(swarmy.agents))
+scan (user dirs + встроенные модули: <package>/agents в wheel, <repo>/agents в editable)
   └▶ для каждого каталога:
        parse AGENT.md (frontmatter → AgentModuleManifest, тело → system_prompt)
        import tools/*.py → tool-функции (валидация типов: §8.5)
@@ -1045,7 +1048,7 @@ tool-функции (§8.5).
 
 | Ограничение | Механизм |
 |-------------|----------|
-| Полная типизация, без `Any`/`dict[str, Any]` | ruff/ty strict на `src/swarmy/agents/**` и `agents/**`; лоадер проверяет `typing.get_type_hints` каждого экспортированного инструмента — неаннотированный параметр = ошибка загрузки |
+| Полная типизация, без `Any`/`dict[str, Any]` | ruff/ty strict на `src/swarmy/**`; ruff strict на `agents/**`; лоадер проверяет `typing.get_type_hints` каждого экспортированного инструмента — неаннотированный параметр = ошибка загрузки |
 | Docstring = описание для LLM | лоадер требует непустой docstring у каждой tool-функции |
 | Зарезервированные префиксы | см. §6.1 |
 | Сеть — только платформенный HTTP-клиент | инвариант-гардрейл: вызовы модульных инструментов, импортирующих `socket`/`urllib`/`http.client` и семейства HTTP-клиентов `httpx`/`aiohttp`/`requests` (F-2: они установлены в том же venv, где исполняются инструменты модуля), для сети блокируются статически — AST-скан лоадера импортов **и форм вызовов** (`os.system`/`os.popen`, сырые asyncio-стримы `open_connection`/`start_server`; голый `os` не запрещается — только порождающие процессы использования; `subprocess` запрещён импортом) — тот же скан покрывает `skills/**/*.py`; динамически — правило `tool_in` на уровне invariants (нет никакого легального пути к сокетам — инструменты модуля работают с `RequestSpec`, сеть исполняет платформа) |
@@ -1075,6 +1078,12 @@ frontmatter скиллов (те же лимиты полей) — ошибки 
 
 Оба модуля написаны строго по контракту §8 и служат референсом для авторов (dogfooding,
 §4.6 spec); их `AGENT.md`, `guardrails.yaml` и структура `tools/` — канонические примеры.
+
+Исходники модулей — **данные, а не импортируемый пакет**: каталог `<repo>/agents/` (D40)
+сборка маппит в `swarmy/agents` внутри wheel и включает в sdist (§3.2); `ModuleLoader`
+резолвит его через `builtin_agents_root()` в обоих layout'ах (§8.3). При
+`include_builtins=True` пустой или отсутствующий каталог — fail-fast `ModuleLoadError`
+с сообщением переустановить пакет (сломанная установка, а не пустой ростер).
 
 ## 9. Оркестратор и движок
 

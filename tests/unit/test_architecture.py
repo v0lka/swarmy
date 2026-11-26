@@ -242,13 +242,19 @@ def test_package_layout_matches_arch_3_1() -> None:
         "modules",
         "report",
         "tui",
-        "agents",
         "cli.py",
         "__main__.py",
         "__init__.py",
     ]
     for rel in expected:
         assert (SRC_ROOT / rel).exists(), f"missing canonical path: src/swarmy/{rel}"
+    # Built-in modules live in the repository-root agents/ directory and ship
+    # inside the wheel as swarmy/agents (arch §3.1/§8.7, D40).
+    agents_root = SRC_ROOT.parent.parent / "agents"
+    for module in ("crawler", "xss-detector"):
+        assert (agents_root / module / "AGENT.md").is_file(), (
+            f"missing built-in module: agents/{module}/AGENT.md"
+        )
 
 
 def test_tools_may_import_riskclass_without_cycle() -> None:
@@ -287,12 +293,16 @@ def test_tools_may_import_riskclass_without_cycle() -> None:
             f"guardrails.models must stay free of the L0 stack, got {sorted(loaded_l0)}"
         )
     finally:
+        # Restore the *original* module objects (not fresh re-imports): other
+        # modules and already-collected test files hold references to the
+        # classes defined in the snapshot modules, so re-importing by name
+        # would create duplicate class objects (``isinstance`` false negatives,
+        # monkeypatches landing on a module nobody uses).
         for name in [
             n
             for n in sys.modules
             if (n == "swarmy" or n.startswith("swarmy.")) and n not in snapshot
         ]:
             del sys.modules[name]
-        for name in sorted(snapshot):
-            if name not in sys.modules:
-                importlib.import_module(name)
+        for name, module in snapshot.items():
+            sys.modules[name] = module

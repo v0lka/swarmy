@@ -121,11 +121,11 @@ The same scenario is exercised headless by the integration suite:
 ## Writing a module (tutorial)
 
 A module is a folder — no engine changes are needed to add one (invariant 9).
-Drop it into an agents directory (default `cwd/agents`, point `--agents-dir`
-at it) with this layout:
+Drop it into a user module directory (for example `my-agents/`, passed via
+`--agents-dir` or the config `agents_dirs`) with this layout:
 
 ```
-agents/my-detector/
+my-agents/my-detector/
 ├── AGENT.md          # required: YAML frontmatter + system prompt
 ├── guardrails.yaml   # optional: declarative block rules (arch §6.6)
 └── tools/            # optional: typed Python tool functions
@@ -197,8 +197,8 @@ rules:
 types). Modules never touch the bus, journal or SQLite directly.
 
 **Reference implementations**: read the built-ins for the full idiom —
-`src/swarmy/agents/crawler/` (parsers, depth guardrail, passive recon
-prompt) and `src/swarmy/agents/xss-detector/` (marker/reflection tools,
+`agents/crawler/` (parsers, depth guardrail, passive recon
+prompt) and `agents/xss-detector/` (marker/reflection tools,
 TRUE-payload block rules, the `http_post` manifest gate, finding + attack-tree
 protocol). Their `AGENT.md`, `guardrails.yaml` and `tools/` are the canonical
 examples this tutorial summarized; the loader contract is pinned by

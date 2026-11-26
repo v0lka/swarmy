@@ -102,7 +102,7 @@ Never do (arch §17): raw `urllib`/`socket`/`requests` in module tools; direct m
 
 ## Subagent module contract (primary extension mechanism)
 
-Modules live in `agents/<name>/` (user modules, default `cwd/agents`) or `src/swarmy/agents/<name>/` (built-in, loaded via `importlib.resources`):
+Built-in reference modules live in `agents/<name>/` at the repository root (shipped inside the package as `swarmy/agents`); user modules live in any directory passed via `--agents-dir` or the config `agents_dirs`:
 
 - `AGENT.md` — required: YAML frontmatter (`name`, `description`; optional `model`, `mode: isolated|fork`, `interrupt_on`, `events`, `guardrails`) + system prompt as the body. Frontmatter maps onto the deepagents `SubAgent` dict.
 - `tools/` — optional Python tools: fully typed arguments/results, LLM-facing docstrings. Reserved platform prefixes (`memory_`, `event_`, `session_`) are forbidden in custom tool names; collisions fail-fast at session start.

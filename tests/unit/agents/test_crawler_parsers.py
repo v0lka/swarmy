@@ -9,15 +9,15 @@ from __future__ import annotations
 import json
 
 import pytest
-
-from swarmy.agents.crawler.tools.parsers import (
-    extract_forms,
-    extract_links,
-    parse_robots_txt,
-    parse_sitemap_xml,
-)
+from tests.helpers.module_tools import load_tool_file
 
 pytestmark = pytest.mark.unit
+
+parsers = load_tool_file("crawler", "parsers")
+extract_forms = parsers.extract_forms
+extract_links = parsers.extract_links
+parse_robots_txt = parsers.parse_robots_txt
+parse_sitemap_xml = parsers.parse_sitemap_xml
 
 
 def _of(json_text: str) -> dict[str, object]:

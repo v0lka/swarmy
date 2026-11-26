@@ -30,6 +30,7 @@
 PACKAGE              ?= swarmy
 SRC_DIR              ?= src
 TESTS_DIR            ?= tests
+AGENTS_DIR           ?= agents
 
 # Strict type checker — F0 decision (roadmap T1.1.1/T1.1.3): ty primary, mypy fallback
 TYPECHECKER          ?= ty
@@ -84,13 +85,13 @@ install: sync ## Set up the dev environment (equivalent of `pip install -e .` + 
 lint: lint-ruff typecheck ## Gate: ruff strict (src + tests) + strict type checker (src)
 
 lint-ruff: ## ruff strict (in the spirit of upstream deepagents: no Any/ANN401, I/UP/B)
-	$(UV) run ruff check $(SRC_DIR) $(TESTS_DIR)
+	$(UV) run ruff check $(SRC_DIR) $(TESTS_DIR) $(AGENTS_DIR)
 
 lint-format: ## ruff format --check — advisory only, not part of the gate (docs mandate `ruff check` only)
-	$(UV) run ruff format --check $(SRC_DIR) $(TESTS_DIR)
+	$(UV) run ruff format --check $(SRC_DIR) $(TESTS_DIR) $(AGENTS_DIR)
 
 format: ## ruff format — auto-format src and tests
-	$(UV) run ruff format $(SRC_DIR) $(TESTS_DIR)
+	$(UV) run ruff format $(SRC_DIR) $(TESTS_DIR) $(AGENTS_DIR)
 
 typecheck: ## Strict type check of src (arch §15.3): ty (default) or mypy (TYPECHECKER=mypy)
 ifeq ($(TYPECHECKER),mypy)

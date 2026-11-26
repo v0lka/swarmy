@@ -76,6 +76,19 @@ async def test_open_creates_all_components_on_one_database(
         await session.close()
 
 
+async def test_open_with_empty_builtin_agents_fails_fast(
+    tmp_path: Path, model: ScriptedChatModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty built-in module directory is a clear start failure, not a crash."""
+    from swarmy.modules.registry import ModuleLoadError
+
+    empty = tmp_path / "builtin-agents"
+    empty.mkdir()
+    monkeypatch.setattr("swarmy.modules.loader.builtin_agents_root", lambda: empty)
+    with pytest.raises(ModuleLoadError, match="built-in module directory is empty"):
+        await Session.open(config=_config(tmp_path), session_dir=tmp_path / "s", model=model)
+
+
 async def test_double_open_is_error_resume_is_separate(
     tmp_path: Path, model: ScriptedChatModel
 ) -> None:

@@ -1,9 +1,9 @@
 """``ModuleLoader``: scan → import → validate → assemble SubAgent dicts (arch §8.3, T1.5.3).
 
 The loader is the fail-fast front door of the module system (arch §8.3,
-spec §4.5): it walks the built-in module package
-(``importlib.resources(swarmy.agents)``) and the operator's user directories,
-and for every module directory:
+spec §4.5): it walks the shipped built-in module directory (``<package>/agents``
+in a wheel, ``<repo>/agents`` in an editable checkout) and the operator's user
+directories, and for every module directory:
 
 1. parses ``AGENT.md`` (frontmatter → :class:`AgentModuleManifest`, body →
    system prompt; T1.5.2);
@@ -50,15 +50,14 @@ without override (AD-4).
 from __future__ import annotations
 
 import ast
-import importlib.resources
 import importlib.util
 import inspect
 import itertools
 import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import ExitStack
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import FunctionType, ModuleType
 from typing import (
     TYPE_CHECKING,
@@ -99,8 +98,6 @@ from swarmy.tools.registry import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from swarmy.guardrails.pipeline import JudgeBand
     from swarmy.modules.manifest import AgentModuleManifest
 
@@ -239,20 +236,46 @@ class _LoadState:
     risk_overrides: dict[str, RiskClass] = field(default_factory=dict)
 
 
-def _builtin_module_dirs(stack: ExitStack) -> list[Path]:
+#: Root of the installed ``swarmy`` package (``.../swarmy``), derived from this
+#: module's location (``.../swarmy/modules/loader.py``). Used to locate the
+#: built-in module directory in both packaging layouts.
+_PACKAGE_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
+
+
+def builtin_agents_root() -> Path | None:
+    """Locate the built-in module directory shipped with swarmy.
+
+    The repository keeps the reference modules in ``<repo>/agents``; the wheel
+    maps that directory to ``swarmy/agents`` inside the installed package
+    (``[tool.hatch.build.targets.wheel] force-include``). Two layouts are
+    resolved, in order:
+
+    * the installed package: ``<site-packages>/swarmy/agents``;
+    * an editable/src-layout checkout: ``<repo>/agents`` (the package root is
+      ``<repo>/src/swarmy``).
+
+    Returns:
+        The directory, or ``None`` when neither candidate exists — a broken
+        installation (:meth:`ModuleLoader.load` reports it fail-fast).
+
+    """
+    packaged = _PACKAGE_ROOT / "agents"
+    if packaged.is_dir():
+        return packaged
+    checkout = _PACKAGE_ROOT.parent.parent / "agents"
+    if checkout.is_dir():
+        return checkout
+    return None
+
+
+def _builtin_module_dirs(root: Path | None) -> list[Path]:
     """Directories of built-in modules (arch §8.3, §8.7).
 
-    ``swarmy.agents`` is scanned via ``importlib.resources``; ``as_file`` keeps
-    a real filesystem path alive for the whole load. An empty or missing
-    package simply yields no built-ins.
+    An empty or missing root simply yields no built-ins; the empty case is a
+    load problem reported by :meth:`ModuleLoader.load`.
     """
-    try:
-        traversable = importlib.resources.files("swarmy.agents")
-    except ModuleNotFoundError:
+    if root is None or not root.is_dir():
         return []
-    if not traversable.is_dir():
-        return []
-    root = stack.enter_context(importlib.resources.as_file(traversable))
     return sorted(
         path for path in root.iterdir() if path.is_dir() and (path / "AGENT.md").is_file()
     )
@@ -613,10 +636,11 @@ class ModuleLoader:
             judge_band_factory: builds the LLM-judge band (P3.4, RD-2) for
                 each subagent pipeline over that module's risk-class map;
                 ``None`` keeps the judge slot empty.
-            include_builtins: scan the installed ``swarmy.agents`` package for
-                built-in modules (arch §8.3). ``False`` loads user modules
-                only — the AD-4 "explicit choice without built-ins" escape
-                hatch, used by tests and operators who want a bespoke roster.
+            include_builtins: scan the shipped built-in module directory
+                (``<package>/agents``, arch §8.3) for the reference modules.
+                ``False`` loads user modules only — the AD-4 "explicit choice
+                without built-ins" escape hatch, used by tests and operators
+                who want a bespoke roster.
         """
         self._user_dirs = tuple(user_dirs)
         self._strictness: StrictnessProfile = strictness
@@ -647,27 +671,41 @@ class ModuleLoader:
         EventRegistry.reset()
         problems: list[LoadProblem] = []
         loaded: list[LoadedModule] = []
-        with ExitStack() as stack:
-            builtin_dirs = _builtin_module_dirs(stack) if self._include_builtins else []
-            user_dirs, scan_problems = _user_module_dirs(self._user_dirs)
-            problems.extend(scan_problems)
-            state = _LoadState(
-                tool_registry=self._tool_registry
-                if self._tool_registry is not None
-                else ToolRegistry()
-            )
-            # name → (source, dir): collision detection incl. AD-4 (built-ins first)
-            known_names: dict[str, tuple[str, str]] = {}
-            plan: list[tuple[Path, str]] = [(path, BUILTIN_SOURCE) for path in builtin_dirs] + [
-                (path, f"module:{path}") for path in user_dirs
-            ]
-            for module_dir, source in plan:
-                module_problems, module_loaded = self._load_module(
-                    module_dir, source, state, known_names
+        builtin_root = builtin_agents_root() if self._include_builtins else None
+        builtin_dirs = _builtin_module_dirs(builtin_root)
+        if self._include_builtins and not builtin_dirs:
+            # Fail-fast on a broken installation: the reference modules are
+            # package data and must ship with swarmy (arch §8.3/§8.7).
+            if builtin_root is None:
+                detail = (
+                    "built-in module directory not found: expected "
+                    f"{_PACKAGE_ROOT / 'agents'} or {_PACKAGE_ROOT.parent.parent / 'agents'}; "
+                    "the swarmy installation is incomplete — reinstall the package"
                 )
-                problems.extend(module_problems)
-                if module_loaded is not None:
-                    loaded.append(module_loaded)
+            else:
+                detail = (
+                    f"built-in module directory is empty: {builtin_root} "
+                    "(expected at least one <module>/AGENT.md); the swarmy "
+                    "installation is incomplete — reinstall the package"
+                )
+            problems.append(LoadProblem("builtins", detail))
+        user_dirs, scan_problems = _user_module_dirs(self._user_dirs)
+        problems.extend(scan_problems)
+        state = _LoadState(
+            tool_registry=self._tool_registry if self._tool_registry is not None else ToolRegistry()
+        )
+        # name → (source, dir): collision detection incl. AD-4 (built-ins first)
+        known_names: dict[str, tuple[str, str]] = {}
+        plan: list[tuple[Path, str]] = [(path, BUILTIN_SOURCE) for path in builtin_dirs] + [
+            (path, f"module:{path}") for path in user_dirs
+        ]
+        for module_dir, source in plan:
+            module_problems, module_loaded = self._load_module(
+                module_dir, source, state, known_names
+            )
+            problems.extend(module_problems)
+            if module_loaded is not None:
+                loaded.append(module_loaded)
         if problems:
             # The abort path registers nothing (#44): a failed load leaves the
             # session ToolRegistry exactly as it was before ``load()``.
@@ -1181,4 +1219,5 @@ __all__ = [
     "PlatformToolset",
     "PlatformToolsetFactory",
     "StrictnessProfile",
+    "builtin_agents_root",
 ]

@@ -8,7 +8,6 @@ names must all exist exactly as documented.
 
 from __future__ import annotations
 
-from importlib import resources
 from pathlib import Path
 
 import pytest
@@ -45,10 +44,8 @@ class TestTutorialMatchesCode:
         """The tutorial's block rule mirrors the xss-detector's real rule."""
         readme = _readme()
         assert "no-executing-payloads" in readme
-        detector_yaml = (
-            resources.files("swarmy.agents")
-            .joinpath("xss-detector/guardrails.yaml")
-            .read_text(encoding="utf-8")
+        detector_yaml = (AGENTS_DIR / "xss-detector" / "guardrails.yaml").read_text(
+            encoding="utf-8"
         )
         assert "id: no-executing-payloads" in detector_yaml
         assert 'applies_to: ["http_get", "http_post"]' in detector_yaml

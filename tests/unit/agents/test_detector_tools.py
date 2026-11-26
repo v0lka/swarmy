@@ -9,11 +9,10 @@ enforces (regex *search* over argument values, conjunction of predicates).
 from __future__ import annotations
 
 import json
-from importlib import resources
 from typing import TYPE_CHECKING
 
 import pytest
-from tests.helpers.module_tools import load_tool_file
+from tests.helpers.module_tools import AGENTS_DIR, load_tool_file
 
 from swarmy.guardrails.dsl import parse_module_guardrails
 from swarmy.guardrails.pipeline import _CompiledRule, evaluate_rule
@@ -34,11 +33,7 @@ _DANGEROUS = ("<script", "javascript:", "onerror", "onload", "alert(", "eval(")
 
 def _module_guardrails(name: str) -> ModuleGuardrails:
     """Parse the real guardrails.yaml of one built-in module."""
-    text = (
-        resources.files("swarmy.agents").joinpath(f"{name}/guardrails.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
+    text = (AGENTS_DIR / name / "guardrails.yaml").read_text(encoding="utf-8")
     return parse_module_guardrails(text, source=f"{name}/guardrails.yaml")
 
 

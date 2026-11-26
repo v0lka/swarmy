@@ -19,6 +19,7 @@ M3 session is complete without it.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, TypeVar, cast
 
@@ -314,13 +315,22 @@ class Session:
         _prepare_session_dir(session_dir)
         session = cls(config=config, session_dir=session_dir)
         session.secrets = secrets
-        await session._compose(
-            fresh=True,
-            model=model,
-            judge_model=judge_model,
-            report_tool_factory=report_tool_factory,
-        )
-        _write_snapshot(session_dir, snapshot_yaml(config, secrets))
+        try:
+            await session._compose(
+                fresh=True,
+                model=model,
+                judge_model=judge_model,
+                report_tool_factory=report_tool_factory,
+            )
+            _write_snapshot(session_dir, snapshot_yaml(config, secrets))
+        except BaseException:
+            # Startup failures (config, module loading, schema, ...) must not
+            # leave the database/journal/http resources open: the CLI reports
+            # the typed error and exits, and a leaked aiosqlite thread would
+            # otherwise keep the process alive after the message (arch §4.5).
+            with suppress(Exception):
+                await session.close()
+            raise
         return session
 
     @classmethod
@@ -362,17 +372,23 @@ class Session:
             secrets = load_secrets(secrets_path)
         session = cls(config=config, session_dir=session_dir)
         session.secrets = secrets
-        await session._compose(
-            fresh=False,
-            model=model,
-            judge_model=judge_model,
-            report_tool_factory=report_tool_factory,
-        )
-        runtime = session.runtime
-        reader = session.reader
-        assert runtime is not None, "runtime composed"
-        assert reader is not None, "reader composed"
-        await runtime.restore(reader.range)
+        try:
+            await session._compose(
+                fresh=False,
+                model=model,
+                judge_model=judge_model,
+                report_tool_factory=report_tool_factory,
+            )
+            runtime = session.runtime
+            reader = session.reader
+            assert runtime is not None, "runtime composed"
+            assert reader is not None, "reader composed"
+            await runtime.restore(reader.range)
+        except BaseException:
+            # Same startup-failure cleanup as open(): no leaked connections.
+            with suppress(Exception):
+                await session.close()
+            raise
         return session
 
     async def close(self) -> None:

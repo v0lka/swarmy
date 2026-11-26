@@ -45,9 +45,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/swarmy"]
+# Built-in modules live in <repo>/agents (the source of truth) and ship inside
+# the package as swarmy/agents; ModuleLoader resolves that directory (arch §8.7).
+force-include = {"agents" = "swarmy/agents"}
 
 [tool.hatch.build.targets.sdist]
-include = ["src/swarmy", "README.md", "LICENSE", "pyproject.toml"]
+include = ["src/swarmy", "agents", "README.md", "LICENSE", "pyproject.toml"]
 
 # ---- ruff: strict set in the spirit of upstream deepagents (arch §3.2, §15.3) ----
 [tool.ruff]
@@ -98,7 +101,6 @@ known-first-party = ["swarmy"]
 # ---- ty: strict type check of src (arch §3.2, §15.3; Makefile TYPECHECKER default) ----
 [tool.ty.src]
 include = ["src"]
-exclude = ["src/swarmy/agents/**/tools/**"] # module tools validated by the loader (arch §8.5)
 
 [tool.ty.rules]
 possibly-unresolved-reference = "warn"

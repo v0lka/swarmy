@@ -12,18 +12,22 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-import swarmy
+from swarmy.modules.loader import builtin_agents_root
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from types import ModuleType
 
 
 def _agents_dir() -> Path:
-    """The ``agents`` folder inside the installed swarmy package."""
-    return Path(swarmy.__file__).resolve().parent / "agents"
+    """The shipped built-in module directory (wheel or editable checkout)."""
+    root = builtin_agents_root()
+    if root is None:  # pragma: no cover - broken installation, loader reports it
+        msg = "built-in agents directory not found"
+        raise RuntimeError(msg)
+    return root
 
 
 #: Source directory of the built-in modules (installed/editable package).

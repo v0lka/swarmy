@@ -292,7 +292,7 @@ def test_user_module_colliding_with_builtin_is_rejected(
     _make_module(builtin_root, "dup", frontmatter="")
     user_root = tmp_path / "user"
     _make_module(user_root, "dup", frontmatter="")
-    monkeypatch.setattr(loader_module, "_builtin_module_dirs", lambda stack: [builtin_root / "dup"])
+    monkeypatch.setattr(loader_module, "_builtin_module_dirs", lambda root: [builtin_root / "dup"])
     message = _load_error_message(ModuleLoader(user_dirs=[user_root]))
     assert "collides with the built-in module at" in message
     assert "built-in modules cannot be overridden (AD-4)" in message
@@ -661,22 +661,44 @@ def test_missing_agents_root_and_empty_loader(tmp_path: Path) -> None:
     assert registry.subagent_dicts() == []
 
 
-def test_builtin_scan_edge_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Built-in scanning tolerates a missing package and a non-directory root."""
-    from contextlib import ExitStack
-    from types import SimpleNamespace
+def test_builtin_scan_edge_cases(tmp_path: Path) -> None:
+    """Built-in scanning tolerates a missing root and an empty root."""
+    assert loader_module._builtin_module_dirs(None) == []
+    empty = tmp_path / "agents"
+    empty.mkdir()
+    assert loader_module._builtin_module_dirs(empty) == []
 
-    def _raise(name: str) -> object:
-        raise ModuleNotFoundError("no swarmy.agents")
 
-    monkeypatch.setattr(loader_module.importlib.resources, "files", _raise)
-    assert loader_module._builtin_module_dirs(ExitStack()) == []
-    monkeypatch.setattr(
-        loader_module.importlib.resources,
-        "files",
-        lambda name: SimpleNamespace(is_dir=lambda: False),
-    )
-    assert loader_module._builtin_module_dirs(ExitStack()) == []
+def test_empty_builtin_root_fails_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty built-in directory is a fail-fast load problem with a clear message."""
+    empty = tmp_path / "agents"
+    empty.mkdir()
+    monkeypatch.setattr(loader_module, "builtin_agents_root", lambda: empty)
+    message = _load_error_message(ModuleLoader(user_dirs=[], include_builtins=True))
+    assert "built-in module directory is empty" in message
+    assert str(empty) in message
+    assert "reinstall the package" in message
+
+
+def test_missing_builtin_root_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing built-in directory is reported as a broken installation."""
+    monkeypatch.setattr(loader_module, "builtin_agents_root", lambda: None)
+    message = _load_error_message(ModuleLoader(user_dirs=[], include_builtins=True))
+    assert "built-in module directory not found" in message
+    assert "reinstall the package" in message
+
+
+def test_builtins_disabled_keeps_the_escape_hatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`include_builtins=False` loads nothing without reporting a broken install."""
+    empty = tmp_path / "agents"
+    empty.mkdir()
+    monkeypatch.setattr(loader_module, "builtin_agents_root", lambda: empty)
+    registry = ModuleLoader(include_builtins=False).load()
+    assert len(registry) == 0
 
 
 # ---------------------------------------------------------------------------

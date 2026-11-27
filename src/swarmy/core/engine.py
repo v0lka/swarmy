@@ -12,9 +12,13 @@ Responsibilities:
   orchestrator toolset, the loaded subagent dicts, the middleware stack
   (``GuardrailMiddleware`` + ``ProjectorMiddleware`` + ``CorrelationMiddleware``
   — the orchestrator carries the same guardrail/projector pair as every
-  subagent, arch §9.1), the HITL ``interrupt_on`` matrix (profile x mode x
-  registry) and the SQLite checkpointer writing into the session's
-  ``memory.sqlite`` (arch §7.1);
+  subagent, arch §9.1), the skills composite (arch §8.6: the read-only
+  ``/skills/`` route of the orchestrator container plus one
+  ``/module-skills/<name>/`` route per module carrying ``skills/`` — L0
+  builds every subagent's ``SkillsMiddleware`` on this same backend;
+  ``None`` keeps the pre-skills L0 assembly unchanged), the
+  HITL ``interrupt_on`` matrix (profile x mode x registry) and the SQLite
+  checkpointer writing into the session's ``memory.sqlite`` (arch §7.1);
 * keep the effective ``interrupt_on`` mapping for the approval-queue origin
   derivation (profile vs mode vs module entries);
 * :meth:`recompile` — rebuild the graph with a different profile or
@@ -36,6 +40,7 @@ from swarmy.core.hitl import (
     StrictnessProfile,
     build_interrupt_config,
 )
+from swarmy.core.skills import build_skills_backend, module_skills_routes
 from swarmy.guardrails.pipeline import GuardrailMiddleware, GuardrailPipeline
 from swarmy.modules.loader import PLATFORM_TOOL_BUDGET_CLASSES
 from swarmy.tools.errors import ToolErrorFeedbackMiddleware
@@ -43,11 +48,13 @@ from swarmy.tools.projector import ProjectorMiddleware
 
 if TYPE_CHECKING:
     from aiosqlite import Connection as AioConnection
+    from deepagents.backends import CompositeBackend
     from langchain.agents.middleware import InterruptOnConfig
     from langchain_core.language_models.chat_models import BaseChatModel
     from langgraph.graph.state import CompiledStateGraph
 
     from swarmy.core.runtime import CorrelationMiddleware
+    from swarmy.core.skills import OrchestratorSkills
     from swarmy.modules.registry import ModuleRegistry
     from swarmy.tools.registry import ToolRegistry
 
@@ -63,6 +70,8 @@ class Engine:
 
     __slots__ = (
         "_checkpointer_connection",
+        "_skills",
+        "_skills_backend",
         "graph",
         "interrupt_config",
         "middleware",
@@ -76,6 +85,9 @@ class Engine:
         interrupt_config: dict[str, bool | InterruptOnConfig],
         checkpointer_connection: AioConnection,
         middleware: list[object],
+        *,
+        skills: OrchestratorSkills | None = None,
+        skills_backend: CompositeBackend | None = None,
     ) -> None:
         """Store the compiled graph, the module registry and the gate facts."""
         self.graph = graph
@@ -83,6 +95,22 @@ class Engine:
         self.interrupt_config = interrupt_config
         self._checkpointer_connection = checkpointer_connection
         self.middleware = middleware
+        self._skills = skills
+        self._skills_backend = skills_backend
+
+    @property
+    def skills(self) -> OrchestratorSkills | None:
+        """The orchestrator skills container wired into the graph, if any."""
+        return self._skills
+
+    @property
+    def skills_backend(self) -> CompositeBackend | None:
+        """The skills composite the graph was compiled with (arch §8.6/§9.1).
+
+        ``None`` when neither the orchestrator container nor any module
+        carries skills (L0 then built its default ``StateBackend``).
+        """
+        return self._skills_backend
 
     @classmethod
     def build(
@@ -102,6 +130,7 @@ class Engine:
         checkpointer_connection: AioConnection,
         modules: ModuleRegistry,
         module_overrides: Mapping[str, bool | InterruptOnConfig] | None = None,
+        skills: OrchestratorSkills | None = None,
     ) -> Engine:
         """Assemble the orchestrator deep-agent (arch §9.1).
 
@@ -137,6 +166,13 @@ class Engine:
             module_overrides: explicit module ``interrupt_on`` entries for
                 the orchestrator's own tools (rare; normally the subagents
                 carry overrides).
+            skills: the validated orchestrator skills container (arch §8.6);
+                ``None`` leaves the orchestrator without the L0
+                ``SkillsMiddleware``. The composite backend is built from it
+                **plus** the ``skills/`` routes of ``modules`` — a module
+                carrying skills is mounted regardless of the orchestrator
+                container; with neither, the graph compiles with the default
+                ``StateBackend`` — the pre-skills assembly.
 
         Returns:
             The compiled engine.
@@ -144,6 +180,7 @@ class Engine:
         interrupt_config = cls._interrupt_matrix(
             tool_registry, profile, mode, significant_tools, module_overrides
         )
+        skills_backend = build_skills_backend(skills, module_skills_routes(modules))
         middleware: list[object] = [
             # The session projector also sanitizes deny feedback inside
             # GuardrailMiddleware (deny bypasses the inner projector, #39);
@@ -165,6 +202,8 @@ class Engine:
             middleware=middleware,
             interrupt_config=interrupt_config,
             checkpointer_connection=checkpointer_connection,
+            skills=skills,
+            skills_backend=skills_backend,
         )
         return cls(
             graph=graph,
@@ -172,6 +211,8 @@ class Engine:
             interrupt_config=interrupt_config,
             checkpointer_connection=checkpointer_connection,
             middleware=middleware,
+            skills=skills,
+            skills_backend=skills_backend,
         )
 
     def recompile(
@@ -217,6 +258,12 @@ class Engine:
             middleware=middleware,
             interrupt_config=interrupt_config,
             checkpointer_connection=self._checkpointer_connection,
+            # The skills composite is part of the assembly, not of the
+            # profile/mode switch: the rebuilt graph keeps the orchestrator
+            # container and every module route (arch §8.6). The module roster
+            # is the one the engine was built with (``self.modules``).
+            skills=self._skills,
+            skills_backend=build_skills_backend(self._skills, module_skills_routes(self.modules)),
         )
         self.interrupt_config = interrupt_config
         self.middleware = middleware
@@ -298,17 +345,33 @@ class Engine:
         middleware: list[object],
         interrupt_config: dict[str, bool | InterruptOnConfig],
         checkpointer_connection: AioConnection,
+        skills: OrchestratorSkills | None,
+        skills_backend: CompositeBackend | None,
     ) -> CompiledStateGraph:
         """The single L0 call of the whole codebase (G3).
 
         The casts mark exactly the untyped seams of ``create_deep_agent``
         (SubAgent dicts, middleware list, model id): swarmy-side values are
         validated by the loader/pipeline before they reach this point.
+
+        Skills (arch §8.6): ``backend=`` is the composite
+        :func:`~swarmy.core.skills.build_skills_backend` built from the
+        orchestrator container and the module ``skills/`` routes (the default
+        ``StateBackend`` cannot read disk paths); ``skills=`` names the
+        orchestrator's ``/skills/`` route as its L0 source, so the
+        orchestrator's ``SkillsMiddleware`` lists and reads the container.
+        L0 builds every subagent's ``SkillsMiddleware`` on the **same**
+        backend: ``mode="fork"`` subagents inherit the orchestrator sources
+        (L0 rule), ``isolated`` ones resolve their module's
+        ``/module-skills/<name>/`` source through the module route. ``None``
+        passes neither argument.
         """
         return create_deep_agent(
             model=model,
             system_prompt=system_prompt,
             tools=list(orchestrator_tools),
+            backend=skills_backend,
+            skills=skills.sources if skills is not None else None,
             subagents=Engine._normalize_subagent_gates(list(subagents)),  # ty: ignore[invalid-argument-type]
             middleware=middleware,  # ty: ignore[invalid-argument-type]
             interrupt_on=interrupt_config,

@@ -1,10 +1,13 @@
-"""Packaging contract for the built-in module directory (arch §3.1/§8.7).
+"""Packaging contract for the built-in module directory and the skills container
+(arch §3.1/§8.6/§8.7).
 
 The reference modules live in ``<repo>/agents`` and are mapped into the wheel
-as ``swarmy/agents`` by hatch's ``force-include``; the sdist carries the same
-directory. These tests pin the build configuration so a pyproject edit cannot
-silently drop the modules from the distribution, and check that the runtime
-resolver finds them in either layout (editable checkout or installed wheel).
+as ``swarmy/agents`` by hatch's ``force-include``; the orchestrator skills
+container ``<repo>/skills`` ships the same way as ``swarmy/skills``; the
+sdist carries both directories. These tests pin the build configuration so a
+pyproject edit cannot silently drop either directory from the distribution,
+and check that the runtime resolvers find them in either layout (editable
+checkout or installed wheel).
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from swarmy.core.skills import builtin_skills_root
 from swarmy.modules.loader import builtin_agents_root
 
 pytestmark = pytest.mark.unit
@@ -38,22 +42,26 @@ def _build_target(name: str) -> dict[str, Any]:
 
 
 class TestBuildConfiguration:
-    """AC: the wheel and sdist both ship ``agents/``."""
+    """AC: the wheel and sdist both ship ``agents/`` and ``skills/``."""
 
-    def test_wheel_maps_agents_into_the_package(self) -> None:
-        """``<repo>/agents`` becomes ``swarmy/agents`` inside the wheel."""
+    def test_wheel_maps_data_directories_into_the_package(self) -> None:
+        """``<repo>/agents`` → ``swarmy/agents`` and ``<repo>/skills`` → ``swarmy/skills``."""
         wheel = _build_target("wheel")
         assert "src/swarmy" in wheel["packages"]
-        assert wheel["force-include"] == {"agents": "swarmy/agents"}
+        assert wheel["force-include"] == {
+            "agents": "swarmy/agents",
+            "skills": "swarmy/skills",
+        }
 
-    def test_sdist_includes_agents(self) -> None:
-        """The source distribution carries the same directory."""
+    def test_sdist_includes_data_directories(self) -> None:
+        """The source distribution carries the same directories."""
         sdist = _build_target("sdist")
         assert "agents" in sdist["include"]
+        assert "skills" in sdist["include"]
 
 
 class TestRuntimeResolution:
-    """AC: the loader resolves the built-ins in either packaging layout."""
+    """AC: the resolvers locate the data directories in either packaging layout."""
 
     def test_repository_agents_directory_holds_reference_modules(self) -> None:
         """The source of truth contains both contract reference modules."""
@@ -69,3 +77,9 @@ class TestRuntimeResolution:
         assert root is not None, "built-in agents directory not found"
         for module in REFERENCE_MODULES:
             assert (root / module / "AGENT.md").is_file()
+
+    def test_builtin_skills_root_finds_the_container(self) -> None:
+        """The skills resolver locates ``skills/`` with its README in either layout."""
+        root = builtin_skills_root()
+        assert root is not None, "orchestrator skills container not found"
+        assert (root / "README.md").is_file()

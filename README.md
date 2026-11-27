@@ -137,6 +137,11 @@ A module is a folder — no engine changes are needed to add one.
 Drop it into a user module directory (for example `my-agents/`, passed via
 `--agents-dir` or the config `agents_dirs`) with this layout:
 
+Skills for the **orchestrator itself** (planning/reporting conventions,
+engagement methodology) go into the repository-root [`skills/`](skills/README.md)
+container instead: every `<skill-name>/SKILL.md` there is loaded automatically into
+the orchestrator context at session start, validated fail-fast and mounted read-only.
+
 ```
 my-agents/my-detector/
 ├── AGENT.md          # required: YAML frontmatter + system prompt

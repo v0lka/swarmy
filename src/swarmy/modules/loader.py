@@ -36,7 +36,11 @@ directories, and for every module directory:
    path), so an aborted load leaves no registered tools behind (#44);
 8. resolves the AD-3 ``result`` reference to a Pydantic class and assembles
    the ``SubAgent`` dict with exactly the arch §8.3 keys, merging the
-   strictness-profile gates with the manifest ``interrupt_on`` (arch §7.2).
+   strictness-profile gates with the manifest ``interrupt_on`` (arch §7.2);
+   a module's ``skills/`` directory is named as the virtual
+   ``/module-skills/<name>/`` L0 source (:func:`module_skills_route`) — never
+   as a disk path, which the default ``StateBackend`` cannot read — and the
+   Engine mounts it read-only through the composite backend (arch §8.6).
 
 Every problem of every module is collected into **one**
 :class:`~swarmy.modules.registry.ModuleLoadError` — a problem in one module
@@ -551,6 +555,91 @@ def _static_scan_problems(tree: ast.Module, path: Path, source: str) -> list[Loa
     ]
 
 
+def scan_skill_scripts(skills_root: Path, source: str) -> list[LoadProblem]:
+    """Statically scan every ``skills/**/*.py`` script under ``skills_root``.
+
+    The one implementation of the skill-script scan (F-2 option b, ASI05),
+    shared by the two skill containers of the system: a module's
+    ``<module>/skills/`` (:meth:`ModuleLoader._scan_skill_scripts`, arch
+    §8.5) and the orchestrator's repository-root ``skills/``
+    (:mod:`swarmy.core.skills`, arch §8.6). Skill scripts execute with
+    operator privileges and are never imported by the loader, so the scan is
+    purely static: the same forbidden-import and raw-egress call-shape rules
+    as ``tools/*.py`` apply. Non-Python scripts are outside the AST scan's
+    reach — the operator vetting rule (SECURITY.md ASI04) covers them; a
+    non-UTF-8 or unparsable ``*.py`` script is a collected problem like any
+    other module file.
+
+    Args:
+        skills_root: the skills container (``<module>/skills`` or ``<repo>/skills``).
+        source: the problem-source label of the container's owner.
+
+    Returns:
+        The collected problems (empty when the root is absent or clean).
+    """
+    problems: list[LoadProblem] = []
+    if not skills_root.is_dir():
+        return problems
+    for script in sorted(skills_root.rglob("*.py")):
+        try:
+            tree = ast.parse(read_utf8(script), filename=str(script))
+        except Utf8Error as exc:
+            problems.append(LoadProblem(source, str(exc)))
+            continue
+        except SyntaxError as exc:
+            problems.append(LoadProblem(source, f"{script.name}: invalid syntax: {exc}"))
+            continue
+        problems.extend(_static_scan_problems(tree, script, source))
+    return problems
+
+
+#: The virtual L0 backend route every module's ``skills/`` directory is
+#: mounted under (arch §8.6/§9.1): ``/module-skills/<module-name>/``. A
+#: separate namespace from the orchestrator's ``/skills/`` container, so a
+#: skill named like a module can never shadow the module route. The default
+#: L0 ``StateBackend`` cannot read disk paths, so the loader never hands the
+#: on-disk directory to L0 — ``Engine`` mounts the directory read-only under
+#: this route through the composite backend (:mod:`swarmy.core.skills`).
+MODULE_SKILLS_ROUTE_PREFIX: Final[str] = "/module-skills/"
+
+#: A module name that hosts skills doubles as a route segment; it must be a
+#: plain path segment (no separators, no ``..``/``~``, no whitespace).
+_MODULE_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
+def module_skills_route(module_name: str) -> str:
+    """The L0 skills source of a module carrying a ``skills/`` directory.
+
+    The loader puts this virtual path into ``SubAgent["skills"]``; the
+    composite backend routes it to the module's read-only ``skills/``
+    directory (arch §8.6). Callers ensure the name is a valid segment with
+    :func:`skills_route_name_problem` first.
+
+    Args:
+        module_name: the manifest ``name`` of the module.
+
+    Returns:
+        ``/module-skills/<module-name>/``.
+    """
+    return f"{MODULE_SKILLS_ROUTE_PREFIX}{module_name}/"
+
+
+def skills_route_name_problem(module_name: str) -> str | None:
+    """Why ``module_name`` cannot host skills, or ``None`` when it can.
+
+    A module with a ``skills/`` directory is mounted under
+    :func:`module_skills_route`, so its name must be usable as a single
+    path segment. Modules without skills are not subject to the rule.
+    """
+    if _MODULE_NAME_PATTERN.fullmatch(module_name) is None:
+        return (
+            f"module name {module_name!r} cannot host skills: it must match "
+            f"{_MODULE_NAME_PATTERN.pattern!r} to be a skills route segment "
+            f"({MODULE_SKILLS_ROUTE_PREFIX}<name>/, arch §8.6)"
+        )
+    return None
+
+
 def _register_event_models(module: ModuleType, unique_name: str, source: str) -> list[LoadProblem]:
     """Register the public payload models of ``tools/event_models.py`` (arch §8.4).
 
@@ -784,6 +873,7 @@ class ModuleLoader:
         self._load_event_models(tools_dir, source, problems)
         self._check_declared_events(manifest, source, problems)
         self._scan_skill_scripts(module_dir, source, problems)
+        self._check_skills_route(module_dir, manifest, source, problems)
         guardrails = self._load_guardrails(module_dir, manifest, source, problems)
         if guardrails is not None:
             self._crosscheck_guardrails(guardrails, platform_tools, module_tools, source, problems)
@@ -919,28 +1009,33 @@ class ModuleLoader:
     def _scan_skill_scripts(
         self, module_dir: Path, source: str, problems: list[LoadProblem]
     ) -> None:
-        """Statically scan every ``skills/**/*.py`` script (F-2 option b, ASI05).
+        """Statically scan every ``skills/**/*.py`` script of the module (ASI05).
 
-        Skill scripts execute with operator privileges and are never imported
-        by the loader, so the scan is purely static: the same forbidden-import
-        and raw-egress call-shape rules as ``tools/*.py`` apply. Non-Python
-        scripts are outside the AST scan's reach — the operator vetting rule
-        (SECURITY.md ASI04) covers them; a non-UTF-8 or unparsable ``*.py``
-        script is a collected problem like any other module file.
+        Delegates to :func:`scan_skill_scripts` — the scan shared with the
+        orchestrator skills container (arch §8.5/§8.6).
         """
-        skills_dir = module_dir / "skills"
-        if not skills_dir.is_dir():
+        problems.extend(scan_skill_scripts(module_dir / "skills", source))
+
+    def _check_skills_route(
+        self,
+        module_dir: Path,
+        manifest: AgentModuleManifest,
+        source: str,
+        problems: list[LoadProblem],
+    ) -> None:
+        """A module carrying ``skills/`` must be mountable under its route (arch §8.6).
+
+        The directory is served through the virtual
+        :func:`module_skills_route` of the composite backend, so the manifest
+        name has to be a valid single path segment; anything else is a
+        collected problem (fail-fast) rather than an L0 source that would
+        silently resolve to nothing.
+        """
+        if not (module_dir / "skills").is_dir():
             return
-        for script in sorted(skills_dir.rglob("*.py")):
-            try:
-                tree = ast.parse(read_utf8(script), filename=str(script))
-            except Utf8Error as exc:
-                problems.append(LoadProblem(source, str(exc)))
-                continue
-            except SyntaxError as exc:
-                problems.append(LoadProblem(source, f"{script.name}: invalid syntax: {exc}"))
-                continue
-            problems.extend(_static_scan_problems(tree, script, source))
+        problem = skills_route_name_problem(manifest.name)
+        if problem is not None:
+            problems.append(LoadProblem(source, problem))
 
     def _crosscheck_guardrails(
         self,
@@ -1180,6 +1275,9 @@ class ModuleLoader:
                 self._judge_band_factory(risks) if self._judge_band_factory is not None else None
             ),
         )
+        # Module skills (arch §8.6): the on-disk directory is mounted by the
+        # Engine under a read-only composite route; the L0 source is that
+        # virtual path — the default ``StateBackend`` cannot read disk paths.
         subagent: dict[str, object] = {
             "name": manifest.name,  # ← arch §8.3
             "description": manifest.description,
@@ -1199,7 +1297,7 @@ class ModuleLoader:
                 ToolErrorFeedbackMiddleware(),
             ],
             "interrupt_on": interrupt_on,
-            "skills": [str(skills_dir)] if skills_dir.is_dir() else [],
+            "skills": [module_skills_route(manifest.name)] if skills_dir.is_dir() else [],
             "response_format": response_format,
         }
         if manifest.model is not None:
@@ -1212,6 +1310,7 @@ class ModuleLoader:
 
 
 __all__ = [
+    "MODULE_SKILLS_ROUTE_PREFIX",
     "PLATFORM_TOOL_BUDGET_CLASSES",
     "LoadProblem",
     "ModuleLoader",
@@ -1220,4 +1319,7 @@ __all__ = [
     "PlatformToolsetFactory",
     "StrictnessProfile",
     "builtin_agents_root",
+    "module_skills_route",
+    "scan_skill_scripts",
+    "skills_route_name_problem",
 ]

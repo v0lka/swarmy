@@ -4,7 +4,7 @@ A session is a portable folder (``session.yaml`` audit snapshot, ``secrets.yaml`
 mode 600, ``memory.sqlite``, ``evidence/``). :meth:`Session.open` builds every
 component **on one Database**, in the arch §13.1 startup order — Database →
 Journal/Bus/Scope/Limiter/ToolRegistry → MemoryStore+SearchIndex →
-ModuleLoader → Engine → ``TargetSet`` — and owns them all: nobody creates a
+ModuleLoader → orchestrator skills → Engine → ``TargetSet`` — and owns them all: nobody creates a
 component "by itself" (arch §2.2). :meth:`Session.resume` is the separate
 restart path (arch §13.1): migrations are skipped when the schema version
 matches, the journal tail is re-read, and the interrupted approvals are
@@ -46,6 +46,7 @@ from swarmy.core.runtime import (
     current_correlation_id,
     resolve_policies,
 )
+from swarmy.core.skills import builtin_skills_root, load_orchestrator_skills
 from swarmy.events.bus import EventBus
 from swarmy.events.emit import EmitEventTool, make_emit_tool
 from swarmy.events.journal import JournalReader, JournalWriter
@@ -634,7 +635,16 @@ class Session:
                 self._require(self.tool_registry).register(
                     ToolSpec(name=name, fn=fn, owner=PLATFORM_OWNER, source=BUILTIN_SOURCE)
                 )
-        # 8. Engine (create_deep_agent + SQLite checkpointer, arch §9.1).
+        # 8. Orchestrator skills (arch §8.6): the shipped ``<repo>/skills/``
+        # container, validated fail-fast before the graph exists; ``None``
+        # (no container / no skill) compiles the engine without the L0
+        # SkillsMiddleware, exactly as before. Module ``skills/`` directories
+        # are not validated here — the loader scanned them (arch §8.5) and
+        # the Engine mounts them as composite routes (arch §8.6).
+        skills = load_orchestrator_skills(builtin_skills_root())
+        # 9. Engine (create_deep_agent + SQLite checkpointer, arch §9.1).
+        #    The engine builds the skills composite from ``skills`` plus the
+        #    module roster: one read-only route per module carrying skills.
         checkpointer_connection = await database.connection("checkpointer")
         self.engine = Engine.build(
             system_prompt=self._orchestrator_prompt(),
@@ -650,8 +660,12 @@ class Session:
             model=model if model is not None else self._model_value(),
             checkpointer_connection=checkpointer_connection,
             modules=self._require(self.modules),
+            skills=skills,
         )
-        # 9. Runtime (single-writer contours) + bus subscription.
+        # 10. Runtime (single-writer contours) + bus subscription. With skills
+        # wired, the first step re-lists the container: a resumed thread keeps
+        # the skill index checkpointed by the previous run (L0 behaviour), so
+        # skills added in between would otherwise stay invisible (arch §8.6).
         self.runtime = OrchestratorRuntime(
             graph=self.engine.graph,
             emit=emit,
@@ -659,9 +673,10 @@ class Session:
             projector=self._require(self.projector),
             approvals=self._require(self.approvals),
             thread_id="orchestrator",
+            reload_skills=skills is not None,
         )
         self.runtime.subscribe(self._require(self.bus).subscribe)
-        # 10. Fresh sessions only: target row + TargetSet event (arch §13.1).
+        # 11. Fresh sessions only: target row + TargetSet event (arch §13.1).
         if fresh:
             store = self._require(self.memory)
             target = await store.save_target(str(self.config.target.base_url))

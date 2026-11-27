@@ -80,6 +80,18 @@ def richlog_text(log: RichLog) -> str:
     return "\n".join(strip.text for strip in log.lines)
 
 
+class GatedModel(ScriptedChatModel):
+    """Scripted model whose answers wait for ``gate`` (a step that takes long)."""
+
+    def __init__(self, gate: asyncio.Event, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._gate = gate
+
+    async def _agenerate(self, messages: Any, stop: Any = None, **kwargs: Any) -> Any:
+        await self._gate.wait()
+        return await super()._agenerate(messages, stop=stop, **kwargs)
+
+
 async def make_session(
     tmp_path: Path,
     scripts: dict[str, list[object]] | None = None,
@@ -87,8 +99,13 @@ async def make_session(
     risk: str = "passive",
     module_name: str = "probe_mod",
     secrets: SecretsConfig | None = None,
+    model: ScriptedChatModel | None = None,
 ) -> Session:
-    """One composed session with a scripted model and one fixture module."""
+    """One composed session with a scripted model and one fixture module.
+
+    ``model`` overrides the scripted default (a gated/slow double for the
+    step-in-progress scenarios).
+    """
     agents = tmp_path / "agents"
     make_module(
         agents,
@@ -97,11 +114,13 @@ async def make_session(
         prompt=f"You are {module_name}: probe the authorized target.",
         risk=risk,  # type: ignore[arg-type]
     )
-    model: ScriptedChatModel | Any
-    if scripts is None:
-        model = one_shot_model()
+    model_: ScriptedChatModel | Any
+    if model is not None:
+        model_ = model
+    elif scripts is None:
+        model_ = one_shot_model()
     else:
-        model = ScriptedChatModel(scripts=scripts, fallback_reply="done")
+        model_ = ScriptedChatModel(scripts=scripts, fallback_reply="done")
     config = SessionConfig(
         target=TargetConfig(base_url="http://127.0.0.1:9/"),
         scope=ScopeEntries(ip_subnets=["127.0.0.1/32"], schemes=["http"]),
@@ -109,7 +128,7 @@ async def make_session(
         profile="normal",
     )
     return await Session.open(
-        config=config, session_dir=tmp_path / "s", secrets=secrets, model=model
+        config=config, session_dir=tmp_path / "s", secrets=secrets, model=model_
     )
 
 
@@ -229,6 +248,75 @@ async def test_opening_goal_starts_the_mission_without_keystrokes(tmp_path: Path
         assert "ack: goal file received" in transcript
         assert "Type your goal" not in transcript
     await session.close()
+
+
+async def test_opening_goal_is_served_while_the_first_step_runs(tmp_path: Path) -> None:
+    """The goal reaches the feed at once; live events keep flowing during a step.
+
+    Regression (the "panels open, nothing happens" report of the goal-file
+    auto-start): the worker used to await ``run_step`` directly, so a step
+    that takes minutes — a ``task()`` delegation runs inside the graph
+    invocation — froze every panel, and the opening goal stayed unserved
+    behind an empty first batch with the "Type your goal" hint on screen for
+    the whole step. The step now runs as a task while the loop keeps serving
+    (arch §10.1).
+    """
+    gate = asyncio.Event()
+    session = await make_session(
+        tmp_path, model=GatedModel(gate, scripts={}, fallback_reply="ack: after the gate")
+    )
+    app = SwarmyTui(session, opening_goal="run the probe")
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(0.3)
+        runtime = session.runtime
+        assert runtime is not None
+        assert runtime.active_calls == 1  # the first step is still inside the model
+        transcript = richlog_text(app.query_one("#chat-log", RichLog))
+        assert "run the probe" in transcript  # served while the step runs
+        assert "Type your goal" not in transcript
+        # a swarm event landing mid-step reaches the panels without waiting
+        journal, bus = session.journal, session.bus
+        assert journal is not None
+        assert bus is not None
+        from swarmy.events.models import EndpointsDiscoveredPayload, EventSource
+
+        envelope = await journal.append(
+            type="EndpointsDiscovered",
+            source=EventSource.PLATFORM,
+            source_detail="test",
+            correlation_id="",
+            payload=EndpointsDiscoveredPayload(endpoints=[], out_of_scope_count=0),
+        )
+        await bus.publish(envelope)
+        await pilot.pause(0.3)
+        assert "EndpointsDiscovered" in richlog_text(app.query_one("#activity-log", RichLog))
+        assert runtime.active_calls == 1  # still the one step (AD-8: single writer)
+        gate.set()
+        await pilot.pause(0.5)
+        assert "ack: after the gate" in richlog_text(app.query_one("#chat-log", RichLog))
+        assert runtime.active_calls == 0
+    await session.close()
+
+
+async def test_console_closes_while_a_step_is_still_running(tmp_path: Path) -> None:
+    """ctrl+q during a long step: the step task is cancelled, the console exits.
+
+    The step runs as a task (arch §10.1), so app shutdown cancels it instead
+    of waiting for a model that may answer minutes later.
+    """
+    gate = asyncio.Event()
+    session = await make_session(
+        tmp_path, model=GatedModel(gate, scripts={}, fallback_reply="never delivered")
+    )
+    app = SwarmyTui(session, opening_goal="run the probe")
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(0.3)
+        runtime = session.runtime
+        assert runtime is not None
+        assert runtime.active_calls == 1
+        # leaving the context quits the app with the step still inside the model
+    await session.close()
+    assert gate.is_set() is False  # the model never answered: the step was cancelled
 
 
 async def test_without_an_opening_goal_the_console_stays_idle(tmp_path: Path) -> None:

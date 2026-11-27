@@ -11,7 +11,7 @@ Instructions for AI coding agents working in this repository. Follow them togeth
 
 ## Current status: v0.1 implemented
 
-The repository contains the implemented v0.1 codebase, not only design documents: `pyproject.toml` (package `swarmy` 0.1.0), `src/swarmy/` (`core`, `events`, `memory`, `tools`, `guardrails`, `modules`, `report`, `tui`, `cli`), `tests/` (`unit` + `integration`), the built-in modules under `agents/`, demo material under `demos/` and launchers under `scripts/run/`. In `docs/development/roadmap.md` all 257 task acceptance criteria across milestones M1–M5 (phases F0–F6) are checked — use the roadmap for traceability of the existing implementation, not as a bootstrap list. The design documents remain canonical (see below); the operator-facing guide is `docs/userguide.md` (Russian translation: `docs/userguide-ru.md`).
+The repository contains the implemented v0.1 codebase, not only design documents: `pyproject.toml` (package `swarmy` 0.1.0), `src/swarmy/` (`core`, `events`, `memory`, `tools`, `guardrails`, `modules`, `report`, `tui`, `cli`), `tests/` (`unit` + `integration`), the built-in modules under `agents/`, the orchestrator skills container under `skills/`, demo material under `demos/` and launchers under `scripts/run/`. In `docs/development/roadmap.md` all 257 task acceptance criteria across milestones M1–M5 (phases F0–F6) are checked — use the roadmap for traceability of the existing implementation, not as a bootstrap list. The design documents remain canonical (see below); the operator-facing guide is `docs/userguide.md` (Russian translation: `docs/userguide-ru.md`).
 
 ## Design documents are canonical
 
@@ -106,8 +106,10 @@ Built-in reference modules live in `agents/<name>/` at the repository root (ship
 
 - `AGENT.md` — required: YAML frontmatter (`name`, `description`; optional `model`, `mode: isolated|fork`, `interrupt_on` (add-only gates), `events`, `guardrails`, `result` = `"<module>/tools/result.py:ClassName"` → `response_format`) + system prompt as the body. Frontmatter maps onto the deepagents `SubAgent` dict.
 - `tools/` — optional Python tools: fully typed arguments/results, LLM-facing docstrings. Reserved platform prefixes (`memory_`, `event_`, `session_`) are forbidden in custom tool names; collisions fail-fast at session start.
-- `skills/` — optional, following the agentskills.io spec (`SKILL.md` + `scripts/`, `references/`, `assets/`).
+- `skills/` — optional, following the agentskills.io spec (`SKILL.md` + `scripts/`, `references/`, `assets/`). It reaches the subagent's L0 `SkillsMiddleware` through the read-only composite route `/module-skills/<module-name>/` (arch §8.6, AD-10 — never as a disk path, which the default `StateBackend` cannot read); a module carrying `skills/` must therefore have a path-segment `name` (`^[A-Za-z0-9][A-Za-z0-9_-]*$`).
 - `guardrails.yaml` — optional module rules; declarative predicates only (`any_param_matches`, `url_matches`, `header_matches`, `body_size_above`, `tool_in`).
+
+**Orchestrator skills** are a separate container: the repository-root `skills/<skill-name>/` directory (`SKILL.md` + optional `scripts/`, `references/`, `assets/`, shipped as `swarmy/skills`). Every skill in it is loaded automatically into the orchestrator context at session start (`src/swarmy/core/skills.py`, arch §8.6): validated fail-fast (one `SkillsError` with every problem), mounted read-only under the `/skills/` route (the same composite backend carries the `/module-skills/<name>/` module routes), inherited by `mode: fork` subagents. See `skills/README.md`.
 
 The built-in `crawler` and `xss-detector` modules are the reference implementations of this contract — follow their structure.
 

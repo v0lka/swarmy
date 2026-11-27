@@ -47,10 +47,12 @@ build-backend = "hatchling.build"
 packages = ["src/swarmy"]
 # Built-in modules live in <repo>/agents (the source of truth) and ship inside
 # the package as swarmy/agents; ModuleLoader resolves that directory (arch §8.7).
-force-include = {"agents" = "swarmy/agents"}
+# The orchestrator skills container <repo>/skills ships the same way as
+# swarmy/skills and is resolved by core/skills.py (arch §8.6).
+force-include = {"agents" = "swarmy/agents", "skills" = "swarmy/skills"}
 
 [tool.hatch.build.targets.sdist]
-include = ["src/swarmy", "agents", "README.md", "LICENSE", "pyproject.toml"]
+include = ["src/swarmy", "agents", "skills", "README.md", "LICENSE", "pyproject.toml"]
 
 # ---- ruff: strict set in the spirit of upstream deepagents (arch §3.2, §15.3) ----
 [tool.ruff]

@@ -300,6 +300,62 @@ class TestSingleWriter:
         assert graph.invocations == []
 
 
+class TestSkillsReload:
+    """AC (arch §8.6): the L0 skills reload trigger rides the first committed step only."""
+
+    @staticmethod
+    def _runtime(graph: MockGraph, emit: RecordingEmit) -> OrchestratorRuntime:
+        return OrchestratorRuntime(
+            graph=graph,
+            emit=emit,
+            policies=resolve_policies(None),
+            projector=ContextProjector(),
+            approvals=ApprovalQueue(),
+            reload_skills=True,
+        )
+
+    async def test_first_step_input_carries_the_reload_trigger(self) -> None:
+        graph, emit = MockGraph(), RecordingEmit()
+        runtime = self._runtime(graph, emit)
+        await runtime.run_step("one")
+        await runtime.run_step("two")
+        first, second = graph.invocations
+        assert isinstance(first, dict)
+        assert isinstance(second, dict)
+        assert first["skills_metadata"] is None
+        assert "skills_metadata" not in second
+
+    async def test_noop_step_does_not_consume_the_trigger(self) -> None:
+        """An empty step (nothing to inject) leaves the trigger for the first real one."""
+        graph, emit = MockGraph(), RecordingEmit()
+        runtime = self._runtime(graph, emit)
+        assert await runtime.run_step() is None
+        await runtime.run_step("go")
+        first = graph.invocations[0]
+        assert isinstance(first, dict)
+        assert "skills_metadata" in first
+
+    async def test_failed_step_keeps_the_trigger_for_the_retry(self) -> None:
+        """A step that fails before committing did not serve the reload."""
+        graph, emit = MockGraph(fail_invocations=True), RecordingEmit()
+        runtime = self._runtime(graph, emit)
+        with pytest.raises(RuntimeError, match="provider hiccup"):
+            await runtime.run_step("one")
+        graph.fail_invocations = False
+        await runtime.run_step("two")
+        retry = graph.invocations[0]
+        assert isinstance(retry, dict)
+        assert "skills_metadata" in retry
+
+    async def test_default_runtime_never_sends_the_trigger(self) -> None:
+        graph, emit = MockGraph(), RecordingEmit()
+        runtime = _make_runtime(graph, emit)
+        await runtime.run_step("plain")
+        first = graph.invocations[0]
+        assert isinstance(first, dict)
+        assert "skills_metadata" not in first
+
+
 class TestResumeWatermark:
     """T3.2.4 support: the resume scan seeds the watermark (Issue #27).
 

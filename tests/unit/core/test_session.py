@@ -17,7 +17,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from tests.helpers.fake_models import ScriptedChatModel, one_shot_model
+from tests.helpers.fake_models import ScriptedChatModel, final_reply, one_shot_model, task_call
 
 from swarmy.core.config import ScopeEntries, SessionConfig, TargetConfig
 from swarmy.core.session import Session, SessionError
@@ -177,6 +177,219 @@ async def test_orchestrator_has_the_subagent_middleware_stack(
         assert isinstance(session.engine.middleware[2], CorrelationMiddleware)
         assert engine_types[-1] is subagent_types[-1]
         assert engine_types[-1].__name__ == "ToolErrorFeedbackMiddleware"
+    finally:
+        await session.close()
+
+
+# ---- orchestrator skills (arch §8.6) ----
+
+
+@pytest.fixture
+def skills_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the session at a temporary orchestrator skills container."""
+    root = tmp_path / "skills"
+    root.mkdir()
+    (root / "web-research").mkdir()
+    (root / "web-research" / "SKILL.md").write_text(
+        "---\nname: web-research\ndescription: Map a web target before delegating.\n"
+        "---\n# Instructions\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("swarmy.core.session.builtin_skills_root", lambda: root)
+    return root
+
+
+async def _loaded_skill_names(session: Session) -> list[str]:
+    """The skill index the L0 SkillsMiddleware wrote into the graph state."""
+    assert session.engine is not None
+    assert session.runtime is not None
+    snapshot = await session.engine.graph.aget_state(session.runtime.config)
+    metadata = snapshot.values.get("skills_metadata") or []
+    return [str(item["name"]) for item in metadata]
+
+
+async def test_orchestrator_skills_reach_the_graph_context(
+    tmp_path: Path, module_dir: Path, model: ScriptedChatModel, skills_root: Path
+) -> None:
+    """Every skill of the container is listed in the orchestrator's L0 state and prompt."""
+    session = await Session.open(
+        config=_config(tmp_path, module_dir), session_dir=tmp_path / "s", model=model
+    )
+    try:
+        assert session.engine is not None
+        assert session.engine.skills is not None
+        assert session.engine.skills.names == ("web-research",)
+        await session.runtime.run_step("hello")
+        assert await _loaded_skill_names(session) == ["web-research"]
+        # progressive disclosure: the index (name + description) reached the
+        # orchestrator's system message on the first model call
+        assert any("web-research" in prompt for prompt in model.system_prompts)
+    finally:
+        await session.close()
+
+
+async def test_session_without_a_container_compiles_without_skills(
+    tmp_path: Path, module_dir: Path, model: ScriptedChatModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No container → the pre-skills assembly (no L0 SkillsMiddleware)."""
+    monkeypatch.setattr("swarmy.core.session.builtin_skills_root", lambda: None)
+    session = await Session.open(
+        config=_config(tmp_path, module_dir), session_dir=tmp_path / "s", model=model
+    )
+    try:
+        assert session.engine is not None
+        assert session.runtime is not None
+        assert session.engine.skills is None
+        assert session.engine.skills_backend is None
+        await session.runtime.run_step("hello")
+        assert await _loaded_skill_names(session) == []
+    finally:
+        await session.close()
+
+
+async def test_broken_skills_container_fails_the_session_start(
+    tmp_path: Path, model: ScriptedChatModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-skill directory aborts ``open`` before any LLM call (fail-fast)."""
+    from swarmy.core.skills import SkillsError
+
+    root = tmp_path / "skills"
+    root.mkdir()
+    (root / "drafts").mkdir()
+    monkeypatch.setattr("swarmy.core.session.builtin_skills_root", lambda: root)
+    with pytest.raises(SkillsError, match="drafts: not a skill"):
+        await Session.open(config=_config(tmp_path), session_dir=tmp_path / "s", model=model)
+    # fail-fast: the orchestrator never ran a step
+    assert model.system_prompts == []
+
+
+async def test_resumed_session_picks_up_skills_added_between_runs(
+    tmp_path: Path, module_dir: Path, model: ScriptedChatModel, skills_root: Path
+) -> None:
+    """The first step of a resumed thread re-lists the container (L0 reload trigger)."""
+    session_dir = tmp_path / "s"
+    first = await Session.open(
+        config=_config(tmp_path, module_dir), session_dir=session_dir, model=model
+    )
+    await first.runtime.run_step("hello")
+    assert await _loaded_skill_names(first) == ["web-research"]
+    await first.close()
+    (skills_root / "reporting").mkdir()
+    (skills_root / "reporting" / "SKILL.md").write_text(
+        "---\nname: reporting\ndescription: Report conventions.\n---\n# Body\n",
+        encoding="utf-8",
+    )
+    resumed = await Session.resume(session_dir=session_dir, model=model)
+    try:
+        await resumed.runtime.run_step("continue")
+        assert sorted(await _loaded_skill_names(resumed)) == ["reporting", "web-research"]
+    finally:
+        await resumed.close()
+
+
+async def test_mode_switch_keeps_the_skills_container(
+    tmp_path: Path, module_dir: Path, model: ScriptedChatModel, skills_root: Path
+) -> None:
+    """``recompile`` rebuilds the graph with the same skills (arch §9.5)."""
+    session = await Session.open(
+        config=_config(tmp_path, module_dir), session_dir=tmp_path / "s", model=model
+    )
+    try:
+        assert session.engine is not None
+        await session.set_mode("mission", model=model)  # explicit: no L0 default flip
+        assert session.engine.skills is not None
+        await session.runtime.run_step("hello")
+        assert await _loaded_skill_names(session) == ["web-research"]
+    finally:
+        await session.close()
+
+
+# ---- module skills (arch §8.6, AD-9) ----
+
+
+@pytest.fixture
+def skilled_agents_dir(tmp_path: Path) -> Path:
+    """A user module carrying ``skills/<skill>/SKILL.md`` (no orchestrator container)."""
+    module = tmp_path / "agents" / "skilled"
+    module.mkdir(parents=True)
+    (module / "AGENT.md").write_text(
+        "---\nname: skilled\ndescription: Module with its own skill.\n---\n"
+        "You are the skilled module.\n",
+        encoding="utf-8",
+    )
+    skill = module / "skills" / "probe-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: probe-skill\ndescription: Probe the module skills route.\n---\n# Body\n",
+        encoding="utf-8",
+    )
+    return tmp_path / "agents"
+
+
+async def test_module_skills_reach_the_subagent_without_an_orchestrator_container(
+    tmp_path: Path, skilled_agents_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A module's ``skills/`` is mounted read-only and listed by the subagent's L0 middleware.
+
+    Before AD-9 the loader handed the disk path to L0, which the default
+    ``StateBackend`` cannot read — the subagent silently ran without skills.
+    """
+    monkeypatch.setattr("swarmy.core.session.builtin_skills_root", lambda: None)
+    model = ScriptedChatModel(
+        scripts={
+            "orchestrator": [
+                task_call("run the skilled module", "skilled", "call-s1"),
+                final_reply("done"),
+            ],
+            "skilled": [final_reply("probed")],
+        }
+    )
+    session = await Session.open(
+        config=_config(tmp_path, skilled_agents_dir), session_dir=tmp_path / "s", model=model
+    )
+    try:
+        assert session.engine is not None
+        assert session.runtime is not None
+        # no orchestrator container, yet a composite carrying the module route
+        assert session.engine.skills is None
+        backend = session.engine.skills_backend
+        assert backend is not None
+        assert set(backend.routes) == {"/module-skills/skilled/"}
+        listing = backend.ls("/module-skills/skilled/")
+        assert [entry["path"] for entry in listing.entries or []] == [
+            "/module-skills/skilled/probe-skill/"
+        ]
+        await session.runtime.run_step("hello")
+        subagent_prompts = [prompt for prompt in model.system_prompts if "skilled module" in prompt]
+        assert subagent_prompts, "the skilled subagent never ran"
+        assert "- **probe-skill**: Probe the module skills route." in subagent_prompts[0]
+        # the module skill is the subagent's, not the orchestrator's (isolated mode)
+        orchestrator_prompts = [
+            prompt for prompt in model.system_prompts if "skilled module" not in prompt
+        ]
+        assert orchestrator_prompts
+        assert all("probe-skill" not in prompt for prompt in orchestrator_prompts)
+    finally:
+        await session.close()
+
+
+async def test_mode_switch_keeps_the_module_skills_route(
+    tmp_path: Path,
+    skilled_agents_dir: Path,
+    model: ScriptedChatModel,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``recompile`` rebuilds the composite with the module routes (arch §9.5)."""
+    monkeypatch.setattr("swarmy.core.session.builtin_skills_root", lambda: None)
+    session = await Session.open(
+        config=_config(tmp_path, skilled_agents_dir), session_dir=tmp_path / "s", model=model
+    )
+    try:
+        assert session.engine is not None
+        await session.set_mode("mission", model=model)
+        backend = session.engine.skills_backend
+        assert backend is not None
+        assert set(backend.routes) == {"/module-skills/skilled/"}
     finally:
         await session.close()
 

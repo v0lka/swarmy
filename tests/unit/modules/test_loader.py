@@ -17,7 +17,12 @@ import pytest
 from swarmy.events.models import EVENT_TYPES, EventRegistry
 from swarmy.guardrails.pipeline import GuardrailMiddleware
 from swarmy.modules import loader as loader_module
-from swarmy.modules.loader import ModuleLoader, PlatformToolsetFactory
+from swarmy.modules.loader import (
+    MODULE_SKILLS_ROUTE_PREFIX,
+    ModuleLoader,
+    PlatformToolsetFactory,
+    module_skills_route,
+)
 from swarmy.modules.registry import ModuleLoadError
 from swarmy.tools.errors import ToolErrorFeedbackMiddleware
 from swarmy.tools.projector import ProjectorMiddleware
@@ -626,14 +631,57 @@ def test_annotation_gaps_and_nested_any(tmp_path: Path) -> None:
 
 
 def test_skills_dir_is_attached_when_present(tmp_path: Path) -> None:
-    """``skills=[<dir>/skills/]`` when the folder exists (arch §8.3)."""
+    """``skills=["/module-skills/<name>/"]`` when the folder exists (arch §8.3).
+
+    The L0 source is the virtual composite route, never the disk path: the
+    default ``StateBackend`` cannot read disk paths (arch §8.6/AD-9).
+    """
     root = tmp_path / "agents"
-    module_dir = _make_module(root, "skilled", skills=True)
+    _make_module(root, "skilled", skills=True)
     factory, _calls = _recording_factory()
     registry = ModuleLoader(
         user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
     ).load()
-    assert registry.get("skilled").subagent["skills"] == [str(module_dir / "skills")]
+    assert registry.get("skilled").subagent["skills"] == ["/module-skills/skilled/"]
+    assert module_skills_route("skilled") == f"{MODULE_SKILLS_ROUTE_PREFIX}skilled/"
+
+
+def test_module_skills_route_name_must_be_a_path_segment(tmp_path: Path) -> None:
+    """A module with ``skills/`` whose name cannot be a route segment fails fast.
+
+    The problem is collected like every other module problem and names the
+    rule; a module without ``skills/`` keeps any name (the rule exists only
+    because the name doubles as the composite route segment).
+    """
+    root = tmp_path / "agents"
+    _make_module(root, "odd dir", skills=True)
+    _make_module(root, "fine", skills=True)
+    _make_module(root, "odd dir too", manifest_name="also odd")  # no skills: unconstrained
+    factory, _calls = _recording_factory()
+    with pytest.raises(ModuleLoadError) as excinfo:
+        ModuleLoader(
+            user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
+        ).load()
+    message = str(excinfo.value)
+    assert "module name 'odd dir' cannot host skills" in message
+    assert "to be a skills route segment" in message
+    assert "fine" not in message
+    assert "also odd" not in message
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["crawler", "xss-detector", "e2e_crawler", "M1", "a" * 64],
+)
+def test_route_safe_module_names_host_skills(name: str, tmp_path: Path) -> None:
+    """Letters, digits, ``_`` and ``-`` (leading alnum) are valid route segments."""
+    root = tmp_path / "agents"
+    _make_module(root, "mod", manifest_name=name, skills=True)
+    factory, _calls = _recording_factory()
+    registry = ModuleLoader(
+        user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
+    ).load()
+    assert registry.get(name).subagent["skills"] == [f"/module-skills/{name}/"]
 
 
 def test_bare_module_without_tools_loads_with_platform_toolset(tmp_path: Path) -> None:

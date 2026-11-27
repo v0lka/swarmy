@@ -403,7 +403,9 @@ Behavior:
   session folder with `0600` permissions (§4.3);
 - with `--goal-file PATH`, or when `goal.md` lies next to the config file, the
   console sends its text as the first chat message on start: the mission begins
-  by itself, no typing needed (`--resume` never auto-starts);
+  by itself, no typing needed (`--resume` never auto-starts). The first
+  orchestrator step may take minutes (a `task()` delegation runs inside it) —
+  the panels keep updating while it runs;
 - the CLI always brings up the TUI console: there is no headless mode in v0.1;
 - `swarmy` without arguments prints the help and does not pull in the heavy
   L0 stack.
@@ -1256,12 +1258,40 @@ optionally `license`, `compatibility`, `metadata`) and resources in `scripts/`,
 progressive disclosure (metadata → instructions → resources). The skill's own
 tools are wired via `metadata.include_tools`. The loader does not parse
 `SKILL.md`: it statically scans `skills/**/*.py` with the same
-forbidden-import rules as `tools/*.py` and passes the `skills/` directory to
-the L0 `SkillsMiddleware`, which validates the frontmatter itself at runtime
-(an invalid skill is skipped with a warning, not a load error). Every subagent
+forbidden-import rules as `tools/*.py` and mounts the `skills/` directory
+**read-only** under the virtual route `/module-skills/<module-name>/`, naming
+that route as the source of the subagent's L0 `SkillsMiddleware` (the subagent
+can list and read its skills but never write, edit or delete them). L0
+validates the frontmatter itself at runtime (an invalid skill is skipped with
+a warning, not a load error). Because the module name doubles as the route
+segment, a module with a `skills/` directory must have a name made of letters,
+digits, `_` or `-` (starting with a letter or digit) — anything else is a load
+error at session start. Every subagent
 has an isolated set of skills; `mode: fork` inherits the parent's skills and
 has none of its own — L0 raises at graph build when `mode: fork` is combined
 with a module that has a `skills/` directory, so do not mix the two.
+
+**Orchestrator skills** are a second, independent container: the repository-root
+`skills/<skill-name>/` directory (next to `agents/`, shipped as `swarmy/skills`). Every
+skill in it is loaded **automatically into the orchestrator's context** at session
+start — there is no config key and no manifest entry; drop a directory with a
+`SKILL.md` into `skills/` and the next session sees it (a resumed session re-reads the
+container on its first step). The rules are stricter than for module skills, because
+these skills carry instruction authority for the orchestrator itself:
+
+* the whole container is validated **fail-fast** before the first LLM call: every
+  subdirectory must be a skill (`SKILL.md` present and not a symlink; `name` ≤64
+  lowercase alphanumeric with single hyphens **and equal to the directory name**;
+  `description` ≤1024; `compatibility` ≤500), and every `skills/**/*.py` script must
+  pass the same forbidden-import scan as module tools — any problem aborts the start
+  with the complete `SkillsError` list instead of silently skipping the skill;
+* the container reaches the agent through a **read-only** `/skills/` route: the
+  orchestrator (and any `mode: fork` subagent, which inherits the orchestrator's skills)
+  can list and read skills but cannot write, edit or delete them;
+* `isolated` subagents do not see these skills — give a module its own `skills/` when
+  its subagent needs them.
+
+Layout and an example frontmatter: `skills/README.md`.
 
 ### 11.11. Step-by-step tutorial: a module from scratch
 

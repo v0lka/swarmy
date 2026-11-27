@@ -56,7 +56,8 @@ points:
 | `interrupt_on` parameter (`InterruptOnConfig`) | HITL gates per tool risk classes | `core/hitl.py` |
 | `checkpointer` parameter | persistence of interrupts and state | `core/engine.py` (SQLite checkpointer) |
 | `response_format` parameter / `SubAgent["response_format"]` | typed task result | `modules/loader.py` (schemas from modules) |
-| `skills` parameter / `SubAgent` skills | skills per the agentskills.io spec | `modules/loader.py` |
+| `skills` parameter / `SubAgent` skills | skills per the agentskills.io spec — the orchestrator's repository-root `skills/` container (`/skills/`) and each module's `skills/` (`/module-skills/<name>/`); both are **virtual composite routes**, never disk paths (AD-10) | `core/skills.py`, `core/engine.py` (composite); `modules/loader.py` (module routes) |
+| `backend` parameter (`CompositeBackend` over `StateBackend` + read-only `FilesystemBackend` routes) | disk access for the skills containers only (`/skills/` and `/module-skills/<name>/` virtual routes) | `core/skills.py`, `core/engine.py` |
 | `model` parameter (`"provider:model"`) | any tool-calling models (D1) | `core/engine.py` |
 | deepagents MCP support | platform MCP servers | `core/engine.py`, session config |
 
@@ -90,6 +91,7 @@ Additional layer rules:
 | `SessionConfig` | `core/config.py` | session config schema, loading, profile and limit resolution | config objects (Pydantic) |
 | `Database` | `core/database.py` | single aiosqlite connection to `memory.sqlite`, WAL, migrations | connection, write lock |
 | `Engine` | `core/engine.py` | `create_deep_agent` assembly (orchestrator + subagents + checkpointer) | compiled graph |
+| `OrchestratorSkills` | `core/skills.py` | the repository-root `skills/` container: resolution, fail-fast validation (§8.6); with `build_skills_backend`/`module_skills_routes` it also assembles the composite every skills container is mounted through (orchestrator `/skills/` + module `/module-skills/<name>/` routes) | validated skill names, the composite backend |
 | `OrchestratorRuntime` | `core/runtime.py` | three orchestrator loops (§9.2), single-writer for the graph | notification queue, graph tasks |
 | `ApprovalQueue` | `core/hitl.py` | queue of HITL interrupts, resume decisions, profiles → `interrupt_on` | pending interrupts |
 | `EventBus` | `events/bus.py` | in-memory asyncio pub/sub | subscriptions, subscriber queues |
@@ -193,7 +195,8 @@ swarmy2/
 │       │   ├── engine.py           # Engine: create_deep_agent, checkpointer (§9.1)
 │       │   ├── runtime.py          # OrchestratorRuntime: loops, single-writer (§9.2)
 │       │   ├── hitl.py             # ApprovalQueue, profiles → interrupt_on (§7)
-│       │   └── prompts.py          # orchestrator system prompt, notification templates
+│       │   ├── prompts.py          # orchestrator system prompt, notification templates
+│       │   └── skills.py           # skills containers: resolve/validate the orchestrator's; the read-only composite (orchestrator + module routes, §8.6)
 │       ├── events/
 │       │   ├── models.py           # EventEnvelope, payload models, EventRegistry (§5)
 │       │   ├── emit.py             # emit_event tool factory
@@ -249,6 +252,8 @@ swarmy2/
 │       ├── AGENT.md
 │       ├── guardrails.yaml
 │       └── tools/
+├── skills/                         # orchestrator skills container: <skill-name>/SKILL.md (§8.6)
+│   └── README.md                   # layout + rules; loose files at the root are not skills
 └── tests/
     ├── unit/                       # mirror the packages; gate ≥ 85% (§15)
     ├── integration/                # end-to-end scenarios; gate ≥ 70%
@@ -263,6 +268,14 @@ Notes:
   (`force-include`), and the loader finds it both in the installed package and in an
   editable checkout. User modules are not placed in this directory — a separate
   directory is used for them (`--agents-dir`).
+- `skills/` at the repository root is the **orchestrator skills container** (arch §8.6):
+  every `<skill-name>/SKILL.md` in it is loaded into the orchestrator context
+  automatically. It ships the same way as `agents/` (`force-include` →
+  `swarmy/skills`, included in the sdist) and is resolved by
+  `core/skills.py:builtin_skills_root()` in both layouts. Module skills stay
+  inside their module directory (`agents/<module>/skills/`) and are mounted
+  read-only through the same composite under `/module-skills/<name>/` (AD-10);
+  the two containers are independent.
 - `docs/` is not part of the distribution; the package is built from `src/swarmy` +
   `agents`.
 
@@ -274,8 +287,8 @@ Notes:
 | `[project.scripts]` | `swarmy = "swarmy.cli:main"` |
 | `[project] dependencies` | `deepagents>=0.7.41,<0.8` (D18), `pydantic>=2,<3` (D9), `httpx`, `textual`, `rich`, `jinja2>=3.1`, `aiosqlite`, `langgraph-checkpoint-sqlite` |
 | `[dependency-groups] dev` | `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `ty` (type checker; the fallback is `mypy`, chosen in F0), `aiohttp` (fixture echo app) |
-| `[tool.hatch.build.targets.wheel]` | `packages = ["src/swarmy"]`, `force-include = {"agents" = "swarmy/agents"}` — the built-in modules from the root `agents/` are shipped inside the package |
-| `[tool.hatch.build.targets.sdist]` | `include = ["src/swarmy", "agents", "README.md", "LICENSE", "pyproject.toml"]` — module sources are included in the sdist |
+| `[tool.hatch.build.targets.wheel]` | `packages = ["src/swarmy"]`, `force-include = {"agents" = "swarmy/agents", "skills" = "swarmy/skills"}` — the built-in modules and the orchestrator skills container from the repository root are shipped inside the package |
+| `[tool.hatch.build.targets.sdist]` | `include = ["src/swarmy", "agents", "skills", "README.md", "LICENSE", "pyproject.toml"]` — module sources and the skills container are included in the sdist |
 | `[tool.ruff]` | strict rule set in the spirit of upstream deepagents: no `Any` in domain code (`ANN401`), mandatory annotations, `I`, `UP`, `B` |
 | `[tool.ty]` / `[tool.mypy]` | strict: `disallow_any_explicit`, `disallow_untyped_defs`, `warn_return_any` |
 | `[tool.pytest.ini_options]` | `asyncio_mode = "auto"`, markers `unit` / `integration` |
@@ -1019,7 +1032,8 @@ explicit field for fail-fast validation.
 `tools/` are not declared in the frontmatter: the loader wires up all the contents of
 `tools/` and `skills/` automatically. Each subagent has its own isolated
 skills-middleware (L0 behavior; `mode="fork"` inherits the parent's skills and has none
-of its own — see §4.4 spec and the L0 limitations).
+of its own — see §4.4 spec and the L0 limitations); the module's `skills/` reaches
+that middleware through the composite route `/module-skills/<name>/` (§8.6, AD-10).
 
 ### 8.3. Loading and assembly (`ModuleLoader`, `modules/loader.py`)
 
@@ -1037,7 +1051,7 @@ scan (user dirs + built-in modules: <package>/agents in the wheel, <repo>/agents
          "tools": [platform_tools + module_tools],
          "middleware": [GuardrailMiddleware(invariants, engine_rules, module_rules)],
          "interrupt_on": merge(profile_gates, manifest.interrupt_on),
-         "skills": [<dir>/skills/],
+         "skills": ["/module-skills/<name>/"],   # virtual composite route (§8.6) — never a disk path (AD-10)
          "response_format": imported_model | None,
        }
   └▶ ModuleRegistry: module names, event declarations → creation of the orchestrator graph
@@ -1094,8 +1108,66 @@ Full compliance with the agentskills.io specification: `SKILL.md` (frontmatter `
 ≤64, `description` ≤1024; optionally `license`, `compatibility`, `metadata`), resources
 in `scripts/`, `references/`, `assets/`. The built-in L0 skills-middleware is used as
 is (progressive disclosure: metadata → instructions → resources). A skill's own tools
-— `metadata.include_tools` (an L0 extension). The loader validates skill frontmatter
-(the same field limits) — skill errors go into the common fail-fast list.
+— `metadata.include_tools` (an L0 extension). The loader statically scans every
+`skills/**/*.py` script of both containers (ASI05) and, for a module carrying
+skills, requires the module name to be a valid route segment (below); the
+orchestrator container's frontmatter is validated fail-fast (below), a module
+skill's frontmatter is validated by L0 itself at subagent start (an invalid skill
+is skipped with a warning).
+
+**Two containers, one L0 mechanism.** *Module skills* live in `agents/<module>/skills/`
+and are wired by the loader into that module's `SubAgent` dict as the **virtual**
+source `skills=["/module-skills/<name>/"]` (§8.3) — `Engine` mounts the directory
+read-only under that route in the composite backend (below). *Orchestrator skills*
+live in the **repository-root `skills/<skill-name>/`** container (shipped as
+`swarmy/skills`, resolved by `core/skills.py:builtin_skills_root()` in both layouts —
+the D40 mechanism) and are loaded **automatically into the orchestrator context** at
+every session start, with no config key: `Session._compose` calls
+`load_orchestrator_skills(root)`, and `Engine.build` hands the result to
+`create_deep_agent(skills=["/skills/"], backend=...)`. `mode="fork"` subagents inherit
+the orchestrator's skills (L0 rule, §8.2); `isolated` subagents keep only their module
+skills. **Why routes, not disk paths (AD-10):** L0 builds every subagent's
+`SkillsMiddleware` on the *same* backend the orchestrator was compiled with, and the
+default `StateBackend` keeps files in graph state — a disk path handed to it resolves
+to nothing, silently. `build_skills_backend(orchestrator, module_skills_routes(modules))`
+therefore produces one `CompositeBackend(default=StateBackend(), routes={...})` with a
+read-only route per container, and L0 resolves both `/skills/` and
+`/module-skills/<name>/` through it. The module namespace is separate from the
+orchestrator's so a skill named like a module can never shadow the module route.
+
+What `core/skills.py` adds on top of the L0 middleware:
+
+* **Fail-fast validation** (`load_orchestrator_skills`, invariant 10): every immediate
+  subdirectory must be a skill — `SKILL.md` present (not a symlink), frontmatter
+  `name` (agentskills.io naming rules, ≤64, equal to the directory name) and
+  `description` (≤1024, `compatibility` ≤500); every `skills/**/*.py` script passes the
+  shared `modules/loader.py:scan_skill_scripts` static scan (ASI05 — skill scripts run
+  with operator privileges). L0 itself only warns and skips a broken skill; here all
+  problems of the container are collected into one `SkillsError` and the start aborts.
+  A container without skills (or a missing one) is valid: the engine is compiled without
+  the `SkillsMiddleware`, exactly as before.
+* **Read-only routes**: the default L0 `StateBackend` cannot read disk paths, so every
+  skills container is mounted through the one
+  `CompositeBackend(default=StateBackend(), routes={"/skills/": ReadOnlySkillsBackend,
+  "/module-skills/<name>/": ReadOnlySkillsBackend, ...})` built by
+  `build_skills_backend` — `ReadOnlySkillsBackend` is a `FilesystemBackend(virtual_mode=True)`
+  subclass whose `write`/`edit`/`delete`/`upload_files` refuse. The orchestrator's own
+  file tools stay state-backed; a prompt-injected agent (orchestrator or subagent)
+  cannot rewrite the vetted instructions loaded at every start (ASI01 persistence).
+  Paths outside the routes are untouched. With neither container present the function
+  returns `None`, `Engine` passes `backend=None`, and L0 builds its default
+  `StateBackend` — the pre-skills assembly.
+* **Module name as a route segment**: a module carrying `skills/` is mounted under
+  `/module-skills/<name>/`, so its manifest `name` must match
+  `^[A-Za-z0-9][A-Za-z0-9_-]*$` (`modules/loader.py:skills_route_name_problem`) —
+  otherwise a collected `ModuleLoadError` problem (fail-fast). Modules without skills
+  are not subject to the rule.
+* **Reload on the first step** (`OrchestratorRuntime(reload_skills=True)`): the L0
+  middleware caches the skill index in the checkpoint, so a resumed thread would never
+  see skills added between runs; the runtime merges the documented L0 trigger
+  (`skills_metadata: None`) into the first committed step's input (the orchestrator's
+  index — a subagent lists its module skills on each of its own runs), and
+  `Engine.recompile` (profile/mode switch) keeps the container and every module route.
 
 ### 8.7. Built-in modules (reference implementations of the contract)
 
@@ -1134,6 +1206,8 @@ def build_engine(session: Session) -> Engine:
         ],
         interrupt_on=interrupt_cfg.orchestrator,        # HITL gates of the orchestrator tools
         checkpointer=AsyncSqliteSaver(session.database.raw),  # SQLite (§7.1)
+        skills=["/skills/"],                            # orchestrator skills container (§8.6)
+        backend=skills_backend,                         # CompositeBackend: StateBackend + read-only /skills/ and /module-skills/<name>/ routes (§8.6, AD-10)
     )
     return Engine(graph=graph, modules=modules, interrupt_cfg=interrupt_cfg)
 ```
@@ -1141,6 +1215,20 @@ def build_engine(session: Session) -> Engine:
 The orchestrator gets **the same** middleware as the subagents: its tools
 (`session_info`, `generate_report`, memory wrappers) pass through guardrails and
 projection on equal footing with module tools.
+
+The `skills=`/`backend=` pair is the skills wiring (§8.6): the L0 default
+`StateBackend` keeps files in the graph state and cannot read disk paths, so
+`core/skills.py:build_skills_backend(orchestrator_skills, module_skills_routes(modules))`
+builds the composite backend routing the virtual `/skills/` prefix to the validated,
+read-only orchestrator container and one `/module-skills/<name>/` prefix per module
+carrying `skills/` to its read-only directory; `skills=` names the orchestrator route
+as the orchestrator's single skills source. L0 hands this same backend to every
+subagent's `SkillsMiddleware`, which is what makes the module sources resolvable
+(AD-10). With neither container (no orchestrator skill and no module skills)
+`Engine.build` passes neither argument and the compilation is byte-for-byte the
+pre-skills one; `Engine.skills_backend` exposes the composite (or `None`) as an
+assembly fact. `Engine.recompile` (§9.5) rebuilds the graph with the same composite —
+the skills wiring is part of the assembly, not of the profile/mode switch.
 
 ### 9.2. OrchestratorRuntime: three loops
 
@@ -1238,6 +1326,11 @@ under the "the roster is data" preamble.
 
 `SwarmyTui` (`tui/app.py`) is a Textual application; the session loop runs in its
 workers (the runtime, the bus and the checkpointer live in the same event loop).
+One pass of the loop serves one coalesced state batch (feed, snapshots, panels) and
+then at most one orchestrator step; the step runs **as a task** while the loop keeps
+serving batches, so a long `task()` delegation never freezes the panels (D44). The
+worker starts before the opening goal (D41) is journaled, so the goal reaches the feed
+through the ordinary bus path before any step runs.
 Panels (all are MVP, D10):
 
 | Panel | File | Data sources |
@@ -1252,7 +1345,9 @@ Panels (all are MVP, D10):
 ### 10.2. State and the facade
 
 - `TuiState` (`tui/state.py`) is the sole owner of UI state: an EventBus subscription
-  (coalescing queue, §5.3) + a snapshot cache from `SessionView`.
+  (coalescing queue, §5.3) + a snapshot cache from `SessionView`. The queue is
+  drained by `wait_batch` (blocking, between steps) or `drain_pending`
+  (non-blocking, while a step runs — D44).
 - `SessionView` is a facade over `Session` (read-only queries: memory, statuses, the
   approvals queue). The TUI imports **only** the facade and `events.models` — the
   core internals are unavailable to it (§2.5). This keeps the TUI interchangeable
@@ -1485,8 +1580,12 @@ POSIX-only APIs in the core (§11 spec) — paths via `pathlib`, no process fork
 9. Adding a subagent module requires no engine changes: new directories in `agents/`
    are picked up by the loader; a new event type is a "payload class + registration"
    pair.
-10. Session start is fail-fast: all config, manifest, guardrail and name-collision
-    problems are detected before the first LLM call.
+10. Session start is fail-fast: all config, manifest, guardrail, skills-container and
+    name-collision problems are detected before the first LLM call.
+11. Every skills container is read-only for the agent: the orchestrator's `/skills/`
+    and each module's `/module-skills/<name>/` reach the graph only through the
+    composite routes whose backend refuses every mutation; the agent's file tools never
+    write to the operator-vetted instructions (§8.6).
 
 ## 17. Anti-patterns
 
@@ -1515,8 +1614,8 @@ POSIX-only APIs in the core (§11 spec) — paths via `pathlib`, no process fork
 | §5 Events | 5.2, 5.3 | D3, D9 |
 | §6 Tools and guardrails | 4.3, 7.1–7.4, 8.1–8.7 | D6, D11, D12, D20, D21, AD-7 |
 | §7 HITL | 5.5, 5.6, 9.2 | D5, D13, D19 |
-| §8 Modules | 4.1–4.6 | P2, D9, AD-3, AD-4 |
-| §9 Orchestrator | 5.1, 5.4, 5.5 | D1, D13, D19, AD-8 |
+| §8 Modules | 4.1–4.6 | P2, D9, AD-3, AD-4, D40, D42 |
+| §9 Orchestrator | 5.1, 5.4, 5.5 | D1, D13, D19, AD-8, AD-9 |
 | §10 TUI | 9.1, 9.2 | D10 |
 | §11 Report | 10 | — |
 | §12 Configuration | 5.5, 5.6, 7.2, 7.3, 8.7 | D5, D6, D14, D21, AD-1 |
@@ -1536,6 +1635,8 @@ POSIX-only APIs in the core (§11 spec) — paths via `pathlib`, no process fork
 | AD-6 | Three subsystems in one SQLite file | session portability; WAL serialization of writers is acceptable locally |
 | AD-7 | Risk class — a declarative tool attribute | determinism of HITL gates |
 | AD-8 | Single-writer for the orchestrator graph | thread checkpoint consistency; parallelism at the subagent level (D19) |
+| AD-9 | Orchestrator skills in the repository-root `skills/` container (shipped as `swarmy/skills`), loaded automatically through the L0 `SkillsMiddleware` over a read-only `/skills/` composite route, validated fail-fast (spec D42) | the default `StateBackend` cannot read disk paths; L0 only warns and skips a broken skill, against invariant 10; a writable route would let a prompt-injected agent persist instructions across sessions (ASI01) |
+| AD-10 | Module `skills/` directories are mounted through the **same** composite as the orchestrator container — the loader names the virtual `/module-skills/<name>/` route as the module's L0 source and `Engine` mounts `<module>/skills` read-only under it; a module carrying skills must have a route-segment name (spec D43) | L0 builds every subagent's `SkillsMiddleware` on the backend the orchestrator was compiled with, and the default `StateBackend` cannot read disk paths — the pre-AD-10 disk-path sources were silently unloadable (subagents ran without their skills); a separate namespace from `/skills/` keeps an orchestrator skill from shadowing a module route; read-only for the same ASI01 reason as AD-9; validating the name at load time fails fast instead of an L0 source that resolves to nothing |
 
 ### 18.3. Mapping to phases (§12.3 spec)
 

@@ -172,6 +172,24 @@ Full compliance with the [agentskills.io specification](https://agentskills.io/s
 deepagents progressive disclosure is used as is (metadata → instructions → resources).
 A skill's own tools — via `metadata.include_tools` (a deepagents extension).
 
+Skills live in two independent containers (D42, D43), both reaching L0 only
+through the read-only composite backend (never as disk paths — the default L0
+`StateBackend` cannot read them):
+
+* **module skills** — `agents/<module>/skills/`: the loader names the virtual
+  route `skills=["/module-skills/<name>/"]` in that module's `SubAgent` (§4.5)
+  and the engine mounts the directory read-only under that route; `mode: fork`
+  inherits the orchestrator's skills and has none of its own;
+* **orchestrator skills** — the repository-root `skills/<skill-name>/` container
+  (shipped as `swarmy/skills`, resolved in both packaging layouts). Every skill in it
+  is loaded **automatically into the orchestrator context** at session start — no
+  config key. The container is validated fail-fast before the first LLM call (a
+  directory without `SKILL.md`, a `name` not matching its directory, over-long
+  fields, a symlinked skill, a `skills/**/*.py` script with a forbidden import —
+  `SkillsError` with the full list), mounted read-only under the virtual `/skills/`
+  route (the agent cannot modify the vetted instructions), and re-listed on the
+  first step of a resumed session so skills added between runs are picked up.
+
 ### 4.5. Loader (ModuleLoader)
 
 1. Scans built-in modules (`<package>/agents` in the wheel or `<repo>/agents`
@@ -179,7 +197,9 @@ A skill's own tools — via `metadata.include_tools` (a deepagents extension).
 2. Validates each manifest with the Pydantic model `AgentModuleManifest`
    (configuration errors = fail-fast with a list of problems across all modules at once).
 3. Assembles SubAgent dicts: `system_prompt`, `tools` (imported functions),
-   `model`, `mode`, `interrupt_on`, `skills=[<path>/skills/]`,
+   `model`, `mode`, `interrupt_on`, `skills=["/module-skills/<name>/"]` (the virtual
+   composite route of the module's `skills/`, D43 — a module carrying skills must
+   have a route-segment name),
    `middleware=[GuardrailMiddleware(module rules)]`,
    `response_format` — if the module declares a result schema.
 4. Checks the module's `events` against the event type registry.
@@ -500,6 +520,7 @@ swarmy/                  # package
 ├── tui/                 # Textual application
 └── report/              # report generator
 agents/                 # built-in modules: crawler, xss-detector (reference); → swarmy/agents in the wheel
+skills/                 # orchestrator skills container: <skill-name>/SKILL.md; → swarmy/skills in the wheel (D42)
 docs/development/       # spec.md · architecture.md · roadmap.md · check reports
 tests/
 pyproject.toml
@@ -587,6 +608,9 @@ headless mode, attack tree correlation engine, non-HTTP evidence kinds (`screens
 | D* | Decision | Rationale |
 | --- | --- | --- |
 | D41 | §3.4 (arch)/§9.2: the TUI auto-starts the mission from a goal file — `--goal-file PATH`, or by convention `goal.md` next to the session config; the CLI reads it (UTF-8, non-empty; an unreadable or empty file — a fail-fast problem before the session folder is created) and hands it to the console as `opening_goal`, which journals it as the first `OperatorMessage` on mount through the same path as a typed message (projected by `ContextProjector`, journal-first, drained by the worker's first pass). `--resume` never auto-starts and rejects `--goal-file`; without a goal file the console waits for the chat as before; the demo launchers pass `<demo>/goal.md` in `--tui` mode too | The goal file used to be a headless-only input, so `run.sh --tui` silently ignored `goal.md`: the operator saw idle panels and a mission that never started — the "the scan does not start" report; the alternatives: chat-only — a demo directory's `goal.md` becomes meaningless in TUI mode and every TUI run repeats the typing of the same goal; auto-start on resume — duplicates a mission whose goal is already in the journal (a second identical `OperatorMessage` restarts the work); a silent skip on an empty/unreadable file — the very "ignored input" defect being fixed, against fail-fast (§4.5); a new `--no-auto-start` flag — not needed: removing/renaming the file is the opt-out, and an absent file already means "wait for the chat" |
+| D42 | §4.4/§8.6 arch: orchestrator skills live in the repository-root `skills/<skill-name>/` container (shipped as `swarmy/skills`, resolved like D40's `agents/`) and are loaded automatically into the orchestrator context at every session start through the L0 `SkillsMiddleware` — `create_deep_agent(skills=["/skills/"], backend=CompositeBackend(default=StateBackend(), routes={"/skills/": ReadOnlySkillsBackend}))`. `core/skills.py` validates the container fail-fast (every subdirectory a skill: `SKILL.md`, agentskills.io `name`/`description` limits, name = directory, no symlinks; `skills/**/*.py` under the shared static scan → one `SkillsError`), mounts it **read-only** (the route's `FilesystemBackend` subclass refuses write/edit/delete/upload), and the runtime merges the documented L0 reload trigger (`skills_metadata: None`) into the first step of a resumed thread; `Engine.recompile` keeps the container. An empty or missing container is valid: the engine compiles without the `SkillsMiddleware` | Skills are model-facing instructions the orchestrator should share across modules (planning, reporting, engagement methodology) — a module-local `skills/` cannot express that (module skills are a separate container, D43); L0 only warns and skips a broken skill — against the fail-fast invariant (§16.9), so a typo would quietly drop a skill; a writable route would let a prompt-injected agent rewrite the instructions it loads at every start (ASI01 persistence); a config key for the container was rejected — "everything under `skills/` is loaded" is the simpler contract, user-level skill directories can be added later as config |
+| D43 | §4.4/§8.6/§9.1 arch: module `skills/` directories are mounted through the **same** composite backend as the orchestrator container. The loader puts the virtual route `/module-skills/<name>/` (`modules/loader.py:module_skills_route`) into `SubAgent["skills"]` — never the disk path; `Engine.build`/`recompile` build the backend with `core/skills.py:build_skills_backend(orchestrator_skills, module_skills_routes(modules))` → `CompositeBackend(default=StateBackend(), routes={"/skills/": ReadOnlySkillsBackend, "/module-skills/<name>/": ReadOnlySkillsBackend, ...})` (one read-only route per module carrying skills); `Engine.skills_backend` exposes the composite. A module with `skills/` whose `name` is not a valid single path segment (`^[A-Za-z0-9][A-Za-z0-9_-]*$`) is a collected `ModuleLoadError` problem. With neither container, `backend=None`/`skills=None` — the pre-skills assembly | L0 builds every subagent's `SkillsMiddleware` on the backend the orchestrator was compiled with (`create_deep_agent(backend=...)`), and the default `StateBackend` reads graph state, not disk — the disk-path sources the loader used to pass were silently unloadable, so every skilled module ran without its skills; a module route is read-only for the same ASI01 reason as the orchestrator's (a subagent must not rewrite the instructions it reloads); the `/module-skills/` namespace is kept apart from `/skills/` so an orchestrator skill named like a module can never shadow the module route (`CompositeBackend` routes longest-prefix); validating the name at load time fails fast instead of an L0 source that resolves to nothing; mounting modules under `/skills/<name>/` was rejected for that shadowing risk, a per-module `FilesystemBackend` passed directly to each subagent — impossible, L0 shares one backend per graph |
+| D44 | §10.1/§10.2 arch: the console worker runs one orchestrator step at a time **as a task** while it keeps serving bus batches (`TuiState.drain_pending`, non-blocking); the worker starts before the opening goal is journaled, so the goal reaches the feed through the ordinary bus path and no step starts behind an unserved goal | Awaiting `run_step` directly froze every panel for the step's whole duration — a `task()` delegation runs inside the graph invocation and takes minutes — so the goal-file auto-start showed the "Type your goal" hint and idle panels until the first step ended (the "the mission did not start" report); the alternatives: a dedicated render thread — breaks the single-loop rule (D4); serving only the opening goal synchronously — fixes one message but leaves every later delegation frozen; a fixed sleep before the step — a timing guess, not a guarantee. The step task stays the single writer (AD-8) |
 
 ---
 

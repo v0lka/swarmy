@@ -5,7 +5,9 @@ Findings & Endpoints, HITL Approvals, Attack Trees, Progress & Plans. The
 session loop runs as a Textual **worker** inside the app's event loop (arch
 §2.2: the core never knows about Textual): every pass serves one coalesced
 state batch (feed, snapshots, panels), then drains pending runtime
-injections with one orchestrator step. Key bindings navigate the panels;
+injections with one orchestrator step — the step runs as a task while the
+loop keeps serving batches, so a long delegation never freezes the panels.
+Key bindings navigate the panels;
 ``ctrl+q`` checkpoints the WAL and leaves.
 """
 
@@ -37,6 +39,7 @@ if TYPE_CHECKING:
     from textual.widget import Widget
 
     from swarmy.core.session import Session
+    from swarmy.events.models import EventEnvelope
 
 #: Panel order of the D10 grid (1-based, matches the digit bindings).
 _PANEL_IDS: tuple[str, ...] = (
@@ -125,12 +128,20 @@ class SwarmyTui(App[None]):
             yield PlansPanel("panel-plans")
 
     async def on_mount(self) -> None:
-        """Subscribe the state, preload the journal, send the goal, start the worker."""
+        """Subscribe the state, preload the journal, start the worker, send the goal."""
         self.state.start()
         await self.state.preload()
-        await self._send_opening_goal()
         self.refresh_panels()
+        # The worker starts BEFORE the opening goal is journaled on purpose:
+        # the goal then reaches the feed through the ordinary bus path (its
+        # dispatcher wakes the waiting worker with a real batch). Started
+        # after the send, the worker's first ``wait_batch`` saw the wake flag
+        # pre-set by ``kick()`` with the envelope still in the dispatcher's
+        # queue — an empty batch, the "Type your goal" hint on screen and a
+        # jump straight into the (minutes-long) first step with the goal
+        # unserved: the "panels open, nothing happens" report.
         self.run_session_loop()
+        await self._send_opening_goal()
 
     async def _send_opening_goal(self) -> None:
         """Journal the goal-file goal as the first operator message (arch §3.4).
@@ -160,27 +171,31 @@ class SwarmyTui(App[None]):
     async def _session_worker(self) -> None:
         """Serve coalesced batches; drain runtime injections step by step.
 
+        One orchestrator step at a time, run as a task (:meth:`_run_step`) so
+        the loop keeps serving bus batches while the graph works: a ``task()``
+        delegation runs inside the graph invocation and can take minutes, and
+        awaiting it directly froze every panel for that time while the journal
+        kept growing — the "panels open, nothing happens" trap of the goal-file
+        auto-start. The step task stays the single writer (AD-8): no second
+        step starts before the previous one completed.
+
         Every await in the loop is guarded (Issue #28): one failed pass — a
         provider hiccup on ``run_step``, a journal decode or render error —
         is reported as a system line in the chat feed and the loop continues;
         the worker used to be a bare ``while True`` whose first exception
-        exited the whole console. Idle poll ticks (no batch, no dirty types)
-        skip the panel re-render entirely (Issue #33: the console used to
-        re-render all six panels ~10x/s even when nothing happened).
+        exited the whole console. Idle poll ticks (no batch, no dirty types,
+        no injections) skip the panel re-render entirely (Issue #33: the
+        console used to re-render all six panels ~10x/s even when nothing
+        happened).
         """
         while True:
             try:
                 batch = await self.state.wait_batch(poll_after=0.1)
                 dirty = self.state.take_dirty()
-                if not batch and not dirty and self.view.pending_injections() == 0:
-                    continue  # idle poll tick: nothing new to render or drain
-                if batch:
-                    self.state.extend_feed(batch)  # coalescing: nothing is lost
-                if batch or self.state.needs_snapshot(dirty):
-                    await self.state.refresh()
-                self.refresh_panels()
+                if batch or dirty:
+                    await self._serve_batch(batch, dirty)
                 while self.view.pending_injections() > 0:
-                    result = await self.view.run_step()
+                    result = await self._run_step()
                     self.state.absorb(result)
                     await self.state.refresh()
                     self.refresh_panels()
@@ -188,7 +203,44 @@ class SwarmyTui(App[None]):
                 raise
             except Exception as exc:  # one failed pass must not kill the TUI
                 self._report_error(exc)
+                self.refresh_panels()  # the new system> line must reach the chat
                 await asyncio.sleep(0.5)  # back off before the retry pass
+
+    async def _serve_batch(self, batch: list[EventEnvelope], dirty: set[str]) -> None:
+        """Fold one coalesced batch into the feed/snapshots and repaint.
+
+        ``dirty`` is the type set of exactly this batch (``take_dirty`` is
+        read right after the drain, with no await in between — arch §5.3:
+        nothing is lost, only redundant redraws collapse).
+        """
+        if batch:
+            self.state.extend_feed(batch)  # coalescing: nothing is lost
+        if batch or self.state.needs_snapshot(dirty):
+            await self.state.refresh()
+        self.refresh_panels()
+
+    async def _run_step(self) -> object:
+        """Run one orchestrator step as a task while the loop keeps serving batches.
+
+        While the step works, every batch the bus dispatcher delivers is folded
+        into the feed (the non-blocking :meth:`TuiState.drain_pending`) so the
+        Activity/Findings panels show the swarm's progress as it happens
+        instead of after the step. The result — or the step's exception — is
+        returned exactly as ``view.run_step`` would; a worker cancellation
+        takes the step task down with it.
+        """
+        step = asyncio.create_task(self.view.run_step())
+        try:
+            while True:
+                done, _ = await asyncio.wait({step}, timeout=0.1)
+                late = self.state.drain_pending()
+                if late:
+                    await self._serve_batch(late, self.state.take_dirty())
+                if done:
+                    return step.result()
+        finally:
+            if not step.done():
+                step.cancel()
 
     # ---- rendering ----
 

@@ -40,6 +40,12 @@ class ScriptedChatModel(BaseChatModel):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._iters: dict[str, Any] = {}  # marker -> iterator of AIMessage
+        self._system_prompts: list[str] = []  # every request's system text (context probes)
+
+    @property
+    def system_prompts(self) -> list[str]:
+        """The system message text of every request, in arrival order."""
+        return list(self._system_prompts)
 
     @property
     def _llm_type(self) -> str:
@@ -58,6 +64,10 @@ class ScriptedChatModel(BaseChatModel):
         return max(matches, key=len) if matches else None
 
     def _generate(self, messages: list[BaseMessage], stop: Any = None, **kwargs: Any) -> ChatResult:
+        system_text = "\n".join(
+            str(message.content) for message in messages if message.type == "system"
+        )
+        self._system_prompts.append(system_text)
         marker = self._marker_for(messages)
         if marker is None:
             return ChatResult(generations=[ChatGeneration(message=AIMessage(self.fallback_reply))])

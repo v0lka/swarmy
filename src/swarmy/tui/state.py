@@ -346,6 +346,19 @@ class TuiState:
         """Wake the consumer immediately (operator action side effects)."""
         self._wake.set()
 
+    def drain_pending(self) -> list[EventEnvelope]:
+        """Non-blocking drain: every envelope buffered so far, as one batch.
+
+        Used while an orchestrator step runs (arch §10.1): the loop must keep
+        folding the events the bus dispatcher delivers mid-step into the feed
+        without waiting — ``wait_batch`` would block for the step's duration
+        and the panels would freeze behind it.
+        """
+        batch = self._pending[:]
+        self._pending.clear()
+        self._wake.clear()
+        return batch
+
     # ---- bounded feed window (Issue #33) ----
 
     def extend_feed(self, batch: Sequence[EventEnvelope]) -> None:

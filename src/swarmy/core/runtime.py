@@ -384,6 +384,7 @@ class OrchestratorRuntime:
         approvals: ApprovalQueue,
         thread_id: str = "orchestrator",
         notify_tui_sink: Callable[[EventEnvelope, ResolvedPolicy], None] | None = None,
+        reload_skills: bool = False,
     ) -> None:
         """Assemble the runtime over its collaborators.
 
@@ -397,6 +398,12 @@ class OrchestratorRuntime:
             thread_id: the LangGraph thread of this session's orchestrator.
             notify_tui_sink: delivery hook for ``notify_tui`` reactions (M4
                 wiring); ``None`` counts them without delivery.
+            reload_skills: merge the documented L0 reload trigger
+                (``skills_metadata: None``) into the **first** step's input.
+                The L0 ``SkillsMiddleware`` loads the skill index once and
+                keeps it checkpointed, so a resumed thread would otherwise
+                never see skills added to the container between runs (arch
+                §8.6); the session sets this whenever skills are wired.
         """
         self._graph = graph
         self._emit = emit
@@ -405,6 +412,7 @@ class OrchestratorRuntime:
         self._approvals = approvals
         self._thread_id = thread_id
         self._notify_tui_sink = notify_tui_sink
+        self._reload_skills = reload_skills
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._graph_lock = asyncio.Lock()
         self._active_calls = 0
@@ -549,8 +557,14 @@ class OrchestratorRuntime:
             messages.append(HumanMessage(content=self._projector.project(user_text)))
         if not messages:
             return None
+        state: dict[str, object] = {"messages": messages}
+        if self._reload_skills:
+            # The documented L0 reload trigger (arch §8.6): the middleware
+            # re-lists the skills sources instead of reusing the checkpointed
+            # index of a previous run.
+            state["skills_metadata"] = None
         try:
-            return await self._invoke_locked({"messages": messages})
+            result = await self._invoke_locked(state)
         except BaseException:
             # A failure *after* the input superstep committed (AsyncSqliteSaver
             # persists the injected HumanMessages before the failing node
@@ -576,6 +590,10 @@ class OrchestratorRuntime:
                 if text not in delivered:
                     self._queue.put_nowait(text)
             raise
+        # A committed step served the reload; a failed step keeps the flag
+        # so the next one retries it (a repeated trigger is idempotent).
+        self._reload_skills = False
+        return result
 
     async def _invoke_locked(self, value: object) -> object:
         """Invoke the graph under the lock; keep the monitor counters honest."""

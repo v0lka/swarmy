@@ -80,6 +80,11 @@ def richlog_text(log: RichLog) -> str:
     return "\n".join(strip.text for strip in log.lines)
 
 
+def status_text(app: SwarmyTui) -> str:
+    """The rendered text of the global status bar."""
+    return static_text(app.query_one("#status-bar", Static))
+
+
 class GatedModel(ScriptedChatModel):
     """Scripted model whose answers wait for ``gate`` (a step that takes long)."""
 
@@ -338,6 +343,112 @@ async def test_without_an_opening_goal_the_console_stays_idle(tmp_path: Path) ->
     await session.close()
 
 
+# ---------------------------------------------------------------------------
+# Status bar — liveness while the model works, completion when the turn ends
+# ---------------------------------------------------------------------------
+
+
+async def test_status_bar_is_idle_on_a_fresh_session(tmp_path: Path) -> None:
+    """No goal, no step: the bar tells the operator how to start."""
+    session = await make_session(tmp_path)
+    app = SwarmyTui(session)
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(0.3)
+        text = status_text(app)
+        assert "idle" in text
+        assert "type a goal" in text
+        assert "working" not in text
+    await session.close()
+
+
+async def test_status_bar_shows_working_and_elapsed_while_the_step_runs(
+    tmp_path: Path,
+) -> None:
+    """A slow model step is visible as a spinner + elapsed time + last-event age.
+
+    Regression for the "is the app frozen or waiting for the LLM?" report:
+    before the status bar the console showed nothing at all for the whole
+    model call.
+    """
+    gate = asyncio.Event()
+    session = await make_session(
+        tmp_path, model=GatedModel(gate, scripts={}, fallback_reply="ack: after the gate")
+    )
+    app = SwarmyTui(session, opening_goal="run the probe")
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(0.4)
+        working = status_text(app)
+        assert "working" in working
+        first_elapsed = app.state.step_elapsed()
+        await pilot.pause(0.5)
+        assert app.state.step_elapsed() > first_elapsed  # the clock really advances
+        assert "working" in status_text(app)
+        gate.set()
+        await pilot.pause(0.8)
+        assert "turn complete" in status_text(app)
+        assert app._notified_turns >= 1  # one completion toast, not a storm
+    await session.close()
+
+
+async def test_status_bar_reports_turn_complete(tmp_path: Path) -> None:
+    """After a normal step the bar persistently says the turn is over."""
+    session = await make_session(
+        tmp_path, {"orchestrator": [final_reply("ack: all done")]}
+    )
+    app = SwarmyTui(session, opening_goal="run the probe")
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(1.0)
+        assert "turn complete" in status_text(app)
+    await session.close()
+
+
+async def test_status_bar_reports_waiting_for_operator_approval(tmp_path: Path) -> None:
+    """A pending HITL request is visible in the bar, not only in its panel."""
+    session = await _session_with_pending_interrupt(tmp_path)
+    app = SwarmyTui(session, opening_goal="run the gated probe")
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(1.5)
+        text = status_text(app)
+        assert "waiting for operator approval" in text
+        assert "1 in the HITL queue" in text
+    await session.close()
+
+
+async def test_status_bar_reports_plan_complete(tmp_path: Path) -> None:
+    """All todos completed + nothing pending → the plan is complete, not just idle."""
+    session = await make_session(tmp_path)
+    app = SwarmyTui(session)
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(0.3)
+        app.state.step_started()
+        app.state.step_finished()
+        app.state.absorb(
+            {"todos": [{"content": "map the target", "status": "completed"}]}
+        )
+        app._refresh_status_bar()
+        assert "plan complete" in status_text(app)
+    await session.close()
+
+
+async def test_chat_renders_untrusted_markers_as_red_background(tmp_path: Path) -> None:
+    """§6.8 markers in a reply never appear as text; the content stays visible."""
+    from swarmy.tools.projector import UNTRUSTED_BEGIN, UNTRUSTED_END
+
+    session = await make_session(
+        tmp_path,
+        {"orchestrator": [final_reply(
+            f"quote: {UNTRUSTED_BEGIN} target said hello {UNTRUSTED_END}"
+        )]},
+    )
+    app = SwarmyTui(session, opening_goal="run the probe")
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(1.0)
+        transcript = richlog_text(app.query_one("#chat-log", RichLog))
+        assert "untrusted-target-content" not in transcript
+        assert "target said hello" in transcript
+    await session.close()
+
+
 async def test_opening_goal_failure_degrades_to_the_error_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -463,13 +574,18 @@ async def test_delegation_table_matches_the_journal(tmp_path: Path) -> None:
             assert cells[0] == request_payload.correlation_id[:8]
             assert cells[1] == request_payload.subagent
             assert cells[2] == completion_payload.status
-            # the digest cell is the projected summary: masked (masker) and
-            # wrapped in untrusted-target-content markers (arch §6.8); the
-            # panel renders through rich-escape, so brackets appear as \[...]
-            digest_cell = str(cells[3])
-            assert completion_payload.summary_digest in digest_cell
-            assert "untrusted-target-content begin" in digest_cell
-            assert "untrusted-target-content end" in digest_cell
+            # The digest cell is the projected summary: masked, with the §6.8
+            # markers never printed as text — the TUI renderer paints the
+            # enclosed content with a red background instead.
+            digest_cell = cells[3]
+            assert completion_payload.summary_digest in str(digest_cell)
+            assert "untrusted-target-content" not in str(digest_cell)
+            # the Plans panel shows the live delegation plan (no todos yet)
+            plans = app.query_one("#panel-plans", PlansPanel)
+            plans_text = static_text(plans.query_one("#plans-todos", Static))
+            assert request_payload.subagent in plans_text
+            assert completion_payload.status in plans_text
+            assert "delegations" in static_text(plans.query_one("#plans-stats", Static))
     finally:
         await session.close()
 
@@ -606,6 +722,7 @@ async def test_plans_stats_and_todos(tmp_path: Path) -> None:
         stats_text = static_text(plans.query_one("#plans-stats", Static))
         assert "crawl target" in todos_text
         assert "endpoints" in stats_text
+        assert "delegations" in stats_text
         # statistics reconcile with the store (AC: the counts match MemoryStore)
         endpoints = await memory.list_endpoints()
         findings = await memory.list_findings()
@@ -915,7 +1032,9 @@ async def test_endpoint_method_markup_does_not_crash_loop(tmp_path: Path) -> Non
         table = app.query_one("#endpoint-table", DataTable)
         assert table.row_count == 2
         methods = " | ".join(str(table.get_row(key)[2]) for key in table.rows)
-        assert rich_escape("[/etc/passwd]") in methods  # escaped, still literal
+        # The cell is a rich Text (literal, not markup): markup-looking
+        # values cannot inject styles, so no escaping is needed on screen.
+        assert "[/etc/passwd]" in methods
     await session.close()
 
 

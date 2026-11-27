@@ -265,6 +265,7 @@ async def test_facade_read_only_queries(session: Session) -> None:
 async def test_facade_mask_applies_the_projector(tmp_path: Path) -> None:
     """Operator secrets are masked in facade-projected display texts (§6.8)."""
     from swarmy.core.config import SecretsConfig
+    from swarmy.tools.projector import UNTRUSTED_BEGIN, UNTRUSTED_END
 
     session_dir = tmp_path / "s2"
     secrets = SecretsConfig(auth_headers={"X-Token": "hushhush-value"})
@@ -277,8 +278,25 @@ async def test_facade_mask_applies_the_projector(tmp_path: Path) -> None:
         masked = view.mask("token hushhush-value leaked")
         assert "hushhush-value" not in masked
         assert "<masked:X-Token>" in masked
+        # Display projection leaves genuine §6.8 markers in place: the TUI
+        # renders them as a red background instead of printing the tag text,
+        # so the facade must neither add a wrapper nor defuse the pair.
+        marked = view.mask(f"{UNTRUSTED_BEGIN} quoted {UNTRUSTED_END}")
+        assert marked == f"{UNTRUSTED_BEGIN} quoted {UNTRUSTED_END}"
+        assert "defused" not in marked
     finally:
         await opened.close()
+
+
+async def test_facade_display_renders_markers_as_red_background(session: Session) -> None:
+    """``SessionView.display`` strips the tag text and paints the span red."""
+    from swarmy.tools.projector import UNTRUSTED_BEGIN, UNTRUSTED_END
+
+    view = SessionView(session)
+    rendered = view.display(f"{UNTRUSTED_BEGIN} target text {UNTRUSTED_END}")
+    assert str(rendered) == " target text "
+    assert "untrusted-target-content" not in str(rendered)
+    assert any("on dark_red" in str(span.style) for span in rendered.spans)
 
 
 async def test_facade_pending_approvals_projection(session: Session) -> None:

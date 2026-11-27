@@ -518,12 +518,17 @@ coalesced — events are not lost, only redundant repainting is.
 | `ctrl+q` | correct exit: WAL checkpoint, session release |
 | `Enter` (in the chat field) | send a message to the orchestrator |
 
+A status line at the bottom of the screen shows liveness and completion: a spinner
+with the elapsed step time and the age of the last event while the orchestrator works,
+`waiting for operator approval` while a HITL request is pending, and
+`turn complete` / `plan complete` / `idle` otherwise (a toast marks each finished turn).
+
 ### 6.2. Chat
 
 A dialogue between the operator and the orchestrator. Write tasks in human
-language: the orchestrator plans the work in its own messages (the L0 0.7.x
-default graph wires no todo tool), delegates to subagents and reports back in
-the chat. In `interactive` mode the orchestrator agrees significant forks with
+language: the orchestrator plans the work with its todo list (`write_todos`),
+delegates to subagents and reports back in the chat. In `interactive` mode the
+orchestrator agrees significant forks with
 you before acting. The task wording sets the
 session focus: "check the target for reflected XSS", "map the attack surface",
 "verify finding #3". The orchestrator puts artifacts (endpoints, findings,
@@ -547,9 +552,11 @@ reproduction steps, absolute paths to the raw evidence files
 (`evidence/<request-id>/request.txt`, `response.txt`). The card's structured
 fields and evidence paths are shown directly; its title, reproduction steps
 and description are rendered through the session projector (secret masking,
-byte budget, untrusted markers, normalization). Raw values live in
+byte budget, normalization); §6.8 untrusted markers are shown as a red
+background, never printed as text. Raw values live in
 `memory.sqlite` and `evidence/` — verification by a pentester uses those. The
-event feeds and the chat show sanitized projections as well.
+event feeds and the chat show sanitized projections as well; untrusted content
+is highlighted with a red background.
 
 ### 6.5. HITL Approvals
 
@@ -567,11 +574,12 @@ navigation from a tree node to a finding card.
 
 ### 6.7. Progress & Plans
 
-The orchestrator's todo list (an L0 state projection — since the L0 default
-graph wires no todo tool, in v0.1 the list stays empty) and session
+The orchestrator's todo list (an L0 state projection written through
+`write_todos`; until the first todo appears the panel shows the live
+delegation plan from `TaskRequested`/`TaskCompleted`) and session
 statistics: endpoints by research status (`undiscovered/probed/analyzed`) and
-out-of-scope count, findings by severity plus the verified count, and the
-journal event total.
+out-of-scope count, findings by severity plus the verified count, delegations
+running/completed/failed, and the journal event total.
 
 ### 6.8. Finishing
 
@@ -719,7 +727,9 @@ preview, event digest, guardrail feedback) passes through `ContextProjector`:
    `[truncated N bytes]` marker; the full content is in the session evidence;
 2. **operator secret masking** → `<masked:secret-name>`;
 3. **untrusted marking**: target content is wrapped in
-   `[untrusted-target-content begin] … [untrusted-target-content end]` markers;
+   `[untrusted-target-content begin] … [untrusted-target-content end]` markers
+   (the TUI never prints them as text — the enclosed content is highlighted
+   with a red background);
 4. **normalization** of control characters and hidden Unicode (biDi,
    zero-width).
 
@@ -727,8 +737,8 @@ preview, event digest, guardrail feedback) passes through `ContextProjector`:
 |-----|-----------|
 | `evidence/` | raw requests/responses in full |
 | `memory.sqlite` (domain tables) | raw data |
-| Finding card in the TUI | structured fields + projected text (secrets masked, budgeted, marked); evidence paths point at the raw files |
-| Event feeds, chat, digests | sanitized projections |
+| Finding card in the TUI | structured fields + projected text (secrets masked, budgeted; §6.8 markers rendered as a red background); evidence paths point at the raw files |
+| Event feeds, chat, digests | sanitized projections; §6.8 markers rendered as a red background |
 | LLM context (of any agent) | only the projection through the projector |
 | `session.yaml` | config + `<masked:...>` references instead of secret values |
 | `report.md` | data from memory (raw findings/endpoints; operator secrets structurally never get into memory) |
@@ -775,7 +785,7 @@ consistent. Parallelism is provided **inside** a graph step: several
 | Loop | Source | Mechanics |
 |--------|----------|----------|
 | **Reactive** | bus events → policies | event → policy → notification (template + digest via the projector) → injected as a message into the graph at the step boundary |
-| **Proactive** | operator's task | the orchestrator plans on its own (in its messages; the L0 default graph wires no todo tool in v0.1) and delegates |
+| **Proactive** | operator's task | the orchestrator plans on its own with its todo list (`write_todos`) and delegates |
 | **Interactive** | TUI chat | the operator's message is journaled as `OperatorMessage` and injected as a human message |
 
 Important: a policy only injects a notification — it does **not** execute tools or

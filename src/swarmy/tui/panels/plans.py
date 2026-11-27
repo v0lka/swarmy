@@ -2,7 +2,10 @@
 
 Todos are the L0 state projection (``TuiState.absorb`` duck-types the step
 result); the statistics reconcile memory + journal through the facade:
-endpoints by research status, findings by class/severity/status.
+endpoints by research status, findings by class/severity/status. When the
+orchestrator has not written todos yet, the left column shows the **live
+delegation plan** from the journal's ``TaskRequested``/``TaskCompleted``
+pairs — the panel must never look idle while the swarm works.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from swarmy.memory.models import FindingStatus
 if TYPE_CHECKING:
     from textual.app import ComposeResult
 
-    from swarmy.tui.state import SessionView, TodoItem, TuiState
+    from swarmy.tui.state import DelegationItem, SessionView, TodoItem, TuiState
 
 _STATUS_MARK: dict[str, str] = {
     "pending": "[ ]",
@@ -44,12 +47,19 @@ class PlansPanel(Vertical):
             yield Static("no data yet", id="plans-stats")
 
     def refresh_state(self, state: TuiState, view: SessionView) -> None:
-        """Re-render todos and statistics from the snapshot caches."""
+        """Re-render the progress column and statistics from the snapshot caches."""
         del view  # snapshots only; the facade is unused at render time
         todos = self.query_one("#plans-todos", Static)
-        todos.update(self._todos_table(state.todos))
+        todos.update(self._progress_table(state))
         stats = self.query_one("#plans-stats", Static)
         stats.update(self._stats_table(state))
+
+    @staticmethod
+    def _progress_table(state: TuiState) -> RichTable:
+        """Todos when the orchestrator wrote them; otherwise live delegations."""
+        if state.todos:
+            return PlansPanel._todos_table(state.todos)
+        return PlansPanel._delegations_table(state.delegations())
 
     @staticmethod
     def _todos_table(todos: list[TodoItem]) -> RichTable:
@@ -61,6 +71,26 @@ class PlansPanel(Vertical):
         for todo in todos:
             mark = _STATUS_MARK.get(todo.status, "[?]")
             table.add_row(mark, escape(todo.content))
+        return table
+
+    @staticmethod
+    def _delegations_table(delegations: list[DelegationItem]) -> RichTable:
+        """The live delegation plan (running/completed/failed) when no todos exist."""
+        table = RichTable(show_header=False, padding=(0, 1), title="live delegations")
+        if not delegations:
+            table.add_row("[dim]no todos or delegations yet[/]")
+            return table
+        for item in delegations:
+            mark = {
+                "completed": "[green]✓[/]",
+                "failed": "[red]✗[/]",
+            }.get(item.status, "[yellow]▶[/]")
+            table.add_row(
+                mark,
+                escape(item.subagent),
+                escape(item.status),
+                item.correlation_id[:8],
+            )
         return table
 
     @staticmethod
@@ -86,5 +116,14 @@ class PlansPanel(Vertical):
         rendered = ", ".join(f"{key}: {count}" for key, count in sorted(by_severity.items()))
         table.add_row("findings", rendered or "—")
         table.add_row("findings verified", str(verified))
+        delegations = state.delegations()
+        table.add_row(
+            "delegations",
+            "running: {}, completed: {}, failed: {}".format(
+                sum(1 for item in delegations if item.status == "running"),
+                sum(1 for item in delegations if item.status == "completed"),
+                sum(1 for item in delegations if item.status == "failed"),
+            ),
+        )
         table.add_row("journal events (session)", str(state.event_count))
         return table

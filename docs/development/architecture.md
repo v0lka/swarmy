@@ -626,9 +626,10 @@ checkpointer + unread journal tail".
 applies at the journal boundary: a digest field is projected (masking + budget +
 normalization, §6.8) at the moment the event is published —
 `OperatorMessage.text_digest` and the `summary_digest` of `Task*` pairs are projected at
-emit (`Task*` — without the untrusted wrapper: the digest is a journal one, the display
-layer adds markers itself), `GuardrailBlocked.reason` — exactly like
-`tool_args_digest` (D25). "Raw by design" (D21) protects the session files (evidence,
+emit — both **without** the untrusted wrapper: operator chat is a trusted stream typed by
+the operator and the `Task*` digest is journal-bound, while the TUI display layer renders
+any §6.8 markers it meets as a red background (never as text). `GuardrailBlocked.reason` —
+exactly like `tool_args_digest` (D25). "Raw by design" (D21) protects the session files (evidence,
 raw tool responses) and does **not** extend to the journal digest fields. New types
 after v0.1 are added as a "payload class + registration" pair without changing the bus
 or the journal.
@@ -1335,12 +1336,17 @@ Panels (all are MVP, D10):
 
 | Panel | File | Data sources |
 |--------|------|------------------|
-| Chat | `panels/chat.py` | `OperatorMessage`/orchestrator replies from the journal; switching to a live subagent — a snapshot of its messages from the checkpointer (read-only) |
+| Chat | `panels/chat.py` | `OperatorMessage`/orchestrator replies from the journal; switching to a live subagent — a snapshot of its messages from the checkpointer (read-only); §6.8 markers rendered as a red background |
 | Swarm Activity | `panels/activity.py` | EventBus feed; the `task()` tree by `correlation_id` (`TaskRequested`/`TaskCompleted`); approval queue statuses |
 | Findings & Endpoints | `panels/findings.py` | queries to `MemoryStore` (read-only): endpoint/parameter tables; finding card: severity, evidence files (opened from `evidence/`), reproduction |
 | HITL Approvals | `approvals.py` | `ApprovalQueue`: request queue; decision modal (§10.3) |
 | Attack Trees | `panels/trees.py` | `AttackNode`/`AttackEdge` from memory; node expansion, navigation to a finding |
-| Progress & Plans | `panels/plans.py` | orchestrator todos (L0 state); session statistics (endpoints by status, findings by class/severity) |
+| Progress & Plans | `panels/plans.py` | orchestrator todos (L0 `TodoListMiddleware` state); the live delegation plan (`TaskRequested`/`TaskCompleted`) when no todos yet; session statistics (endpoints by status, findings by class/severity, delegations) |
+
+A global status bar at the bottom is the liveness/completion signal: a spinner with the
+elapsed step time and the age of the last folded event while an orchestrator step runs,
+`waiting for operator approval` while the HITL queue is non-empty, and
+`turn complete` / `plan complete` / `idle` otherwise (one toast per finished turn).
 
 ### 10.2. State and the facade
 

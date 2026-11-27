@@ -340,7 +340,24 @@ class ContextProjector:
             raise ValueError("; ".join(problems))
         return (*literal_rules, *pattern_rules)
 
-    def project(self, text: str, *, tool_class: str | None = None) -> str:
+    @property
+    def untrusted_begin(self) -> str:
+        """The verbatim §6.8 begin marker (read by the display layer)."""
+        return UNTRUSTED_BEGIN
+
+    @property
+    def untrusted_end(self) -> str:
+        """The verbatim §6.8 end marker (read by the display layer)."""
+        return UNTRUSTED_END
+
+    def project(
+        self,
+        text: str,
+        *,
+        tool_class: str | None = None,
+        mark_untrusted: bool | None = None,
+        defuse_markers: bool = True,
+    ) -> str:
         """Project one model-bound text through the four §6.8 steps in order.
 
         Canonical order (D23): masking → budget → marking → normalization.
@@ -354,6 +371,15 @@ class ContextProjector:
             tool_class: class of the producing tool (``http_preview``,
                 ``memory_result``, ...) selecting the byte budget; ``None``
                 uses the conservative default budget.
+            mark_untrusted: override the instance's untrusted-marking default
+                for this call. ``None`` keeps the constructor value;
+                ``False`` projects without the §6.8 wrapper (operator chat,
+                display-bound digests). Masking, budgeting and normalization
+                still run.
+            defuse_markers: deactivate in-content occurrences of the §6.8
+                markers (D24). The display layer passes ``False`` so genuine
+                markers survive for red-background rendering; every
+                model-bound stream keeps the default ``True``.
 
         Returns:
             The sanitized projection; the raw ``text`` is left untouched for
@@ -361,7 +387,10 @@ class ContextProjector:
         """
         projected = self._mask_secrets(text)  # §6.8 step 1 (D23: before the budget)
         projected = self._apply_budget(projected, tool_class)  # §6.8 step 2
-        projected = self._mark_untrusted_target(projected)  # §6.8 step 3
+        mark = self._mark_untrusted if mark_untrusted is None else mark_untrusted
+        projected = self._mark_untrusted_target(
+            projected, mark=mark, defuse_markers=defuse_markers
+        )  # §6.8 step 3
         return self._normalize(projected)  # §6.8 step 4
 
     def _apply_budget(self, text: str, tool_class: str | None) -> str:
@@ -384,16 +413,22 @@ class ContextProjector:
             projected = pattern.sub(_header_masker(secret_name), projected)
         return _BEARER_TOKEN_RE.sub(_mask_bearer, projected)
 
-    def _mark_untrusted_target(self, text: str) -> str:
+    def _mark_untrusted_target(
+        self, text: str, *, mark: bool, defuse_markers: bool = True
+    ) -> str:
         """§6.8 step 3: wrap the content in the verbatim untrusted markers.
 
         In-content occurrences of the markers are defused first (D24): the
         wrapped text can neither close its own block nor fabricate one, and
-        the platform note after the end marker reports the defusals.
+        the platform note after the end marker reports the defusals. The
+        display layer disables defusing so genuine markers survive for
+        red-background rendering.
         """
+        if not defuse_markers:
+            return f"{UNTRUSTED_BEGIN} {text} {UNTRUSTED_END}" if mark else text
         defused, spoof_count = _defuse_containment_markers(text)
         note = _spoof_note(spoof_count)
-        if not self._mark_untrusted:
+        if not mark:
             return f"{defused}{note}"
         return f"{UNTRUSTED_BEGIN} {defused} {UNTRUSTED_END}{note}"
 

@@ -24,6 +24,7 @@ from textual.widgets import DataTable, Static
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from rich.text import Text
     from textual.app import ComposeResult
 
     from swarmy.memory.models import Endpoint, Finding
@@ -44,7 +45,7 @@ class FindingsPanel(Vertical):
 
     BORDER_TITLE = "Findings & Endpoints (enter: card)"
 
-    def __init__(self, widget_id: str, masker: Callable[[str], str]) -> None:
+    def __init__(self, widget_id: str, masker: Callable[[str], Text]) -> None:
         """Start with no selected finding (the card renders a hint)."""
         super().__init__(id=widget_id)
         self.masker = masker
@@ -93,9 +94,9 @@ class FindingsPanel(Vertical):
         for endpoint in endpoints:
             table.add_row(
                 str(endpoint.id),
-                escape(self.masker(endpoint.host)),
-                escape(self.masker(endpoint.method)),
-                escape(self.masker(endpoint.path)),
+                self.masker(endpoint.host),
+                self.masker(endpoint.method),
+                self.masker(endpoint.path),
                 endpoint.research_status,
                 "yes" if endpoint.out_of_scope else "",
                 key=str(endpoint.id),
@@ -111,7 +112,7 @@ class FindingsPanel(Vertical):
                 finding.type.value,
                 finding.severity.value,
                 finding.status.value,
-                escape(self.masker(finding.title)),
+                self.masker(finding.title),
                 key=str(finding.id),
             )
 
@@ -123,14 +124,14 @@ class FindingsPanel(Vertical):
             card.update("select a finding row (enter) to open the card")
             return
         table = RichTable(show_header=False, padding=(0, 1))
-        table.add_row("[bold]finding[/]", f"#{finding.id} {escape(self.masker(finding.title))}")
+        table.add_row("[bold]finding[/]", self.masker(f"#{finding.id} {finding.title}"))
         table.add_row("[bold]class[/]", f"{finding.type.value} / {finding.severity.value}")
         table.add_row("[bold]status[/]", finding.status.value)
         if finding.endpoint_ref is not None:
             table.add_row("[bold]endpoint[/]", f"#{finding.endpoint_ref}")
         for step in finding.reproduction:
-            table.add_row("[bold]step[/]", escape(self.masker(step)))
-        table.add_row("[bold]description (raw)[/]", escape(self.masker(finding.description)))
+            table.add_row("[bold]step[/]", self.masker(step))
+        table.add_row("[bold]description (raw)[/]", self.masker(finding.description))
         for path in self.evidence_paths:
             table.add_row("[bold]evidence[/]", escape(path))
         card.update(table)

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from rich.markup import escape
+from rich.text import Text
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -24,6 +25,8 @@ from textual.widgets import Button, DataTable, Static, TextArea
 from swarmy.tui.state import ApprovalChoice
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from textual.app import ComposeResult
 
     from swarmy.tui.state import ApprovalItem, SessionView, TuiState
@@ -89,9 +92,10 @@ class ApprovalsPanel(Vertical):
 
     BORDER_TITLE = "HITL Approvals (enter: decide)"
 
-    def __init__(self, widget_id: str) -> None:
-        """Bind the grid cell id (state lives in the snapshot cache)."""
+    def __init__(self, widget_id: str, render_text: Callable[[str], Text]) -> None:
+        """Bind the grid cell id and the §6.8 display renderer."""
         super().__init__(id=widget_id)
+        self.render_text = render_text
 
     def compose(self) -> ComposeResult:
         """One table over the pending requests."""
@@ -119,7 +123,7 @@ class ApprovalsPanel(Vertical):
                 escape(item.tool),
                 escape(item.origin),
                 escape(item.rule_or_profile),
-                escape(item.args_digest),
+                self.render_text(item.args_digest),
                 key=item.request_id,
             )
         count = len(state.approvals)
@@ -148,10 +152,11 @@ class ApprovalModal(ModalScreen[ModalDecision]):
     #approval-buttons > Button { margin-right: 1; }
     """
 
-    def __init__(self, item: ApprovalItem) -> None:
-        """Bind the request under decision."""
+    def __init__(self, item: ApprovalItem, render_text: Callable[[str], Text]) -> None:
+        """Bind the request under decision and the §6.8 display renderer."""
         super().__init__()
         self.item = item
+        self.render_text = render_text
 
     def compose(self) -> ComposeResult:
         """Details, hidden edit form, decision buttons, error line."""
@@ -167,18 +172,21 @@ class ApprovalModal(ModalScreen[ModalDecision]):
                 yield Button("Cancel", id="btn-cancel")
             yield Static("", id="approval-error")
 
-    def _details_markup(self) -> str:
+    def _details_markup(self) -> Text:
         """The §10.3 detail block (all content already sanitized upstream)."""
         item = self.item
-        return "\n".join(
-            [
-                f"[bold]tool[/] {escape(item.tool)}    [bold]request[/] {escape(item.request_id)}",
-                f"[bold]gate[/] {escape(item.origin)}    [bold]rule/profile[/] "
-                f"{escape(item.rule_or_profile)}",
-                "[bold]args (sanitized)[/]",
-                escape(item.args_digest),
-            ]
-        )
+        text = Text()
+        text.append("tool ", style="bold")
+        text.append(self.render_text(item.tool))
+        text.append("    request ", style="bold")
+        text.append(item.request_id)
+        text.append("\ngate ", style="bold")
+        text.append(self.render_text(item.origin))
+        text.append("    rule/profile ", style="bold")
+        text.append(self.render_text(item.rule_or_profile))
+        text.append("\nargs (sanitized)\n", style="bold")
+        text.append(self.render_text(item.args_digest))
+        return text
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Dispatch the pressed decision button."""

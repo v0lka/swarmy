@@ -20,7 +20,7 @@ from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
-from textual.widgets import Input, TextArea
+from textual.widgets import Input, Static, TextArea
 
 from swarmy.tui.approvals import (
     ApprovalModal,
@@ -36,6 +36,7 @@ from swarmy.tui.panels.trees import TreesPanel
 from swarmy.tui.state import SessionView, TuiState
 
 if TYPE_CHECKING:
+    from textual.timer import Timer
     from textual.widget import Widget
 
     from swarmy.core.session import Session
@@ -66,6 +67,12 @@ _FOCUS_TARGETS: dict[int, str | None] = {
 #: :meth:`SwarmyTui.on_key`).
 _PANEL_KEYS: frozenset[str] = frozenset("123456")
 
+#: Spinner frames of the status bar while an orchestrator step runs. The
+#: frame advances with the elapsed time, so a frozen UI (no timer ticks) is
+#: itself visible — the operator can tell "waiting for the model" from a
+#: hang.
+_SPINNER_FRAMES: tuple[str, ...] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
 
 class SwarmyTui(App[None]):
     """The six-panel console over one open session (arch §10.1).
@@ -90,6 +97,7 @@ class SwarmyTui(App[None]):
     #approvals-status { dock: bottom; height: 1; }
     #findings-tables { height: 1fr; }
     #finding-card { dock: bottom; height: auto; max-height: 12; }
+    #status-bar { height: 1; padding: 0 1; background: $panel-lighten-1; }
     """
 
     BINDINGS: ClassVar[list] = [
@@ -114,24 +122,37 @@ class SwarmyTui(App[None]):
         self.view = SessionView(session)
         self.state = TuiState(self.view)
         self.opening_goal = opening_goal
+        # Status bar bookkeeping: the timer repaints on change only, and the
+        # completion toast fires once per finished turn (no toast storm).
+        self._status_timer: Timer | None = None
+        self._last_status: str = ""
+        self._notified_turns: int = 0
 
     # ---- layout ----
 
     def compose(self) -> ComposeResult:
-        """The 2x3 panel grid of arch §10.1."""
+        """The 2x3 panel grid of arch §10.1 plus the global status bar."""
         with Horizontal(id="panels"):
-            yield ChatPanel("panel-chat", self.view.mask)
-            yield ActivityPanel("panel-activity", self.view.mask)
-            yield FindingsPanel("panel-findings", self.view.mask)
-            yield ApprovalsPanel("panel-approvals")
-            yield TreesPanel("panel-trees", self.view.mask)
+            yield ChatPanel("panel-chat", self.view.display)
+            yield ActivityPanel("panel-activity", self.view.display)
+            yield FindingsPanel("panel-findings", self.view.display)
+            yield ApprovalsPanel("panel-approvals", self.view.display)
+            yield TreesPanel("panel-trees", self.view.display)
             yield PlansPanel("panel-plans")
+        yield Static("", id="status-bar", markup=False)
 
     async def on_mount(self) -> None:
         """Subscribe the state, preload the journal, start the worker, send the goal."""
         self.state.start()
         await self.state.preload()
         self.refresh_panels()
+        # The status bar is the liveness/completion signal (arch §10.1): a
+        # 0.2 s tick advances the spinner and the elapsed/last-event ages even
+        # when no bus event arrives — exactly the "is it frozen or waiting
+        # for the model?" question. The repaint is skipped when the text is
+        # unchanged (Issue #33: no idle churn).
+        self._status_timer = self.set_interval(0.2, self._refresh_status_bar)
+        self._refresh_status_bar()
         # The worker starts BEFORE the opening goal is journaled on purpose:
         # the goal then reaches the feed through the ordinary bus path (its
         # dispatcher wakes the waiting worker with a real batch). Started
@@ -160,6 +181,7 @@ class SwarmyTui(App[None]):
             self._report_error(exc)
             return
         self.state.kick()
+        self._refresh_status_bar()
 
     # ---- the session worker (arch §10.1: workers inside the Textual loop) ----
 
@@ -199,6 +221,7 @@ class SwarmyTui(App[None]):
                     self.state.absorb(result)
                     await self.state.refresh()
                     self.refresh_panels()
+                self._refresh_status_bar()  # completion reaches the bar without waiting for the tick
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # one failed pass must not kill the TUI
@@ -230,6 +253,7 @@ class SwarmyTui(App[None]):
         takes the step task down with it.
         """
         step = asyncio.create_task(self.view.run_step())
+        self.state.step_started()  # status bar: the model/tools are working
         try:
             while True:
                 done, _ = await asyncio.wait({step}, timeout=0.1)
@@ -241,6 +265,10 @@ class SwarmyTui(App[None]):
         finally:
             if not step.done():
                 step.cancel()
+            # A cancelled or failed step is not a completed turn — the
+            # operator must not see "turn complete" for aborted work.
+            completed = step.done() and not step.cancelled() and step.exception() is None
+            self.state.step_finished(completed=completed)
 
     # ---- rendering ----
 
@@ -272,6 +300,65 @@ class SwarmyTui(App[None]):
         """
         self.log.error(f"console failure: {type(exc).__name__}: {exc}")
         self.state.report_error(f"{type(exc).__name__}: {exc}")
+
+    # ---- status bar (liveness / completion, arch §10.1) ----
+
+    def _status_text(self) -> str:
+        """The current status line: working, approval, queued, complete or idle.
+
+        The working state carries a spinner frame, the elapsed step time and
+        the age of the last folded event — the operator can distinguish
+        "waiting for the model" from a frozen console. The completion states
+        are persistent (the bar stays visible after the toast is gone).
+        """
+        state = self.state
+        if state.step_active:
+            elapsed = state.step_elapsed()
+            frame = _SPINNER_FRAMES[int(elapsed * 8) % len(_SPINNER_FRAMES)]
+            age = state.last_event_age()
+            last = f" • last event {age:.0f}s ago" if age is not None else ""
+            return f"{frame} orchestrator working… {elapsed:.0f}s{last}"
+        if state.approvals:
+            return (
+                f"⏸ waiting for operator approval — "
+                f"{len(state.approvals)} in the HITL queue"
+            )
+        pending = self.view.pending_injections()
+        if pending:
+            return f"… queued {pending} — starting…"
+        if state.todos and all(todo.status == "completed" for todo in state.todos):
+            return "✓ plan complete — idle (type a message to continue; ctrl+q quits)"
+        if state.turns_completed:
+            return "✓ turn complete — idle (type a message to continue; ctrl+q quits)"
+        return (
+            "idle — type a goal in Chat to start the mission "
+            "(keys 1-6 switch panels; ctrl+q quits)"
+        )
+
+    def _refresh_status_bar(self) -> None:
+        """Repaint the status bar when its text changed; check for completion."""
+        try:
+            text = self._status_text()
+            if text != self._last_status:
+                self.query_one("#status-bar", Static).update(text)
+                self._last_status = text
+            self._maybe_notify_completion()
+        except Exception as exc:  # the status bar must never break the console
+            self.log.warning(f"status bar refresh failed: {type(exc).__name__}: {exc}")
+
+    def _maybe_notify_completion(self) -> None:
+        """One toast per finished turn that leaves nothing pending."""
+        state = self.state
+        if state.step_active or state.approvals or self.view.pending_injections() > 0:
+            return
+        if state.turns_completed > self._notified_turns:
+            self._notified_turns = state.turns_completed
+            self.notify(
+                "Orchestrator turn complete — nothing pending",
+                title="Session",
+                severity="information",
+                timeout=5,
+            )
 
     # ---- navigation ----
 
@@ -326,6 +413,7 @@ class SwarmyTui(App[None]):
         except Exception as exc:  # a journaling failure must not kill the console
             self._report_error(exc)
         self.state.kick()
+        self._refresh_status_bar()
 
     # ---- HITL modal (T4.3.1: modal for the operator, not for the swarm) ----
 
@@ -342,7 +430,7 @@ class SwarmyTui(App[None]):
             return
         for item in self.state.approvals:
             if item.request_id == event.request_id:
-                self.push_screen(ApprovalModal(item), self._serve_decision)
+                self.push_screen(ApprovalModal(item, self.view.display), self._serve_decision)
                 return
 
     async def _serve_decision(self, decision: ModalDecision | None) -> None:
@@ -355,10 +443,13 @@ class SwarmyTui(App[None]):
         """
         if decision is None:
             return
+        completed = False
+        self.state.step_started()  # resuming the interrupt is graph work too
         try:
             result = await self.view.submit_decision(
                 decision.request_id, decision.decision, decision.edited_args
             )
+            completed = result is not None
             # The post-decision snapshot re-pull sits inside the same guard:
             # a transient read error must degrade to the error line, never
             # kill the console on the decision path (Issue #28 philosophy).
@@ -379,6 +470,8 @@ class SwarmyTui(App[None]):
             self._report_error(exc)
             self.state.kick()
             return
+        finally:
+            self.state.step_finished(completed=completed)
         self.refresh_panels()
         self.state.kick()
 
@@ -414,6 +507,9 @@ class SwarmyTui(App[None]):
 
     async def action_quit(self) -> None:
         """Checkpoint the WAL and release the session before exiting."""
+        if self._status_timer is not None:
+            self._status_timer.stop()
+            self._status_timer = None
         self.state.stop()
         await self.view.close()
         self.exit()

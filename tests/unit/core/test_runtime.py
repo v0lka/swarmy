@@ -558,6 +558,30 @@ class TestOperatorMessageProjection:
         assert "<masked:api_key>" in queued
         assert queued == digest  # one projection serves both surfaces
 
+    async def test_operator_text_is_a_trusted_stream_not_marked_untrusted(self) -> None:
+        """The operator's own instructions are not wrapped as target content.
+
+        A default (marking) projector still leaves operator chat unwrapped:
+        the §6.8 markers separate the platform's voice from *target* data, and
+        the operator's typed message is not target-derived. This is the root
+        cause of the doubled markers the operator used to see in the chat.
+        """
+        graph, emit = MockGraph(), RecordingEmit()
+        runtime = OrchestratorRuntime(
+            graph=graph,
+            emit=emit,
+            policies=resolve_policies(None),
+            projector=ContextProjector(),  # default: mark target content
+            approvals=ApprovalQueue(),
+            thread_id="orchestrator",
+        )
+        await runtime.deliver_operator_message("continue the authorized scan")
+        digest = str(emit.events[0][1]["text_digest"])
+        assert digest == "continue the authorized scan"
+        assert UNTRUSTED_BEGIN not in digest
+        assert UNTRUSTED_END not in digest
+        assert runtime._queue.get_nowait() == "continue the authorized scan"
+
 
 class TestCorrelationDigestProjection:
     """Issue #55: ``Task*`` digests route through the ContextProjector."""
@@ -713,7 +737,9 @@ class TestRunStepProjection:
         )
         # The committed text lives in the checkpointed state exactly once.
         committed = [str(message.content) for message in graph.state_values["messages"]]
-        assert committed.count(runtime._projector.project("steer once")) == 1
+        assert (
+            committed.count(runtime._projector.project("steer once", mark_untrusted=False)) == 1
+        )
 
     async def test_failed_step_keeps_uncommitted_and_drops_committed(self) -> None:
         """Mixed drain: the pre-commit text re-queues, the committed one not."""
@@ -722,11 +748,12 @@ class TestRunStepProjection:
         runtime._queue.put_nowait("queued before the failure")
         await runtime.deliver_operator_message("delivered before the failure")
         # Simulate the checkpointer having committed only the second text
-        # (the queue carries the §6.8-projected text, so the checkpointed
-        # HumanMessage content matches it verbatim).
+        # (the queue carries the §6.8-projected operator text — trusted
+        # stream, no untrusted wrapper — so the checkpointed HumanMessage
+        # content matches it verbatim).
         graph.state_values = {
             "messages": [HumanMessage(content=runtime._projector.project(
-                "delivered before the failure"
+                "delivered before the failure", mark_untrusted=False
             ))]
         }
         with pytest.raises(RuntimeError, match="hiccup"):

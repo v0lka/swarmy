@@ -243,6 +243,45 @@ def test_step3_marking_can_be_disabled() -> None:
     assert UNTRUSTED_BEGIN not in projector.project("plain text")
 
 
+def test_step3_marking_override_disables_the_wrapper_per_call() -> None:
+    """A marking projector can project one trusted stream without the wrapper.
+
+    The instance default stays marking (tool results keep §6.8); only the
+    operator-chat/display calls opt out. Masking and normalization still run.
+    """
+    projector = ContextProjector(secrets={"api_key": "s3cr3t-value"})
+    out = projector.project("hello s3cr3t-value", mark_untrusted=False)
+    assert out == "hello <masked:api_key>"
+    assert UNTRUSTED_BEGIN not in out
+    # The default is unchanged for the next (target-derived) call.
+    assert UNTRUSTED_BEGIN in projector.project("target data")
+
+
+def test_step3_defusing_can_be_disabled_for_the_display_layer() -> None:
+    """Display projection leaves genuine markers in place for red-background rendering.
+
+    The TUI must not see its own markers deactivated into ``[defused:...]``
+    text; it strips and styles them itself. Model-bound streams keep the
+    default defusing (D24).
+    """
+    projector = ContextProjector()
+    out = projector.project(
+        f"{UNTRUSTED_BEGIN} quoted {UNTRUSTED_END}",
+        mark_untrusted=False,
+        defuse_markers=False,
+    )
+    assert out == f"{UNTRUSTED_BEGIN} quoted {UNTRUSTED_END}"
+    assert "defused" not in out
+    assert "spoof attempts" not in out
+
+
+def test_marker_properties_expose_the_verbatim_strings() -> None:
+    """The facade reads the §6.8 marker strings from the projector instance."""
+    projector = ContextProjector()
+    assert projector.untrusted_begin == UNTRUSTED_BEGIN
+    assert projector.untrusted_end == UNTRUSTED_END
+
+
 # ---- step 3 hardening: in-content marker defusing (D24, F-14) ----
 
 

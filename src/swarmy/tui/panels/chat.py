@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from rich.markup import escape
+from rich.text import Text
 from textual.containers import Vertical
 from textual.widgets import Input, RichLog
 
@@ -36,11 +37,12 @@ class ChatPanel(Vertical):
 
     BORDER_TITLE = "Chat (ctrl+t: inspect subagent)"
 
-    def __init__(self, widget_id: str, masker: Callable[[str], str]) -> None:
+    def __init__(self, widget_id: str, masker: Callable[[str], Text]) -> None:
         """Start on the orchestrator transcript with an empty history.
 
-        ``masker`` is the §6.8 projection applied to every rendered line —
-        secrets never reach the transcript, target data passes untouched.
+        ``masker`` is the display projection applied to every rendered line —
+        secrets never reach the transcript and §6.8 markers are rendered as
+        a red background instead of printed text.
         """
         super().__init__(id=widget_id)
         self.masker = masker
@@ -89,7 +91,7 @@ class ChatPanel(Vertical):
             )
             return
         for role, text in lines:
-            log.write(f"[bold cyan]{escape(role)}[/] {escape(self.masker(text))}")
+            log.write(Text(f"{role} ", style="bold cyan") + self.masker(text))
         if self.target != "orchestrator" and not state.subagent_transcripts:
             log.write("[dim]no delegation transcript yet[/]")
 

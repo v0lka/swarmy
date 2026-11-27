@@ -444,8 +444,17 @@ class OrchestratorRuntime:
         carries the projected ``text_digest`` (masking, budget,
         normalization — a pasted credential becomes ``<masked:name>``), and
         the same projection is queued for injection as the ``HumanMessage``.
+
+        Operator text is a **trusted** stream — it is typed by the operator,
+        not derived from the target — so it is projected *without* the §6.8
+        untrusted wrapper (``mark_untrusted=False``). The wrapper exists to
+        separate the platform's voice from target content; wrapping the
+        operator's own instructions as "untrusted target content" both
+        mislabels them and doubles the markers when the TUI re-projects the
+        journal digest. Secret masking, byte budget and normalization still
+        apply (D25).
         """
-        projected = self._projector.project(text)
+        projected = self._projector.project(text, mark_untrusted=False)
         await self._emit(
             "OperatorMessage",
             OperatorMessagePayload(text_digest=projected).model_dump(mode="json"),
@@ -554,7 +563,12 @@ class OrchestratorRuntime:
             injections.append(self._queue.get_nowait())
         messages: list[BaseMessage] = [HumanMessage(content=text) for text in injections]
         if user_text is not None:
-            messages.append(HumanMessage(content=self._projector.project(user_text)))
+            # Direct operator input: the same trusted-stream rule as
+            # deliver_operator_message — masking/budget/normalization, no
+            # §6.8 untrusted wrapper (D25).
+            messages.append(
+                HumanMessage(content=self._projector.project(user_text, mark_untrusted=False))
+            )
         if not messages:
             return None
         state: dict[str, object] = {"messages": messages}

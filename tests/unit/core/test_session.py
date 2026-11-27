@@ -175,6 +175,12 @@ async def test_orchestrator_has_the_subagent_middleware_stack(
         from swarmy.core.runtime import CorrelationMiddleware
 
         assert isinstance(session.engine.middleware[2], CorrelationMiddleware)
+        # The orchestrator carries the todo middleware (write_todos + the
+        # ``todos`` state key of Progress & Plans); it sits before the
+        # innermost tool-error wrapper so the stack tail stays identical.
+        from langchain.agents.middleware import TodoListMiddleware
+
+        assert isinstance(session.engine.middleware[3], TodoListMiddleware)
         assert engine_types[-1] is subagent_types[-1]
         assert engine_types[-1].__name__ == "ToolErrorFeedbackMiddleware"
     finally:
@@ -450,6 +456,10 @@ async def test_set_mode_rebuilds_the_orchestrator_toolset(
         await session.set_mode("mission", model=model)  # explicit: no L0 default flip
         state_after = json.loads(await session._orchestrator_tools["session_info"]())
         assert state_after["hitl"]["mode"] == "mission"  # the post-switch mode
+        # the todo middleware survives the recompile (same stack on both paths)
+        from langchain.agents.middleware import TodoListMiddleware
+
+        assert any(isinstance(m, TodoListMiddleware) for m in session.engine.middleware)
         # the runtime runs on the recompiled graph (the checkpointer carried over)
         assert await session.runtime.run_step() is not None or True  # step executes
         decisions = await session.reader.by_type("OperatorDecision")

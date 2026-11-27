@@ -23,16 +23,21 @@ import the L0 stack (arch §2.5) — plain structural checks only.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict
 
+from swarmy.events.models import TaskCompletedPayload, TaskRequestedPayload
 from swarmy.memory.models import EntityType, Evidence
+from swarmy.tui.render import render_untrusted
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from rich.text import Text
 
     from swarmy.core.session import Session
     from swarmy.events.bus import EventBus
@@ -102,6 +107,21 @@ class TodoItem(BaseModel):
     status: str
 
 
+class DelegationItem(BaseModel):
+    """One delegation row of the Progress & Plans panel (journal projection).
+
+    Built from the ``TaskRequested``/``TaskCompleted`` pairs of the feed: the
+    live plan of the swarm even when the orchestrator has not written todos
+    yet (the panel must never look idle while delegations run).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    correlation_id: str
+    subagent: str
+    status: str
+
+
 class UiSubscription:
     """Stop-handle for a facade subscription (bus types stay internal)."""
 
@@ -158,8 +178,30 @@ class SessionView:
         return UiSubscription(subscription.unsubscribe)
 
     def mask(self, text: str) -> str:
-        """Project one display text through the §6.8 sanitizer (masked feeds)."""
-        return _require(self._session.projector).project(text)
+        """Project one display text through the §6.8 sanitizer (masked feeds).
+
+        Display projection is **non-marking and non-defusing**: the TUI
+        renders any §6.8 markers itself (red background, ``tui/render.py``),
+        so the facade must neither add a wrapper around the already-projected
+        journal text nor deactivate the genuine markers it carries. Secret
+        masking, byte budget and normalization still apply — no secret ever
+        reaches the screen.
+        """
+        return _require(self._session.projector).project(
+            text, mark_untrusted=False, defuse_markers=False
+        )
+
+    def display(self, text: str) -> Text:
+        """Project one display text and render §6.8 markers as a red background.
+
+        The single display entry point of every panel: masking stays, the
+        marker strings never reach the screen, and the enclosed content is
+        visibly marked as target-derived (``tui/render.py``).
+        """
+        projector = _require(self._session.projector)
+        return render_untrusted(
+            self.mask(text), projector.untrusted_begin, projector.untrusted_end
+        )
 
     # ---- read-only memory queries (raw values — finding cards, §6.8) ----
 
@@ -292,6 +334,13 @@ class TuiState:
         self.last_reply: str = ""
         self.replies: deque[str] = deque(maxlen=REPLIES_MAX)
         self.subagent_transcripts: dict[str, list[str]] = {}
+        # Liveness/completion state of the console status bar (the operator
+        # must see the app is alive while the model thinks, and when a turn
+        # is over). ``time.monotonic`` is immune to wall-clock changes.
+        self.step_active: bool = False
+        self.step_started_at: float | None = None
+        self.turns_completed: int = 0
+        self.last_event_at: float | None = None
         self._pending: list[EventEnvelope] = []
         self._dirty: set[str] = set()
         self._wake = asyncio.Event()
@@ -369,12 +418,40 @@ class TuiState:
         """
         self.feed.extend(batch)
         self.event_count += len(batch)
+        self.last_event_at = time.monotonic()  # liveness signal for the status bar
 
     def recent_feed(self, limit: int) -> list[EventEnvelope]:
         """The newest ``limit`` envelopes of the bounded window, in order."""
         if len(self.feed) <= limit:
             return list(self.feed)
         return list(self.feed)[-limit:]
+
+    def delegations(self) -> list[DelegationItem]:
+        """The journal's ``TaskRequested``/``TaskCompleted`` pairs, in request order.
+
+        A request without a completion is ``running``; a completion carries
+        the subagent's own status (``completed``/``failed``). The Progress &
+        Plans panel uses this as the live-plan fallback when the orchestrator
+        has not written todos.
+        """
+        requested: dict[str, str] = {}
+        for envelope in self.feed:
+            payload = envelope.payload
+            if isinstance(payload, TaskRequestedPayload):
+                requested[payload.correlation_id] = payload.subagent
+        completed: dict[str, str] = {}
+        for envelope in self.feed:
+            payload = envelope.payload
+            if isinstance(payload, TaskCompletedPayload):
+                completed[payload.correlation_id] = payload.status
+        return [
+            DelegationItem(
+                correlation_id=correlation_id,
+                subagent=subagent,
+                status=completed.get(correlation_id, "running"),
+            )
+            for correlation_id, subagent in requested.items()
+        ]
 
     def report_error(self, message: str) -> None:
         """Record one UI/system error line (bounded; rendered by the chat).
@@ -383,6 +460,37 @@ class TuiState:
         surfaces here and in the operator log instead of exiting the app.
         """
         self.system_errors.append(message)
+
+    # ---- step lifecycle / liveness (status bar, arch §10.1) ----
+
+    def step_started(self) -> None:
+        """Mark the orchestrator step as running (starts the elapsed clock)."""
+        self.step_active = True
+        self.step_started_at = time.monotonic()
+
+    def step_finished(self, *, completed: bool = True) -> None:
+        """Mark the step done; ``completed`` counts it as a finished turn.
+
+        A cancelled or failed step does not count as a completed turn — the
+        operator must not be told "turn complete" when the graph never
+        finished its work.
+        """
+        if self.step_active and completed:
+            self.turns_completed += 1
+        self.step_active = False
+        self.step_started_at = None
+
+    def step_elapsed(self) -> float:
+        """Seconds since the running step started (``0.0`` when idle)."""
+        if self.step_started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self.step_started_at)
+
+    def last_event_age(self) -> float | None:
+        """Seconds since the last folded event (``None`` before the first one)."""
+        if self.last_event_at is None:
+            return None
+        return max(0.0, time.monotonic() - self.last_event_at)
 
     def take_dirty(self) -> set[str]:
         """Consume the dirty-type set accumulated since the last call."""
@@ -545,6 +653,7 @@ __all__ = [
     "REPLIES_MAX",
     "ApprovalChoice",
     "ApprovalItem",
+    "DelegationItem",
     "SessionView",
     "TodoItem",
     "TuiState",

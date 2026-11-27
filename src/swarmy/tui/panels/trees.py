@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, TypeAlias
 
 from rich.markup import escape
+from rich.text import Text
 from textual.containers import Vertical
 from textual.widgets import Tree
 
@@ -41,7 +42,7 @@ class TreesPanel(Vertical):
 
     BORDER_TITLE = "Attack Trees (enter: expand / open finding card)"
 
-    def __init__(self, widget_id: str, masker: Callable[[str], str]) -> None:
+    def __init__(self, widget_id: str, masker: Callable[[str], Text]) -> None:
         """Start with an empty forest (rebuilt on refresh)."""
         super().__init__(id=widget_id)
         self.masker = masker
@@ -123,9 +124,9 @@ class TreesPanel(Vertical):
                 continue
             visited.add(target.id)
             path.add(target.id)
-            child = branch.add(
-                f"[dim]{kind}[/] → {self._label(target)}", data=self._payload(target)
-            )
+            label = Text.from_markup(f"[dim]{kind}[/] → ")
+            label.append(self._label(target))
+            child = branch.add(label, data=self._payload(target))
             self._attach_children(child, target.id, children, visited, path)
             path.discard(target.id)
 
@@ -134,6 +135,8 @@ class TreesPanel(Vertical):
         """Tree-node data: (kind, finding_ref, title) for the selection handler."""
         return (node.kind, node.finding_ref, node.title)
 
-    def _label(self, node: AttackNode) -> str:
-        """One node label (target data; secrets masked like every panel)."""
-        return f"{_KIND_MARK.get(node.kind, escape(node.kind))} {escape(self.masker(node.title))}"
+    def _label(self, node: AttackNode) -> Text:
+        """One node label (target data; secrets masked, markers rendered red)."""
+        label = Text.from_markup(f"{_KIND_MARK.get(node.kind, escape(node.kind))} ")
+        label.append(self.masker(node.title))
+        return label

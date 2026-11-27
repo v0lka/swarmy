@@ -19,6 +19,7 @@ from swarmy.events.models import TaskCompletedPayload, TaskRequestedPayload
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from rich.text import Text
     from textual.app import ComposeResult
 
     from swarmy.events.models import EventEnvelope
@@ -32,8 +33,8 @@ class ActivityPanel(Vertical):
 
     BORDER_TITLE = "Swarm Activity"
 
-    def __init__(self, widget_id: str, masker: Callable[[str], str]) -> None:
-        """Bind the grid cell id and the §6.8 display masker."""
+    def __init__(self, widget_id: str, masker: Callable[[str], Text]) -> None:
+        """Bind the grid cell id and the §6.8 display renderer."""
         super().__init__(id=widget_id)
         self.masker = masker
 
@@ -54,7 +55,7 @@ class ActivityPanel(Vertical):
         log = self.query_one("#activity-log", RichLog)
         log.clear()
         for envelope in state.recent_feed(_FEED_LIMIT):
-            log.write(escape(self.masker(self._feed_line(envelope))))
+            log.write(self.masker(self._feed_line(envelope)))
         self._refresh_delegations(state)
         self._refresh_status(state)
 
@@ -92,7 +93,7 @@ class ActivityPanel(Vertical):
                 cid[:8],
                 escape(subagent),
                 escape(status),
-                escape(self.masker(digest)),
+                self.masker(digest),
                 key=cid,
             )
 

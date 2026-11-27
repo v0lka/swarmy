@@ -32,6 +32,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from deepagents import create_deep_agent
+from langchain.agents.middleware import TodoListMiddleware
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from swarmy.core.hitl import (
@@ -181,19 +182,7 @@ class Engine:
             tool_registry, profile, mode, significant_tools, module_overrides
         )
         skills_backend = build_skills_backend(skills, module_skills_routes(modules))
-        middleware: list[object] = [
-            # The session projector also sanitizes deny feedback inside
-            # GuardrailMiddleware (deny bypasses the inner projector, #39);
-            # the tool-class map applies the §6.8 budgets to HTTP tool
-            # envelopes (#58 ↔ F-6).
-            GuardrailMiddleware(pipeline, projector=projector),
-            ProjectorMiddleware(projector, tool_classes=PLATFORM_TOOL_BUDGET_CLASSES),
-            correlation_middleware,
-            # Innermost: recoverable tool-body failures reach the model as
-            # error feedback instead of aborting the run (see
-            # swarmy.tools.errors).
-            ToolErrorFeedbackMiddleware(),
-        ]
+        middleware = cls._middleware_stack(pipeline, projector, correlation_middleware)
         graph = cls._compile(
             model=model,
             system_prompt=system_prompt,
@@ -241,15 +230,7 @@ class Engine:
         interrupt_config = self._interrupt_matrix(
             tool_registry, profile, mode, significant_tools, module_overrides
         )
-        middleware: list[object] = [
-            GuardrailMiddleware(pipeline, projector=projector),
-            ProjectorMiddleware(projector, tool_classes=PLATFORM_TOOL_BUDGET_CLASSES),
-            correlation_middleware,
-            # Innermost: recoverable tool-body failures reach the model as
-            # error feedback instead of aborting the run (see
-            # swarmy.tools.errors).
-            ToolErrorFeedbackMiddleware(),
-        ]
+        middleware = self._middleware_stack(pipeline, projector, correlation_middleware)
         self.graph = self._compile(
             model=model,
             system_prompt=system_prompt,
@@ -267,6 +248,38 @@ class Engine:
         )
         self.interrupt_config = interrupt_config
         self.middleware = middleware
+
+    @staticmethod
+    def _middleware_stack(
+        pipeline: GuardrailPipeline,
+        projector: Any,
+        correlation_middleware: CorrelationMiddleware,
+    ) -> list[object]:
+        """The orchestrator middleware stack (arch §9.1), shared by build/recompile.
+
+        Order: guardrails → projector → correlation → todos → the innermost
+        tool-error wrapper. ``TodoListMiddleware`` supplies the ``write_todos``
+        tool and the ``todos`` state key the Progress & Plans panel reads: the
+        L0 base stack wires no todo middleware by default, so without it the
+        orchestrator's prompt references a tool that does not exist and the
+        panel stays empty for the whole session. It sits *before* the
+        tool-error wrapper so that wrapper stays innermost (recoverable
+        tool-body failures still reach the model as feedback).
+        """
+        return [
+            # The session projector also sanitizes deny feedback inside
+            # GuardrailMiddleware (deny bypasses the inner projector, #39);
+            # the tool-class map applies the §6.8 budgets to HTTP tool
+            # envelopes (#58 ↔ F-6).
+            GuardrailMiddleware(pipeline, projector=projector),
+            ProjectorMiddleware(projector, tool_classes=PLATFORM_TOOL_BUDGET_CLASSES),
+            correlation_middleware,
+            TodoListMiddleware(),
+            # Innermost: recoverable tool-body failures reach the model as
+            # error feedback instead of aborting the run (see
+            # swarmy.tools.errors).
+            ToolErrorFeedbackMiddleware(),
+        ]
 
     @staticmethod
     def _interrupt_matrix(

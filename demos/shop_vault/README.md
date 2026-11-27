@@ -16,7 +16,7 @@ session shape lives in [`session.yaml`](./session.yaml).
 | File | Purpose |
 |---|---|
 | `session.yaml` | Session config: target `http://127.0.0.1:3001/`, scope loopback (`127.0.0.1/32` + `localhost`, ports 3000/3001, http), `profile: yolo`, `mode: mission`, `model: deepseek:deepseek-flash`; the judge band stays off and `limits` keep the conservative code defaults. |
-| `goal.md` | The operator goal for the headless driver (a UTF-8 text file; override with `GOAL_FILE`). |
+| `goal.md` | The operator goal (a UTF-8 text file; override with `GOAL_FILE`): required by the headless driver; with `--tui` the console sends it as the first chat message, so the mission starts automatically. |
 | `target/` | The ShopVault application under test (git submodule): Go backend + React frontend. See `target/README.md` for build details. |
 | `session/` | Created by the session: the portable session folder (`session.yaml` audit snapshot, `memory.sqlite`, `evidence/`, `report.md`). |
 | `reports/` | Archived reports (one folder per run: `report.md` + the `session.yaml` provenance snapshot). |
@@ -64,10 +64,12 @@ scripts/run/run.sh --keep-up       # leave the target running afterwards
 ```
 
 In `--tui` mode the launcher opens the interactive swarmy TUI on the demo
-session with the config as-is (`profile: yolo`, `mode: mission`):
-`DEADLINE_MINUTES` is ignored, `run.log` is not written (the TUI owns the
-terminal) and `report.md` is archived only if it was generated during the
-session.
+session with the config as-is (`profile: yolo`, `mode: mission`) and passes
+`goal.md` as the opening goal: the mission starts automatically as soon as
+the console opens (without a goal file the operator types the goal in the
+Chat panel). `DEADLINE_MINUTES` is ignored, `run.log` is not written (the
+TUI owns the terminal) and `report.md` is archived only if it was generated
+during the session.
 
 The headless driver can also be invoked directly — the launchers pass the
 same arguments:

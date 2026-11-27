@@ -76,10 +76,76 @@ def test_help_shows_the_full_session_syntax(capsys: pytest.CaptureFixture[str]) 
         "--mode",
         "--model",
         "--session-dir",
+        "--goal-file",
         "--resume",
         "--version",
     ):
         assert flag in out, f"missing {flag} in --help"
+
+
+# ---------------------------------------------------------------------------
+# Opening goal (arch §3.4): --goal-file / goal.md next to the config.
+# Fail-fast before the session folder exists; never on --resume.
+# ---------------------------------------------------------------------------
+
+
+def test_goal_file_with_resume_is_a_usage_error(tmp_path: Path) -> None:
+    """``--goal-file`` + ``--resume`` is a usage error: the goal is already journaled."""
+    code = cli.main(["--resume", str(tmp_path), "--goal-file", str(tmp_path / "goal.md")])
+    assert code == 2
+
+
+def test_missing_explicit_goal_file_fails_fast(
+    tmp_path: Path, guard_ui: list[bool], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicit ``--goal-file`` that does not exist exits 2 before any UI or folder."""
+    config = _write_minimal_config(tmp_path / "session.yaml")
+    session_dir = tmp_path / "s"
+    code = cli.main(
+        [str(config), "--session-dir", str(session_dir), "--goal-file", str(tmp_path / "absent.md")]
+    )
+    assert code == 2
+    assert guard_ui == []
+    assert "goal file not found" in capsys.readouterr().err
+    assert not session_dir.exists()
+
+
+def test_empty_goal_file_fails_fast(
+    tmp_path: Path, guard_ui: list[bool], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty goal file (explicit or conventional) is a configuration error."""
+    config = _write_minimal_config(tmp_path / "session.yaml")
+    (tmp_path / "goal.md").write_text("   \n", encoding="utf-8")
+    code = cli.main([str(config), "--session-dir", str(tmp_path / "s")])
+    assert code == 2
+    assert guard_ui == []
+    err = capsys.readouterr().err
+    assert "goal file" in err
+    assert "is empty" in err
+
+
+def test_unreadable_goal_file_fails_fast(
+    tmp_path: Path, guard_ui: list[bool], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-UTF-8 goal file is reported as unreadable (exit 2, no UI)."""
+    config = _write_minimal_config(tmp_path / "session.yaml")
+    (tmp_path / "goal.md").write_bytes(b"\xff\xfe\x00bad")
+    code = cli.main([str(config), "--session-dir", str(tmp_path / "s")])
+    assert code == 2
+    assert guard_ui == []
+    assert "unreadable" in capsys.readouterr().err
+
+
+def test_resolve_opening_goal_convention_and_override(tmp_path: Path) -> None:
+    """``goal.md`` next to the config is the default; ``--goal-file`` wins; absent = None."""
+    (tmp_path / "demo").mkdir()
+    config = _write_minimal_config(tmp_path / "demo" / "session.yaml")
+    assert cli._resolve_opening_goal(None, config) is None  # no goal.md yet
+    (tmp_path / "demo" / "goal.md").write_text("  map the API, then test XSS  \n", encoding="utf-8")
+    assert cli._resolve_opening_goal(None, config) == "map the API, then test XSS"
+    override = tmp_path / "other.md"
+    override.write_text("only the login form", encoding="utf-8")
+    assert cli._resolve_opening_goal(str(override), config) == "only the login form"
 
 
 # ---------------------------------------------------------------------------

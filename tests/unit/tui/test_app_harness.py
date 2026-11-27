@@ -42,6 +42,7 @@ from swarmy.tui.panels.chat import ChatPanel
 from swarmy.tui.panels.findings import FindingCardRequested, FindingsPanel
 from swarmy.tui.panels.plans import PlansPanel
 from swarmy.tui.panels.trees import TreesPanel
+from swarmy.tui.state import SessionView
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -135,6 +136,138 @@ async def test_app_starts_with_six_panels(tmp_path: Path) -> None:
         # the preloaded journal tail is on screen (TargetSet of the fresh session)
         feed_text = richlog_text(app.query_one("#activity-log", RichLog))
         assert "TargetSet" in feed_text
+    await session.close()
+
+
+async def test_typing_starts_in_the_chat_input(tmp_path: Path) -> None:
+    """The opening goal can be typed without hunting for the input.
+
+    Regression: Textual's default ``AUTO_FOCUS = "*"`` focused the Chat
+    panel's ``RichLog`` (the first focusable widget in the DOM), so operator
+    keystrokes went into the transcript viewer — no ``OperatorMessage`` was
+    journaled and the mission never started. The digit bindings stay global
+    (``2`` still switches to Activity); every other printable key starts a
+    chat message.
+    """
+    session = await make_session(tmp_path)
+    app = SwarmyTui(session)
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(0.3)
+        assert not isinstance(app.focused, Input)
+        await pilot.press("h")
+        await pilot.pause(0.2)
+        assert isinstance(app.focused, Input)
+        assert app.focused.id == "chat-input"
+        assert app.query_one("#chat-input", Input).value == "h"
+        # the digit panel bindings still work while the chat is not focused
+        app.query_one("#chat-log", RichLog).focus()
+        await pilot.pause()
+        await pilot.press("2")
+        await pilot.pause()
+        assert app.focused is not None
+        assert app.focused.id == "delegation-table"
+    await session.close()
+
+
+async def test_empty_chat_shows_the_start_hint(tmp_path: Path) -> None:
+    """The empty chat panel tells the operator how to start the mission."""
+    session = await make_session(tmp_path)
+    app = SwarmyTui(session)
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(0.3)
+        transcript = richlog_text(app.query_one("#chat-log", RichLog))
+        assert "Type your goal" in transcript
+    await session.close()
+
+
+async def test_typing_the_goal_starts_the_mission(tmp_path: Path) -> None:
+    """No panel key, no click: typing the goal starts the orchestrator step.
+
+    Regression for the "panels open but nothing happens" report: with the
+    Chat ``RichLog`` focused, the typed goal never reached the input, so no
+    ``OperatorMessage`` was journaled and the swarm stayed idle.
+    """
+    session = await make_session(
+        tmp_path,
+        {"orchestrator": [final_reply("ack: starting the probe")]},
+    )
+    app = SwarmyTui(session)
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(0.3)
+        for char in "run the probe":
+            await pilot.press("space" if char == " " else char)
+        await pilot.press("enter")
+        await pilot.pause(1.0)
+        reader = session.reader
+        assert reader is not None
+        assert len(await reader.by_type("OperatorMessage")) == 1
+        transcript = richlog_text(app.query_one("#chat-log", RichLog))
+        assert "ack: starting the probe" in transcript
+    await session.close()
+
+
+async def test_opening_goal_starts_the_mission_without_keystrokes(tmp_path: Path) -> None:
+    """A goal file handed to the console starts the mission by itself (arch §3.4).
+
+    The opening goal is journaled as the first ``OperatorMessage`` on mount
+    and the worker's first pass runs the orchestrator step — nothing is
+    typed, and the "Type your goal" hint never shows.
+    """
+    session = await make_session(
+        tmp_path,
+        {"orchestrator": [final_reply("ack: goal file received")]},
+    )
+    app = SwarmyTui(session, opening_goal="run the probe")
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(1.0)
+        reader = session.reader
+        assert reader is not None
+        assert len(await reader.by_type("OperatorMessage")) == 1
+        assert app.view.pending_injections() == 0
+        transcript = richlog_text(app.query_one("#chat-log", RichLog))
+        assert "run the probe" in transcript
+        assert "ack: goal file received" in transcript
+        assert "Type your goal" not in transcript
+    await session.close()
+
+
+async def test_without_an_opening_goal_the_console_stays_idle(tmp_path: Path) -> None:
+    """No goal file: nothing is sent and the start hint shows (chat-only start)."""
+    session = await make_session(
+        tmp_path,
+        {"orchestrator": [final_reply("must not run")]},
+    )
+    app = SwarmyTui(session)
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(0.5)
+        reader = session.reader
+        assert reader is not None
+        assert await reader.by_type("OperatorMessage") == []
+        assert app.view.pending_injections() == 0
+        transcript = richlog_text(app.query_one("#chat-log", RichLog))
+        assert "Type your goal" in transcript
+        assert "must not run" not in transcript
+    await session.close()
+
+
+async def test_opening_goal_failure_degrades_to_the_error_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A journaling failure of the opening goal keeps the console up (Issue #28)."""
+
+    async def broken(self: SessionView, text: str) -> None:
+        raise RuntimeError("journal is closed")
+
+    session = await make_session(tmp_path, {"orchestrator": [final_reply("unused")]})
+    monkeypatch.setattr(SessionView, "send_operator_message", broken)
+    app = SwarmyTui(session, opening_goal="run the probe")
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause(0.5)
+        assert any("journal is closed" in line for line in app.state.system_errors)
+        # the console is still alive: the worker loop serves the preloaded feed
+        assert app.state.event_count >= 1
+        # the failed message was never queued, so the orchestrator did not step
+        assert "unused" not in richlog_text(app.query_one("#chat-log", RichLog))
     await session.close()
 
 

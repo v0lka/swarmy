@@ -78,7 +78,17 @@ class ChatPanel(Vertical):
         del view  # masking goes through the panel masker; the facade is unused
         log = self.log_widget
         log.clear()
-        for role, text in self._lines(state):
+        lines = self._lines(state)
+        if not lines and self.target == "orchestrator":
+            # Empty console: tell the operator how to start the mission. The
+            # TUI deliberately seeds no first chat message (D15), so without
+            # this line the panels look idle and the goal is never typed.
+            log.write(
+                "[dim]Type your goal in the field below and press Enter "
+                "to start the mission (keys 1-6 switch panels; ctrl+q quits).[/]"
+            )
+            return
+        for role, text in lines:
             log.write(f"[bold cyan]{escape(role)}[/] {escape(self.masker(text))}")
         if self.target != "orchestrator" and not state.subagent_transcripts:
             log.write("[dim]no delegation transcript yet[/]")

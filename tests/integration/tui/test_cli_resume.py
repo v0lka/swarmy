@@ -56,6 +56,7 @@ async def test_resume_continues_an_existing_session(
         observed["dir"] = view.session.session_dir
         observed["profile"] = view.session.config.profile
         observed["has_runtime"] = view.session.runtime is not None
+        observed["opening_goal"] = self.opening_goal
         reader = view.session.reader
         assert reader is not None
         observed["tail"] = [envelope.type for envelope in await reader.tail(1)]
@@ -69,6 +70,8 @@ async def test_resume_continues_an_existing_session(
     assert observed["profile"] == "paranoid"
     assert observed["has_runtime"] is True
     assert observed["tail"] == ["TargetSet"]
+    # resume never auto-starts a mission (arch §3.4): the goal is in the journal
+    assert observed["opening_goal"] is None
 
 
 async def test_open_via_cli_prepares_the_portable_folder(
@@ -102,4 +105,57 @@ async def test_open_via_cli_prepares_the_portable_folder(
     assert "profile: yolo" in snapshot
     opened = captured[0].view.session
     assert opened.config.profile == "yolo"
+    # no goal.md next to the config: the console waits for the chat
+    assert captured[0].opening_goal is None
     await opened.close()
+
+
+async def _open_via_cli_capturing_goal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_args: list[str]
+) -> SwarmyTui:
+    """Open a config through the CLI and return the console the CLI launched."""
+    config_path = tmp_path / "session.yaml"
+    config_path.write_text(
+        "target:\n"
+        "  base_url: 'http://127.0.0.1:9/'\n"
+        "scope:\n"
+        "  ip_subnets: ['127.0.0.1/32']\n"
+        "  schemes: ['http']\n",
+        encoding="utf-8",
+    )
+    captured: list[SwarmyTui] = []
+
+    async def fake_run_async(self: SwarmyTui, *args: Any, **kwargs: Any) -> None:
+        captured.append(self)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(SwarmyTui, "run_async", fake_run_async)
+    code = await asyncio.to_thread(
+        cli.main, [str(config_path), "--session-dir", str(tmp_path / "run"), *extra_args]
+    )
+    assert code == 0
+    assert len(captured) == 1
+    return captured[0]
+
+
+async def test_open_via_cli_passes_the_goal_file_to_the_console(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC (arch §3.4): ``--goal-file`` reaches the console as the opening goal."""
+    goal = tmp_path / "mission.md"
+    goal.write_text("  enumerate the API, then verify every reflection  \n", encoding="utf-8")
+    app = await _open_via_cli_capturing_goal(
+        tmp_path, monkeypatch, ["--goal-file", str(goal)]
+    )
+    assert app.opening_goal == "enumerate the API, then verify every reflection"
+    await app.view.close()
+
+
+async def test_goal_md_next_to_the_config_auto_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC (arch §3.4): ``goal.md`` next to the config is the opening goal by convention."""
+    (tmp_path / "goal.md").write_text("test the shop for stored XSS\n", encoding="utf-8")
+    app = await _open_via_cli_capturing_goal(tmp_path, monkeypatch, [])
+    assert app.opening_goal == "test the shop for stored XSS"
+    await app.view.close()

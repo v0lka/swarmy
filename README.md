@@ -9,24 +9,25 @@ gates.
 Built on the [deepagents](https://github.com/langchain-ai/deepagents) harness
 (LangChain + LangGraph). The primary use of this codebase is **writing
 specialized subagent modules** (recon, vulnerability detectors, attack-tree
-builders) — see `docs/development/architecture.md` §8 for the module contract.
+builders) — see `docs/development/architecture.md` for the module contract.
 
 ## ⚠️ Legal disclaimer
 
 swarmy is a tool for **professional penetration testers**. You are responsible
 for ensuring you have **explicit authorization** to test every target you point
 it at. Scanning or attacking systems without permission is illegal. The authors
-accept no liability for misuse; there is no authorization gate by design (spec
-D15) — responsibility for authorized testing lies with the operator.
+accept no liability for misuse; there is no authorization gate by design —
+responsibility for authorized testing lies with the operator.
 
 ## Status
 
-Design-phase implementation tracking `docs/development/roadmap.md`
-(milestones M1–M5 → release v0.1). The design documents are canonical:
+v0.1 implementation, complete against `docs/development/roadmap.md` (all 257
+task acceptance criteria across milestones M1–M5 are checked).
+The design documents are canonical:
 
 | Document | Role |
 |---|---|
-| [`docs/development/spec.md`](docs/development/spec.md) | WHAT and WHY — principles, decision log, phases F0–F6 |
+| [`docs/development/spec.md`](docs/development/spec.md) | WHAT and WHY — principles, decision log, phases |
 | [`docs/development/architecture.md`](docs/development/architecture.md) | HOW — packages, pipelines, invariants |
 | [`docs/development/roadmap.md`](docs/development/roadmap.md) | WORK PLAN — milestones → phases → atomic tasks |
 
@@ -49,7 +50,7 @@ A released checkout also builds distributable artifacts (sdist/wheel, into
 make build
 ```
 
-Installing from git (D17 — no PyPI for v0.1; a future distribution would use
+Installing from git (no PyPI for v0.1; a future distribution would use
 the name `swarmy-cli`):
 
 ```sh
@@ -58,31 +59,40 @@ uv tool install git+<this repository URL>
 
 The developer workflow lives in the `Makefile` (`make help`).
 
-## Quickstart: the F5 demo session
+## Quickstart: the demo session
 
 One session = one portable folder (config snapshot, `memory.sqlite`,
 `evidence/`, `report.md`). The built-in reference swarm — the `crawler` and
-`xss-detector` modules — reproduces the roadmap's F5 demo: goal → endpoints →
+`xss-detector` modules — reproduces the demo: goal → endpoints →
 XSS candidate → operator-approved verification → attack tree.
 
 1. **Write a session config** (`demo.yaml`) pointing at your *authorized*
-   target (example runs swarmy against itself on loopback — replace with a
+   target (the example uses a loopback placeholder — replace it with a
    target you are allowed to test):
 
    ```yaml
    target:
-     base_url: "http://127.0.0.1:8080/"
+     base_url: "http://127.0.0.1:8080/"   # loopback placeholder — use a target you may test
    scope:
      ip_subnets: ["127.0.0.1/32"]
      ports: [8080]
      schemes: ["http"]
-   limits:
-     rate_limit: 5          # requests/second, session-global (arch §6.4)
+   limits:                     # every key is required once the section is present;
+     rate_limit: 5             # omit the section to get these same code defaults
      max_concurrent_requests: 8
-   policies:                 # arch §9.3 defaults, spelled out for clarity
+     max_body_bytes: 5242880
+     max_redirect_depth: 5
+     total_request_budget: 5000
+     connect_timeout_s: 10
+     read_timeout_s: 30
+   policies:                 # a non-empty section replaces the built-in defaults wholesale;
+                              # these are the defaults plus one EndpointsDiscovered nudge
      - {on: EndpointsDiscovered, action: notify_orchestrator, template: generic}
      - {on: FindingCandidate, action: notify_orchestrator, template: verify_finding}
-     - {on: FindingVerified, action: notify_orchestrator, template: tree_proposal}
+     - {on: [FindingVerified, FindingRejected], action: notify_orchestrator, template: tree_proposal}
+     - {on: GuardrailBlocked, action: notify_orchestrator, template: generic}
+     - {on: ScopeChanged, action: notify_orchestrator, template: generic}
+     - {on: [AttackTreeUpdated, TaskRequested, TaskCompleted], action: notify_tui, template: generic}
    ```
 
 2. **Start the console** (the built-in modules load automatically; add your
@@ -98,12 +108,15 @@ XSS candidate → operator-approved verification → attack tree.
    check the target for reflected XSS
    ```
 
-   The swarm then runs the §13.4 chain: `crawler` maps `robots.txt`,
+   The swarm then runs the chain: `crawler` maps `robots.txt`,
    `sitemap.xml` and pages into the endpoint memory (`EndpointsDiscovered`);
-   the `tree_proposal` policy steers the orchestrator; `xss-detector` probes
+   the `EndpointsDiscovered → notify_orchestrator` policy (if configured, as
+   in the example) nudges the orchestrator; `xss-detector` probes
    parameters with inert markers, classifies reflections and verifies with
    safe (non-executing) payloads. The detector's POST probes are gated by
-   the HITL queue — approve them in the Approvals panel.
+   the module's `http_post` manifest gate — approve them in the Approvals
+   panel. Later, the built-in `tree_proposal` policy fires on
+   `FindingVerified`.
 
 4. **Watch and steer**: Swarm Activity shows the live event feed and the
    `task()` tree; Findings & Endpoints shows the endpoint map and finding
@@ -120,18 +133,18 @@ The same scenario is exercised headless by the integration suite:
 
 ## Writing a module (tutorial)
 
-A module is a folder — no engine changes are needed to add one (invariant 9).
+A module is a folder — no engine changes are needed to add one.
 Drop it into a user module directory (for example `my-agents/`, passed via
 `--agents-dir` or the config `agents_dirs`) with this layout:
 
 ```
 my-agents/my-detector/
 ├── AGENT.md          # required: YAML frontmatter + system prompt
-├── guardrails.yaml   # optional: declarative block rules (arch §6.6)
+├── guardrails.yaml   # optional: declarative block rules
 └── tools/            # optional: typed Python tool functions
 ```
 
-**`AGENT.md` frontmatter** maps onto the L0 `SubAgent` dict (arch §8.2). The
+**`AGENT.md` frontmatter** maps onto the L0 `SubAgent` dict. The
 `events` list is checked against the event registry at load — declaring an
 unknown type fails the session start:
 
@@ -148,11 +161,14 @@ Everything below the frontmatter is the subagent's system prompt — write the
 method, the boundaries and which platform tools to use.
 
 **Tools** are plain Python functions in `tools/*.py`. The loader enforces the
-contract at load time (arch §8.5): full type annotations (no `Any`), a
+contract at load time: full type annotations (no `Any`), a
 non-empty docstring per tool (it is the LLM-facing description), no
-`socket`/`urllib`/`http.client` imports — network runs only through the
-platform's `http_get`/`http_post`/`http_put`/`http_delete`. The risk class is
-a declarative attribute (AD-7) — inert parsers stay ungated:
+`socket`/`urllib`/`http.client`/`httpx`/`aiohttp`/`requests`/`subprocess`
+imports (nor `os.system`/`os.popen`/raw asyncio streams) — network runs only
+through the platform's `http_get`/`http_post`/`http_put`/`http_delete`. The
+risk class is a declarative attribute — declare pure local computations
+`passive` and they stay ungated (an undeclared module tool defaults to
+`destructive`, i.e. gated under every profile):
 
 ```python
 from swarmy.guardrails.models import RiskClass
@@ -171,11 +187,11 @@ def score_response(body: str, marker: str) -> str:
     return '{"context": "html_text"}'  # real logic here
 
 
-score_response.swarmy_risk_class = RiskClass.PASSIVE  # AD-7 declaration
+score_response.swarmy_risk_class = RiskClass.PASSIVE  # risk-class declaration
 ```
 
 **Guardrails** (`guardrails.yaml`) are deterministic pre-call denies — the
-LLM is never in the deny path (spec §8.3). Conditions are conjunctions of
+LLM is never in the deny path. Conditions are conjunctions of
 `any_param_matches` / `url_matches` / `header_matches` / `body_size_above` /
 `tool_in`:
 

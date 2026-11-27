@@ -14,11 +14,11 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, ClassVar
 
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
-from textual.widgets import Input
+from textual.widgets import Input, TextArea
 
 from swarmy.tui.approvals import (
     ApprovalModal,
@@ -58,10 +58,25 @@ _FOCUS_TARGETS: dict[int, str | None] = {
     6: None,
 }
 
+#: The panel-navigation digits. They stay global while no text field is
+#: focused; every other printable key starts a chat message (see
+#: :meth:`SwarmyTui.on_key`).
+_PANEL_KEYS: frozenset[str] = frozenset("123456")
+
 
 class SwarmyTui(App[None]):
-    """The six-panel console over one open session (arch §10.1)."""
+    """The six-panel console over one open session (arch §10.1).
 
+    With an ``opening_goal`` (arch §3.4) the mission starts on mount: the
+    goal is journaled as the first ``OperatorMessage`` and the worker's first
+    pass runs the orchestrator step — no keystrokes needed.
+    """
+
+    # Textual's default AUTO_FOCUS="*" lands on the Chat panel's RichLog
+    # (the first focusable widget in the DOM). That is deliberate here: the
+    # global digit bindings must stay usable, and on_key routes every other
+    # printable key into the chat input so the operator can type the opening
+    # goal without first hunting for the input.
     CSS = """
     #panels { layout: grid; grid-size: 2; grid-rows: 1fr 1fr 1fr; height: 1fr; }
     #panels > * { border: round #555555; padding: 0 1; }
@@ -84,11 +99,18 @@ class SwarmyTui(App[None]):
         Binding("6", "panel(6)", "Plans", priority=True),
     ]
 
-    def __init__(self, session: Session) -> None:
-        """Bind one OPEN session (composition stays with open/resume)."""
+    def __init__(self, session: Session, *, opening_goal: str | None = None) -> None:
+        """Bind one OPEN session (composition stays with open/resume).
+
+        ``opening_goal`` — the mission goal from a goal file (arch §3.4). On
+        mount the console journals it as the first ``OperatorMessage`` — the
+        same path as a typed message — so the mission starts by itself
+        instead of waiting for the operator to type the goal.
+        """
         super().__init__()
         self.view = SessionView(session)
         self.state = TuiState(self.view)
+        self.opening_goal = opening_goal
 
     # ---- layout ----
 
@@ -103,11 +125,30 @@ class SwarmyTui(App[None]):
             yield PlansPanel("panel-plans")
 
     async def on_mount(self) -> None:
-        """Subscribe the state, preload the journal tail, start the worker."""
+        """Subscribe the state, preload the journal, send the goal, start the worker."""
         self.state.start()
         await self.state.preload()
+        await self._send_opening_goal()
         self.refresh_panels()
         self.run_session_loop()
+
+    async def _send_opening_goal(self) -> None:
+        """Journal the goal-file goal as the first operator message (arch §3.4).
+
+        Same route as a typed message (:meth:`_send_chat`): the platform
+        journals ``OperatorMessage`` and queues the injection, and the
+        worker's first pass drains it into an orchestrator step. A journaling
+        failure degrades to the error line (Issue #28 philosophy): the console
+        stays up and the operator can still type the goal in the chat.
+        """
+        if not self.opening_goal:
+            return
+        try:
+            await self.view.send_operator_message(self.opening_goal)
+        except Exception as exc:  # a journaling failure must not kill the console
+            self._report_error(exc)
+            return
+        self.state.kick()
 
     # ---- the session worker (arch §10.1: workers inside the Textual loop) ----
 
@@ -189,6 +230,29 @@ class SwarmyTui(App[None]):
             return
         widget: Widget = self.query_one(target)
         self.set_focus(widget)
+
+    async def on_key(self, event: events.Key) -> None:
+        """Start a chat message from any printable key except panel digits.
+
+        The console opens with the Chat ``RichLog`` focused so the global
+        ``1``-``6`` panel bindings stay live. Every other printable key is
+        routed into the chat input: the operator can type the opening goal
+        without first clicking the input (the "panels open but nothing
+        happens" trap). Digits remain navigation until the input is focused;
+        afterwards they are ordinary text.
+        """
+        if len(self.screen_stack) > 1:
+            return  # a modal owns the keyboard
+        if isinstance(self.focused, (Input, TextArea)):
+            return  # already typing in a text field
+        if not event.is_printable or event.character is None:
+            return
+        if event.key in _PANEL_KEYS:
+            return
+        event.stop()
+        chat_input = self.query_one("#chat-input", Input)
+        chat_input.focus()
+        chat_input.insert_text_at_cursor(event.character)
 
     # ---- chat (T4.2.1) ----
 

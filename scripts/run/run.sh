@@ -14,7 +14,8 @@
 #   DEMO_DIR   demo directory, absolute or relative to the repository root
 #              (default: demos/shop_vault)
 # Environment overrides:
-#   GOAL_FILE           operator goal text file (default: <demo>/goal.md)
+#   GOAL_FILE           operator goal text file (default: <demo>/goal.md); in
+#                       --tui mode its presence auto-starts the mission
 #   DEADLINE_MINUTES    mission deadline passed to the driver (headless only)
 #   WAIT_TIMEOUT_SECS   readiness polling budget (default: 300)
 #   BACKEND_URL         backend readiness endpoint (default: ShopVault API)
@@ -71,10 +72,19 @@ fi
 [ -d "$DEMO_DIR" ] || fail "demo directory not found: $DEMO_DIR"
 
 # GOAL_FILE is resolved before the cd below: a relative override stays relative
-# to the caller's cwd, not to the repository root.
+# to the caller's cwd, not to the repository root. An explicit override must
+# point at a readable file in both modes; the default (<demo>/goal.md) is
+# optional for the TUI, which otherwise takes the goal from the chat.
 GOAL_FILE="${GOAL_FILE:-}"
-if [ -n "$GOAL_FILE" ] && [ "${GOAL_FILE#/}" = "$GOAL_FILE" ]; then
-    GOAL_FILE="$INVOCATION_DIR/$GOAL_FILE"
+GOAL_FILE_EXPLICIT=0
+if [ -n "$GOAL_FILE" ]; then
+    GOAL_FILE_EXPLICIT=1
+    if [ "${GOAL_FILE#/}" = "$GOAL_FILE" ]; then
+        GOAL_FILE="$INVOCATION_DIR/$GOAL_FILE"
+    fi
+    if [ ! -r "$GOAL_FILE" ]; then
+        fail "operator goal file is missing: $GOAL_FILE (GOAL_FILE; see the demo README)"
+    fi
 fi
 
 cd -- "$REPO_ROOT"
@@ -94,15 +104,17 @@ docker compose version >/dev/null 2>&1 || fail "docker compose plugin not availa
 command -v uv >/dev/null 2>&1 || fail "uv not found in PATH (https://docs.astral.sh/uv/)"
 command -v curl >/dev/null 2>&1 || fail "curl not found in PATH (used for readiness polling)"
 
-# The operator goal file is a headless-mode input; the TUI takes the goal
-# from the chat, so it is not required there.
-if [ "$TUI" -eq 0 ]; then
-    if [ -z "$GOAL_FILE" ]; then
-        GOAL_FILE="$DEMO_DIR/goal.md"
-    fi
-    if [ ! -r "$GOAL_FILE" ] || [ ! -s "$GOAL_FILE" ]; then
-        fail "operator goal file is missing or empty: $GOAL_FILE (create it; see the demo README)"
-    fi
+# The operator goal file: the headless driver requires it; the TUI takes it
+# as the opening goal — the mission starts by itself when the file is present
+# and otherwise waits for the goal typed in the chat (arch §3.4). An empty
+# file is a configuration error in both modes, caught before the target starts.
+if [ "$GOAL_FILE_EXPLICIT" -eq 0 ]; then
+    GOAL_FILE="$DEMO_DIR/goal.md"
+fi
+if [ ! -r "$GOAL_FILE" ]; then
+    [ "$TUI" -eq 1 ] || fail "operator goal file is missing: $GOAL_FILE (create it; see the demo README)"
+elif [ ! -s "$GOAL_FILE" ]; then
+    fail "operator goal file is empty: $GOAL_FILE (see the demo README)"
 fi
 
 SESSION_DIR="$DEMO_DIR/session"
@@ -157,8 +169,18 @@ wait_for "frontend" "$FRONTEND_URL"
 
 # --- session: TUI (--tui) or the headless driver ---
 if [ "$TUI" -eq 1 ]; then
+    GOAL_ARGS=()
+    if [ -r "$GOAL_FILE" ]; then
+        # goal.md present: the console journals it as the first operator
+        # message and the mission starts without typing (arch §3.4).
+        GOAL_ARGS=(--goal-file "$GOAL_FILE")
+        echo "run.sh: opening goal: $GOAL_FILE (the mission starts automatically)"
+    else
+        echo "run.sh: no goal file at $GOAL_FILE; type the goal in the Chat panel"
+    fi
     echo "run.sh: starting the swarmy TUI..."
     uv run --group demo swarmy "$DEMO_DIR/session.yaml" --session-dir "$SESSION_DIR" \
+        ${GOAL_ARGS[@]+"${GOAL_ARGS[@]}"} \
         || fail "the swarmy TUI exited with a non-zero code"
 else
     echo "run.sh: starting the headless swarmy session..."

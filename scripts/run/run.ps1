@@ -14,7 +14,8 @@
 #   DEMO_DIR              demo directory, absolute or relative to the repository root
 #                         (default: demos/shop_vault)
 # Environment overrides:
-#   GOAL_FILE           operator goal text file (default: <demo>/goal.md)
+#   GOAL_FILE           operator goal text file (default: <demo>/goal.md); in
+#                       --tui mode its presence auto-starts the mission
 #   DEADLINE_MINUTES    mission deadline passed to the driver (headless only)
 #   WAIT_TIMEOUT_SECS   readiness polling budget (default: 300)
 #   BACKEND_URL         backend readiness endpoint (default: ShopVault API)
@@ -136,19 +137,27 @@ try {
         Fail 'uv not found in PATH (https://docs.astral.sh/uv/)'
     }
 
-    # The operator goal file is a headless-mode input; the TUI takes the goal
-    # from the chat, so it is not required there. A relative GOAL_FILE stays
-    # relative to the caller's cwd (resolved before the location change below).
+    # The operator goal file: the headless driver requires it; the TUI takes it
+    # as the opening goal — the mission starts by itself when the file is present
+    # and otherwise waits for the goal typed in the chat (arch §3.4). An empty
+    # file is a configuration error in both modes, caught before the target
+    # starts. A relative GOAL_FILE stays relative to the caller's cwd (resolved
+    # before the location change below).
     $goalValue = Get-EnvValue 'GOAL_FILE'
-    if ([string]::IsNullOrEmpty($goalValue)) {
+    $goalExplicit = -not ([string]::IsNullOrEmpty($goalValue))
+    if (-not $goalExplicit) {
         $goalFile = Join-Path $DemoDir 'goal.md'
     } elseif ([System.IO.Path]::IsPathRooted($goalValue)) {
         $goalFile = $goalValue
     } else {
         $goalFile = Join-Path $InvocationDir $goalValue
     }
-    if (-not $Tui -and -not (Test-Path -Path $goalFile -PathType Leaf)) {
-        Fail "operator goal file is missing or empty: $goalFile (create it; see the demo README)"
+    if (-not (Test-Path -LiteralPath $goalFile -PathType Leaf)) {
+        if ($goalExplicit -or -not $Tui) {
+            Fail "operator goal file is missing: $goalFile (create it; see the demo README)"
+        }
+    } elseif ((Get-Item -LiteralPath $goalFile).Length -eq 0) {
+        Fail "operator goal file is empty: $goalFile (see the demo README)"
     }
 
     if ((Test-Path -Path $SessionDir -PathType Container) -and
@@ -186,8 +195,17 @@ try {
     Push-Location -LiteralPath $RepoRoot
     $locationPushed = $true
     if ($Tui) {
+        $goalArgs = @()
+        if (Test-Path -LiteralPath $goalFile -PathType Leaf) {
+            # goal.md present: the console journals it as the first operator
+            # message and the mission starts without typing (arch §3.4).
+            $goalArgs = @('--goal-file', $goalFile)
+            Write-Host "run.ps1: opening goal: $goalFile (the mission starts automatically)"
+        } else {
+            Write-Host "run.ps1: no goal file at $goalFile; type the goal in the Chat panel"
+        }
         Write-Host 'run.ps1: starting the swarmy TUI...'
-        & uv run --group demo swarmy (Join-Path $DemoDir 'session.yaml') --session-dir $SessionDir
+        & uv run --group demo swarmy (Join-Path $DemoDir 'session.yaml') --session-dir $SessionDir @goalArgs
         if ($LASTEXITCODE -ne 0) {
             Fail "the swarmy TUI exited with exit code $LASTEXITCODE"
         }

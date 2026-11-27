@@ -34,7 +34,7 @@ class TestTutorialMatchesCode:
     def test_ad7_declaration_idiom_is_real(self) -> None:
         """The tutorial's `swarmy_risk_class` attribute line matches the code."""
         readme = _readme()
-        assert ".swarmy_risk_class = RiskClass.PASSIVE  # AD-7 declaration" in readme
+        assert ".swarmy_risk_class = RiskClass.PASSIVE  # risk-class declaration" in readme
         parsers = (
             AGENTS_DIR / "crawler" / "tools" / "parsers.py"
         ).read_text(encoding="utf-8")

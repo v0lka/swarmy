@@ -2,6 +2,7 @@
 
     swarmy <session-config.yaml> [--agents-dir PATH]... [--profile paranoid|normal|yolo]
            [--mode interactive|mission] [--model provider:model] [--session-dir PATH]
+           [--goal-file PATH]
     swarmy --resume <session-dir>
     swarmy --version
 
@@ -10,6 +11,14 @@ The CLI is a thin wrapper (argparse, no CLI framework — P4): it resolves the
 prepares the session folder (operator secrets next to the config file are
 copied into it as ``secrets.yaml`` mode 600) and launches :class:`SwarmyTui`
 — headless mode is out of scope for v0.1. Config problems never open the UI.
+
+The opening goal (arch §3.4): ``--goal-file PATH``, or the convention file
+``goal.md`` next to the session config, is handed to the console as its
+``opening_goal`` — the console journals it as the first operator message when
+it mounts, so the mission starts without typing. Without a goal file the
+console waits for the chat as before; ``--resume`` never auto-starts (the
+goal is already in the journal). An unreadable or empty goal file is a
+fail-fast problem reported before the session folder is created.
 
 The L0-touching imports (``core.session`` → engine → deepagents/LangChain)
 are made lazily inside the launch paths: ``main`` with no arguments prints
@@ -37,6 +46,11 @@ if TYPE_CHECKING:
 
 #: Default session folder for a fresh start (arch §3.4: ``--session-dir``).
 DEFAULT_SESSION_DIR: Path = Path("swarmy-session")
+
+#: The convention goal file looked up next to the session config when
+#: ``--goal-file`` is not given (arch §3.4): the demo launchers and the
+#: headless driver use the same name, so one ``goal.md`` serves every mode.
+GOAL_FILE_NAME: str = "goal.md"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -82,6 +96,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"session folder to create (default: {DEFAULT_SESSION_DIR})",
     )
     parser.add_argument(
+        "--goal-file",
+        metavar="PATH",
+        help=(
+            "UTF-8 text file with the opening goal: the console sends it as the "
+            f"first chat message when it opens (default: {GOAL_FILE_NAME} next to "
+            "the session config when present; not with --resume)"
+        ),
+    )
+    parser.add_argument(
         "--resume",
         metavar="SESSION_DIR",
         help="resume the session folder created by an earlier run (arch §13.1)",
@@ -100,6 +123,15 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        if args.goal_file is not None:
+            # The goal of a resumed session is already in the journal: sending
+            # it again would restart the mission (arch §3.4: no auto-start on resume).
+            print(
+                "error: --goal-file cannot be combined with --resume "
+                "(the goal is already in the session journal)",
+                file=sys.stderr,
+            )
+            return 2
         return _resume(args)
     if args.config is None:
         parser.print_help()
@@ -112,6 +144,35 @@ def _fail(problems: list[str]) -> int:
     for problem in problems:
         print(f"error: {problem}", file=sys.stderr)
     return 2
+
+
+def _resolve_opening_goal(goal_file: str | None, config_path: Path) -> str | None:
+    """Resolve the opening goal of a fresh session (arch §3.4).
+
+    ``--goal-file`` is explicit and must point at a file; without it the
+    convention file ``goal.md`` next to the session config is used when
+    present. ``None`` means "no auto-start": the operator types the goal in
+    the chat. A present-but-unreadable, non-UTF-8 or empty file is a
+    fail-fast ``ConfigError`` — resolved before the session folder exists.
+    """
+    from swarmy.core.config import ConfigError  # lazy: see _open
+
+    if goal_file is not None:
+        path = Path(goal_file)
+        if not path.is_file():
+            raise ConfigError([f"goal file not found: {path}"])
+    else:
+        path = config_path.resolve().parent / GOAL_FILE_NAME
+        if not path.is_file():
+            return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError([f"goal file {path} is unreadable: {exc}"]) from exc
+    goal = text.strip()
+    if not goal:
+        raise ConfigError([f"goal file {path} is empty"])
+    return goal
 
 
 def _open(args: Namespace) -> int:
@@ -133,6 +194,9 @@ def _open(args: Namespace) -> int:
     config_path = Path(args.config)
     try:
         config = SessionConfig.load(cli_overrides=overrides, config_path=config_path)
+        # The goal file is part of the session's declared inputs: its problems
+        # surface in the same fail-fast report, before any folder is created.
+        opening_goal = _resolve_opening_goal(args.goal_file, config_path)
     except ConfigError as exc:
         return _fail(list(exc.problems))
     session_dir = Path(args.session_dir) if args.session_dir else DEFAULT_SESSION_DIR
@@ -148,7 +212,7 @@ def _open(args: Namespace) -> int:
         # so `--resume` finds them on another machine (arch §3.3/§12.3).
         session_dir.mkdir(parents=True, exist_ok=True)
         write_secrets(session_dir / "secrets.yaml", secrets)
-    return asyncio.run(_launch_fresh(config, session_dir, secrets))
+    return asyncio.run(_launch_fresh(config, session_dir, secrets, opening_goal))
 
 
 def _resume(args: Namespace) -> int:
@@ -186,9 +250,16 @@ def _start_error_types() -> tuple[type[Exception], ...]:
 
 
 async def _launch_fresh(
-    config: SessionConfig, session_dir: Path, secrets: SecretsConfig | None
+    config: SessionConfig,
+    session_dir: Path,
+    secrets: SecretsConfig | None,
+    opening_goal: str | None = None,
 ) -> int:
-    """Compose the session on the app's event loop and run the console."""
+    """Compose the session on the app's event loop and run the console.
+
+    ``opening_goal`` (arch §3.4) is handed to the console, which journals it
+    as the first operator message on mount — the mission starts by itself.
+    """
     from swarmy.core.session import Session  # lazy: L0 out of help
     from swarmy.report.generator import make_generate_report_tool
 
@@ -201,11 +272,15 @@ async def _launch_fresh(
         )
     except _start_error_types() as exc:
         return _fail([f"session could not be opened: {exc}"])
-    return await _run_console(session)
+    return await _run_console(session, opening_goal=opening_goal)
 
 
 async def _launch_resume(session_dir: Path, model: str | None) -> int:
-    """Resume the session on the app's event loop and run the console."""
+    """Resume the session on the app's event loop and run the console.
+
+    No opening goal on this path: the goal of the earlier run is already in
+    the journal, and re-sending it would restart the mission (arch §3.4).
+    """
     from swarmy.core.session import Session  # lazy: L0 out of help
     from swarmy.report.generator import make_generate_report_tool
 
@@ -220,11 +295,11 @@ async def _launch_resume(session_dir: Path, model: str | None) -> int:
     return await _run_console(session)
 
 
-async def _run_console(session: Session) -> int:
+async def _run_console(session: Session, *, opening_goal: str | None = None) -> int:
     """Run SwarmyTui on the current loop; guarantee the session release."""
     from swarmy.tui.app import SwarmyTui
 
-    app = SwarmyTui(session)
+    app = SwarmyTui(session, opening_goal=opening_goal)
     try:
         await app.run_async()
     finally:

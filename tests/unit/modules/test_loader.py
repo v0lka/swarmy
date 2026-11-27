@@ -540,7 +540,8 @@ def test_event_models_register_and_factory_receives_declarations(tmp_path: Path)
         user_dirs=[root], platform_toolset_factory=factory, include_builtins=False
     ).load()
     assert "emitter" in registry
-    assert calls == [frozenset({"LoaderProbeEvent"})]  # arch §8.4 → allowed_types wiring
+    assert calls[0] == frozenset({"LoaderProbeEvent"})  # arch §8.4 → allowed_types wiring
+    assert frozenset({"FindingCandidate"}) in calls  # the virtual generalist (§8.8)
     assert "LoaderProbeEvent" in EVENT_TYPES
     assert EVENT_TYPES["LoaderProbeEvent"].model_fields.keys() == {"detail"}
 
@@ -698,15 +699,16 @@ def test_bare_module_without_tools_loads_with_platform_toolset(tmp_path: Path) -
 
 
 def test_missing_agents_root_and_empty_loader(tmp_path: Path) -> None:
-    """A missing user root is a load problem; an empty loader loads nothing."""
+    """A missing user root is a load problem; an empty loader loads only the generalist."""
     message = _load_error_message(
         ModuleLoader(user_dirs=[tmp_path / "nope"], include_builtins=False)
     )
     assert f"agents root directory does not exist: {tmp_path / 'nope'}" in message
     registry = ModuleLoader(include_builtins=False).load()
-    assert len(registry) == 0
-    assert registry.names() == ()
-    assert registry.subagent_dicts() == []
+    assert len(registry) == 1  # the platform virtual generalist (arch §8.8)
+    assert registry.names() == ("generalist",)
+    assert registry.modules() == ()
+    assert registry.subagent_dicts() == [registry.virtual("generalist").subagent]
 
 
 def test_builtin_scan_edge_cases(tmp_path: Path) -> None:
@@ -741,12 +743,14 @@ def test_missing_builtin_root_fails_fast(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_builtins_disabled_keeps_the_escape_hatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`include_builtins=False` loads nothing without reporting a broken install."""
+    """`include_builtins=False` skips the shipped modules, not the virtual generalist."""
     empty = tmp_path / "agents"
     empty.mkdir()
     monkeypatch.setattr(loader_module, "builtin_agents_root", lambda: empty)
     registry = ModuleLoader(include_builtins=False).load()
-    assert len(registry) == 0
+    assert len(registry) == 1  # only the platform virtual generalist (arch §8.8)
+    assert registry.names() == ("generalist",)
+    assert registry.modules() == ()
 
 
 # ---------------------------------------------------------------------------

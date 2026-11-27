@@ -13,7 +13,7 @@ builders) — see `docs/development/architecture.md` for the module contract.
 
 ## ⚠️ Legal disclaimer
 
-swarmy is a tool for **professional penetration testers**. You are responsible
+swarmy is a tool for all kinds of **penetration testers**. You are responsible
 for ensuring you have **explicit authorization** to test every target you point
 it at. Scanning or attacking systems without permission is illegal. The authors
 accept no liability for misuse; there is no authorization gate by design —
@@ -25,11 +25,11 @@ v0.1 implementation, complete against `docs/development/roadmap.md` (all 257
 task acceptance criteria across milestones M1–M5 are checked).
 The design documents are canonical:
 
-| Document | Role |
-|---|---|
-| [`docs/development/spec.md`](docs/development/spec.md) | WHAT and WHY — principles, decision log, phases |
-| [`docs/development/architecture.md`](docs/development/architecture.md) | HOW — packages, pipelines, invariants |
-| [`docs/development/roadmap.md`](docs/development/roadmap.md) | WORK PLAN — milestones → phases → atomic tasks |
+| Document                                                               | Role                                            |
+| ---------------------------------------------------------------------- | ----------------------------------------------- |
+| [`docs/development/spec.md`](docs/development/spec.md)                 | WHAT and WHY — principles, decision log, phases |
+| [`docs/development/architecture.md`](docs/development/architecture.md) | HOW — packages, pipelines, invariants           |
+| [`docs/development/roadmap.md`](docs/development/roadmap.md)           | WORK PLAN — milestones → phases → atomic tasks  |
 
 ## Install from sources
 

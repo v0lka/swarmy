@@ -4,16 +4,18 @@
 Two artefacts live here:
 
 * :func:`build_orchestrator_prompt` — the static system prompt of the
-  orchestrator deep-agent (arch §9.6 sections 1-5) with one generated
-  section: the loaded module names and their manifest ``description``s.
-  The prompt text itself is fixed at build time — the function accepts no
-  free-form user text (arch §9.6: "без пользовательских инъекций текста"),
-  so the only dynamic content is the module roster the operator chose to
-  load. Descriptions are module-author text in instruction position, so
-  they render normalized (control characters flattened, embedded §6.8
-  markers defused — the manifest validation applies the same treatment)
-  and wrapped in the verbatim untrusted markers under a roster preamble
-  that positions the whole roster as data (F-9).
+  orchestrator deep-agent (arch §9.6) with one generated section: the loaded
+  subagent names and their manifest ``description``s (modules plus the
+  platform virtual ``generalist``, arch §8.8), plus the fallback-delegation
+  rule naming the generalist when it is in the roster. The prompt text itself
+  is fixed at build time — the function accepts no free-form user text (arch
+  §9.6: "без пользовательских инъекций текста"), so the only dynamic content is
+  the subagent roster the operator chose to load. Descriptions are
+  module-author text in instruction position, so they render normalized
+  (control characters flattened, embedded §6.8 markers defused — the manifest
+  validation applies the same treatment) and wrapped in the verbatim untrusted
+  markers under a roster preamble that positions the whole roster as data
+  (F-9).
 * The policy notification templates :data:`VERIFY_FINDING_TEMPLATE`,
   :data:`TREE_PROPOSAL_TEMPLATE` and :data:`POLICY_TEMPLATES` — render
   declarative event policies (arch §9.3) into injected notifications.
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
 
+from swarmy.modules.generalist import GENERALIST_NAME
 from swarmy.modules.manifest import MAX_DESCRIPTION_CHARS, normalize_description
 from swarmy.tools.projector import UNTRUSTED_BEGIN, UNTRUSTED_END
 
@@ -95,6 +98,24 @@ _MODULE_ROSTER_PREAMBLE: Final[str] = (
 )
 _MODULE_ENTRY: Final[str] = "- `{name}` — {UNTRUSTED_BEGIN} {description} {UNTRUSTED_END}"
 
+#: The fallback-delegation rule (arch §9.6). Appended only when the roster
+#: actually contains the platform generalist, so a roster-less prompt (tests,
+#: bespoke compositions) never advertises an agent that cannot be delegated to.
+_FALLBACK_SECTION: Final[str] = """
+## Fallback delegation
+- The platform provides the virtual generalist agent `{generalist_name}`: a real \
+subagent you delegate to with `task()` like any module, defined by the platform \
+rather than loaded from a module directory.
+- Use it when no loaded module's declared specialization covers the task — a \
+vulnerability class without a dedicated detector, a cross-cutting check, or \
+independent verification work that no specialist owns. Prefer a matching \
+specialist whenever one exists.
+- Never retask a specialist outside its declared scope. A module's `description` \
+is its contract: an XSS detector is delegated XSS work only; do not use a \
+delegation prompt to make it test other classes. Route uncovered work to \
+`{generalist_name}` instead.
+"""
+
 
 def _roster_entry(name: str, description: str) -> str:
     """Render one roster entry as marked data (F-9).
@@ -118,16 +139,18 @@ def build_orchestrator_prompt(
 ) -> str:
     """Assemble the orchestrator system prompt (arch §9.6, T3.1.4).
 
-    The body is the fixed five-section template of arch §9.6; the only
-    dynamic part is the generated module roster — ``(name, description)``
-    pairs from the loaded modules' manifests, rendered as marked data
-    (:func:`_roster_entry` — normalized, capped, untrusted-marker-wrapped,
-    F-9). No other caller-supplied text enters the prompt: the function
-    signature structurally excludes prompt injection through user input
-    (T3.1.4 AC).
+    The body is the fixed template of arch §9.6; the dynamic parts are the
+    generated module roster — ``(name, description)`` pairs from the loaded
+    subagents (modules plus the platform virtual generalist), rendered as
+    marked data (:func:`_roster_entry` — normalized, capped,
+    untrusted-marker-wrapped, F-9) — and the fallback-delegation rule, which
+    is emitted only when the roster actually contains :data:`GENERALIST_NAME`
+    (arch §8.8). No other caller-supplied text enters the prompt: the
+    function signature structurally excludes prompt injection through user
+    input (T3.1.4 AC).
 
     Args:
-        module_descriptions: loaded module name → manifest description.
+        module_descriptions: subagent name → manifest description.
 
     Returns:
         The complete system prompt string.
@@ -136,10 +159,16 @@ def build_orchestrator_prompt(
         _roster_entry(name, description)
         for name, description in sorted(module_descriptions.items())
     ) or "(no subagent modules loaded — every target interaction must be declined)"
+    fallback = (
+        _FALLBACK_SECTION.format(generalist_name=GENERALIST_NAME)
+        if GENERALIST_NAME in module_descriptions
+        else ""
+    )
     return (
         _ORCHESTRATOR_PROMPT_BODY.format(
             untrusted_begin=UNTRUSTED_BEGIN, untrusted_end=UNTRUSTED_END
         )
+        + fallback
         + _MODULE_SECTION_HEADER
         + _MODULE_ROSTER_PREAMBLE
         + roster
@@ -218,6 +247,7 @@ def render_notification(template_key: str, fields: Mapping[str, object]) -> str:
 
 
 __all__ = [
+    "GENERALIST_NAME",
     "GENERIC_NOTIFICATION_TEMPLATE",
     "POLICY_TEMPLATES",
     "TREE_PROPOSAL_TEMPLATE",

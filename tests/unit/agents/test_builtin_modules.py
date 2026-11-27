@@ -77,10 +77,15 @@ class TestBuiltinModulesLoad:
     """AC: both reference modules load through the real loader."""
 
     def test_both_modules_load_as_builtins(self, builtins: ModuleRegistry) -> None:
-        """crawler + xss-detector are present with builtin source."""
-        assert set(builtins.names()) == {"crawler", "xss-detector"}
+        """crawler + xss-detector are present with builtin source; generalist is virtual."""
+        assert set(builtins.names()) == {"crawler", "xss-detector", "generalist"}
+        assert {module.manifest.name for module in builtins.modules()} == {
+            "crawler",
+            "xss-detector",
+        }
         for module in builtins.modules():
             assert module.source == "builtin"
+        assert [agent.manifest.name for agent in builtins.virtual_agents()] == ["generalist"]
 
     def test_manifest_events_match_arch_8_7_and_registry(
         self, builtins: ModuleRegistry

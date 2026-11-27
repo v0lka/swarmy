@@ -134,11 +134,19 @@ async def test_graph_compiles_and_checkpointer_tables_appear(
         config=_config(tmp_path, module_dir), session_dir=session_dir, model=model
     )
     try:
-        # the graph compiled with the loaded module roster: the dummy
-        # fixture plus the two built-in reference modules (arch §8.7)
+        # the graph compiled with the loaded subagent roster: the dummy
+        # fixture plus the two built-in reference modules (arch §8.7) plus the
+        # platform virtual generalist (arch §8.8)
         assert session.engine.graph is not None
-        assert len(session.modules) == 3
+        assert len(session.modules) == 4
+        assert len(session.modules.modules()) == 3
         assert "dummy" in session.modules
+        assert "generalist" in session.modules
+        # the orchestrator prompt carries the generalist roster entry and the
+        # fallback-delegation rule (arch §8.8/§9.6)
+        prompt = session._orchestrator_prompt()
+        assert "`generalist`" in prompt
+        assert "## Fallback delegation" in prompt
         # one graph step: the checkpointer materializes its L0 tables (arch §7.1)
         await session.runtime.run_step("hello")
         with sqlite3.connect(session_dir / "memory.sqlite") as conn:

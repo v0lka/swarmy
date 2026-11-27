@@ -103,6 +103,27 @@ class TestNoUserInjection:
         assert set(signature.parameters) == {"module_descriptions"}
 
 
+class TestFallbackDelegation:
+    """AC (arch §8.8): the generalist fallback rule rides the roster conditionally."""
+
+    def test_section_present_when_generalist_in_roster(self) -> None:
+        prompt = build_orchestrator_prompt({"generalist": "Fallback subagent."})
+        assert "## Fallback delegation" in prompt
+        assert "`generalist`" in prompt
+        assert "Never retask a specialist" in prompt
+        assert "XSS detector" in prompt
+        assert "Route uncovered work to `generalist`" in prompt
+
+    def test_section_absent_without_generalist(self) -> None:
+        prompt = build_orchestrator_prompt({"dummy": "A perfectly normal module."})
+        assert "## Fallback delegation" not in prompt
+        assert "generalist" not in prompt
+
+    def test_section_precedes_the_roster(self) -> None:
+        prompt = build_orchestrator_prompt({"generalist": "Fallback subagent."})
+        assert prompt.index("## Fallback delegation") < prompt.index("## Module roster")
+
+
 class TestPolicyTemplates:
     """Policy notification templates render deterministically (T3.2.2 support)."""
 

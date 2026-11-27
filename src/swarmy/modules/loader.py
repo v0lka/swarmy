@@ -80,15 +80,27 @@ from swarmy.events.models import EVENT_TYPES, EventRegistry
 from swarmy.guardrails.dsl import GuardrailsDslError, parse_module_guardrails
 from swarmy.guardrails.models import ModuleGuardrails, RiskClass
 from swarmy.guardrails.pipeline import GuardrailMiddleware, GuardrailPipeline
+from swarmy.modules.generalist import (
+    GENERALIST_EVENTS,
+    GENERALIST_GATED_TOOLS,
+    GENERALIST_NAME,
+    GENERALIST_SOURCE,
+    GENERALIST_SYSTEM_PROMPT,
+    generalist_manifest,
+)
 from swarmy.modules.manifest import (
     ManifestError,
-    ParsedAgentModule,
     Utf8Error,
     parse_agent_module,
     parse_result_spec,
     read_utf8,
 )
-from swarmy.modules.registry import LoadedModule, ModuleLoadError, ModuleRegistry
+from swarmy.modules.registry import (
+    LoadedModule,
+    ModuleLoadError,
+    ModuleRegistry,
+    VirtualAgent,
+)
 from swarmy.tools.errors import ToolErrorFeedbackMiddleware
 from swarmy.tools.projector import ContextProjector, ProjectorMiddleware
 from swarmy.tools.registry import (
@@ -729,7 +741,8 @@ class ModuleLoader:
                 (``<package>/agents``, arch §8.3) for the reference modules.
                 ``False`` loads user modules only — the AD-4 "explicit choice
                 without built-ins" escape hatch, used by tests and operators
-                who want a bespoke roster.
+                who want a bespoke roster. The platform virtual ``generalist``
+                (arch §8.8) is not a module and is loaded either way.
         """
         self._user_dirs = tuple(user_dirs)
         self._strictness: StrictnessProfile = strictness
@@ -746,8 +759,10 @@ class ModuleLoader:
         """Run the full pipeline (arch §8.3).
 
         Returns:
-            The populated :class:`ModuleRegistry` (each module carrying its
-            assembled ``SubAgent`` dict).
+            The populated :class:`ModuleRegistry` — every loaded module with
+            its assembled ``SubAgent`` dict, plus the platform virtual
+            ``generalist`` (arch §8.8; present even when the built-in module
+            directory is skipped, because it is not a module).
 
         Raises:
             ModuleLoadError: with **all** problems of **all** modules when
@@ -799,10 +814,20 @@ class ModuleLoader:
             # The abort path registers nothing (#44): a failed load leaves the
             # session ToolRegistry exactly as it was before ``load()``.
             raise ModuleLoadError([str(problem) for problem in problems])
+        # The platform virtual generalist (arch §8.8) is assembled after a
+        # clean module pass but *before* the deferred flush, so its platform
+        # tool names reach the ToolRegistry through the same batch mechanics
+        # as the modules' (and the judge band keeps seeing every tool).
+        generalist_problems, generalist = self._load_generalist(state, known_names)
+        problems.extend(generalist_problems)
+        if problems:
+            raise ModuleLoadError([str(problem) for problem in problems])
         self._flush_tool_registrations(state)
         registry = ModuleRegistry()
         for module in loaded:
             registry.register(module)
+        if generalist is not None:
+            registry.register_virtual(generalist)
         return registry
 
     def _flush_tool_registrations(self, state: _LoadState) -> None:
@@ -885,15 +910,16 @@ class ModuleLoader:
         self._check_manifest_gates(manifest, risks, source, problems)
         if problems:
             return problems, None
+        skills_dir = module_dir / "skills"
         subagent = self._build_subagent(
-            module_dir,
             manifest,
-            parsed,
+            parsed.system_prompt,
             platform_tools,
             module_tools,
             guardrails,
             response_format,
             risks,
+            skills=[module_skills_route(manifest.name)] if skills_dir.is_dir() else [],
         )
         module = LoadedModule(
             manifest=manifest,
@@ -905,6 +931,76 @@ class ModuleLoader:
             subagent=subagent,
         )
         return [], module
+
+    def _load_generalist(
+        self,
+        state: _LoadState,
+        known_names: Mapping[str, tuple[str, str]],
+    ) -> tuple[list[LoadProblem], VirtualAgent | None]:
+        """Assemble the platform virtual generalist (arch §8.8).
+
+        The generalist is not a module: there is no directory to scan, so its
+        manifest comes from :func:`generalist_manifest` and its system prompt
+        from the platform constant. Everything else reuses the ordinary
+        ``SubAgent`` assembly — platform toolset, risk-class gates, middleware
+        stack — so the fallback delegate has exactly the same guarded surface
+        as a loaded module (no privilege beyond the platform tools).
+
+        A user module named ``generalist`` is a fail-fast collision: the
+        platform name is reserved and cannot be overridden (the same AD-4
+        reasoning as built-ins).
+
+        Args:
+            state: the load-run state (deferred platform/tool registrations).
+            known_names: module names already accepted in this load.
+
+        Returns:
+            ``(problems, agent)`` — problems when the reserved name is taken;
+            ``agent`` is ``None`` on any problem.
+        """
+        problems: list[LoadProblem] = []
+        if GENERALIST_NAME in known_names:
+            source, _ = known_names[GENERALIST_NAME]
+            problems.append(
+                LoadProblem(
+                    source,
+                    f"module name {GENERALIST_NAME!r} collides with the platform virtual "
+                    f"agent {GENERALIST_NAME!r} (arch §8.8); the platform name is reserved "
+                    "and cannot be overridden — rename the module",
+                )
+            )
+            return problems, None
+        platform_tools = dict(
+            self._platform_factory(GENERALIST_NAME, frozenset(GENERALIST_EVENTS))
+        )
+        # The manifest may only name gates for tools the platform toolset
+        # actually carries (a gate for a missing tool is a load error).
+        manifest = generalist_manifest(
+            gated_tools=[tool for tool in GENERALIST_GATED_TOOLS if tool in platform_tools]
+        )
+        self._register_platform_tools(platform_tools, state)
+        # No module tools and no module guardrails: the generalist's only
+        # tools are the platform set, whose risk classes the tools declare
+        # themselves (http_get → passive, http_post/put/delete → network-write).
+        risks = self._resolve_risks(platform_tools, {}, state)
+        self._check_manifest_gates(manifest, risks, GENERALIST_SOURCE, problems)
+        if problems:
+            return problems, None
+        subagent = self._build_subagent(
+            manifest,
+            GENERALIST_SYSTEM_PROMPT,
+            platform_tools,
+            {},
+            None,
+            None,
+            risks,
+            skills=[],
+        )
+        return [], VirtualAgent(
+            manifest=manifest,
+            system_prompt=GENERALIST_SYSTEM_PROMPT,
+            subagent=subagent,
+        )
 
     def _register_platform_tools(
         self, platform_tools: dict[str, ModuleTool], state: _LoadState
@@ -1234,16 +1330,21 @@ class ModuleLoader:
 
     def _build_subagent(
         self,
-        module_dir: Path,
         manifest: AgentModuleManifest,
-        parsed: ParsedAgentModule,
+        system_prompt: str,
         platform_tools: dict[str, ModuleTool],
         module_tools: dict[str, ModuleTool],
         guardrails: ModuleGuardrails | None,
         response_format: type[BaseModel] | None,
         risks: dict[str, RiskClass],
+        *,
+        skills: Sequence[str],
     ) -> dict[str, object]:
-        """Assemble the ``SubAgent`` dict with exactly the arch §8.3 keys."""
+        """Assemble the ``SubAgent`` dict with exactly the arch §8.3 keys.
+
+        Shared by loaded modules (``skills`` is their module-skills route) and
+        the virtual generalist (``skills=[]``, no module directory).
+        """
         gates = _PROFILE_GATES[self._strictness]
         toolset: dict[str, ModuleTool] = {**platform_tools, **module_tools}
         interrupt_on: dict[str, bool] = {
@@ -1256,7 +1357,6 @@ class ModuleLoader:
         # of a tool the profile does not gate. Platform-set gates win.
         for tool_name, wants_gate in manifest.interrupt_on.items():
             interrupt_on[tool_name] = wants_gate
-        skills_dir = module_dir / "skills"
         # One projector per subagent: the session wiring (T3.1.1) supplies
         # config budgets + operator secrets via the factory; the conservative
         # §6.8 default stays the fallback for platform-less loading, shared
@@ -1281,7 +1381,7 @@ class ModuleLoader:
         subagent: dict[str, object] = {
             "name": manifest.name,  # ← arch §8.3
             "description": manifest.description,
-            "system_prompt": parsed.system_prompt,
+            "system_prompt": system_prompt,
             "mode": manifest.mode,
             "tools": list(toolset.values()),  # platform + module tools (arch §6.1)
             # The session projector also sanitizes the deny feedback inside
@@ -1297,7 +1397,7 @@ class ModuleLoader:
                 ToolErrorFeedbackMiddleware(),
             ],
             "interrupt_on": interrupt_on,
-            "skills": [module_skills_route(manifest.name)] if skills_dir.is_dir() else [],
+            "skills": list(skills),
             "response_format": response_format,
         }
         if manifest.model is not None:

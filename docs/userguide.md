@@ -156,6 +156,7 @@ swarmy              # without arguments prints the CLI help
 | **Subagent module** | A folder `agents/<name>/` with `AGENT.md` and optional `tools/`, `skills/`, `guardrails.yaml` (§11.1) |
 | **Orchestrator** | The main deep-agent: receives operator tasks, reacts to events, delegates work to subagents through `task()`, maintains the chat |
 | **Subagent (swarm)** | Specialized agents from modules; each has an isolated context; they work in parallel |
+| **Generalist** | The platform's virtual fallback subagent (`generalist`), defined in code rather than loaded from `agents/`; delegated to when no specialist module's `description` covers the task (§9.1) |
 | **Event** | A typed record (Pydantic envelope with a payload model) in the event bus; published to an append-only journal (§9.6) |
 | **Shared memory** | A single SQLite store of facts about the target for all agents: endpoints, parameters, findings, evidence, attack trees, facts, notes (§9.7) |
 | **Finding** | A vulnerability candidate or a confirmed vulnerability: type, status `candidate → verified/rejected`, mandatory severity, reproduction steps |
@@ -321,7 +322,9 @@ Rules:
   `agents_dirs` section. Every immediate subdirectory of such a directory that
   contains `AGENT.md` is a module.
 - The module name must be unique: a collision with the name of a built-in or
-  another user module is a load error; there is no module overriding.
+  another user module is a load error; there is no module overriding. The name
+  `generalist` is reserved for the platform virtual agent (arch §8.8) — a module
+  with it fails fast.
 - The `agents/` directory at the repository root holds the built-in modules
   (the source of truth); user modules are placed in a separate directory and
   connected through `--agents-dir`/`agents_dirs`.
@@ -768,12 +771,19 @@ the target as data to analyze.
   `emit_event`, `generate_report`; plus the L0 built-ins every deep agent has —
   `task()` and the filesystem tools `ls`, `read_file`, `write_file`,
   `edit_file`, `glob`, `grep`, `execute`. The system prompt is
-  a fixed template of five sections (role, untrusted-content rules, policies,
-  boundaries, style) + a generated list of loaded modules with their
-  `description`.
+  a fixed template of six sections (role, fallback delegation, untrusted-content
+  rules, policies, boundaries, style) + a generated list of loaded subagents with
+  their `description`.
 - **Subagents** — executors from modules; delegated to by the module's
   `description`; each has an isolated context; `mode: fork` inherits the
   orchestrator's context, `mode: isolated` (default) — an empty one.
+- **`generalist`** — the platform's virtual fallback subagent. It is always in
+  the roster, is defined in code rather than loaded from `agents/`, and is the
+  prescribed target when no specialist module's `description` covers the task
+  (an uncovered vulnerability class, a cross-cutting check, an independent
+  verification no specialist owns). A specialist is never retasked outside its
+  declared scope: `xss-detector` is delegated XSS work only, and the
+  orchestrator routes other classes to `generalist`.
 
 Execution discipline is **single-writer**: no more than one call goes into the
 orchestrator graph at a time — the thread-state checkpoint must stay
@@ -1469,7 +1479,7 @@ are designed for them (§9.3, §9.8):
 ### 11.14. Module author's checklist
 
 - [ ] The directory `<name>/AGENT.md` exists, the frontmatter starts from the first line with `---`;
-- [ ] `name` is unique and does not collide with the built-ins;
+- [ ] `name` is unique and does not collide with the built-ins or the platform `generalist`;
 - [ ] `description` — one sentence "what and when to delegate";
 - [ ] all tools: annotations without `Any`, non-empty docstrings, a JSON-string return;
 - [ ] no imports of `socket`/`urllib`/`http.client`/`httpx`/`aiohttp`/`requests`/`subprocess`, no `os.system`/`os.popen`/raw asyncio streams;

@@ -113,6 +113,8 @@ Built-in reference modules live in `agents/<name>/` at the repository root (ship
 
 The built-in `crawler` and `xss-detector` modules are the reference implementations of this contract — follow their structure.
 
+The platform also provides a virtual `generalist` subagent (`src/swarmy/modules/generalist.py`, **not** a module in `agents/`): it is always in the roster and is the orchestrator's prescribed fallback when no loaded module's declared specialization covers a task. A specialist is never retasked outside its declared scope — `xss-detector` stays XSS-only, other classes go to `generalist` (arch §8.8).
+
 ## Domain quick reference
 
 - **Session** = one run against one target = a portable folder: `session.yaml` (resolved config snapshot for audit), `secrets.yaml` (mode 600), `memory.sqlite` (WAL; domain tables + `events` + FTS5 + checkpoints), `evidence/<id>/`, `report.md`.

@@ -24,7 +24,7 @@ from swarmy.events import (
 )
 from swarmy.memory.schema import MIGRATIONS
 from swarmy.modules.manifest import AgentModuleManifest
-from swarmy.modules.registry import LoadedModule, ModuleLoadError, ModuleRegistry
+from swarmy.modules.registry import LoadedModule, ModuleLoadError, ModuleRegistry, VirtualAgent
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -54,6 +54,20 @@ def _module(
         source=f"module:{path}",
         tools={},
         guardrails=None,
+        subagent={"name": name},
+    )
+
+
+def _virtual(name: str, *, events: list[str] | None = None) -> VirtualAgent:
+    """Build a ``VirtualAgent`` record for registry-level tests."""
+    manifest = AgentModuleManifest(
+        name=name,
+        description=f"Virtual {name}.",
+        events=events or [],
+    )
+    return VirtualAgent(
+        manifest=manifest,
+        system_prompt=f"You are {name}.",
         subagent={"name": name},
     )
 
@@ -99,6 +113,58 @@ def test_registry_lookups_and_aggregation(tmp_path: Path) -> None:
     with pytest.raises(KeyError, match="unknown module 'nope'") as excinfo:
         registry.get("nope")
     assert "alpha, beta" in str(excinfo.value)
+
+
+def test_virtual_agents_are_aggregated_with_modules(tmp_path: Path) -> None:
+    """Modules and virtual agents form one name-sorted delegation surface."""
+    registry = ModuleRegistry()
+    registry.register(_module(tmp_path, "beta"))
+    registry.register_virtual(_virtual("alpha"))
+    assert registry.names() == ("alpha", "beta")
+    assert [m.manifest.name for m in registry.modules()] == ["beta"]
+    assert [a.manifest.name for a in registry.virtual_agents()] == ["alpha"]
+    assert registry.subagent_dicts() == [{"name": "alpha"}, {"name": "beta"}]
+    assert registry.descriptions() == {
+        "alpha": "Virtual alpha.",
+        "beta": "Module beta under test.",
+    }
+    assert len(registry) == 2
+    assert "alpha" in registry
+    assert "beta" in registry
+
+
+def test_virtual_agent_lookup_and_unknown_name() -> None:
+    """``virtual`` returns the record and names the registered virtuals on error."""
+    registry = ModuleRegistry()
+    registry.register_virtual(_virtual("generalist"))
+    assert registry.virtual("generalist").manifest.name == "generalist"
+    with pytest.raises(KeyError, match="unknown virtual agent 'nope'"):
+        registry.virtual("nope")
+
+
+def test_virtual_agent_name_collides_with_module(tmp_path: Path) -> None:
+    """A virtual agent cannot reuse a loaded module's name."""
+    registry = ModuleRegistry()
+    registry.register(_module(tmp_path, "dup"))
+    with pytest.raises(ModuleLoadError, match="duplicate subagent name 'dup'"):
+        registry.register_virtual(_virtual("dup"))
+
+
+def test_module_name_collides_with_virtual_agent(tmp_path: Path) -> None:
+    """A module cannot shadow a platform virtual agent (the generalist reservation)."""
+    registry = ModuleRegistry()
+    registry.register_virtual(_virtual("dup"))
+    with pytest.raises(ModuleLoadError, match="duplicate subagent name 'dup'"):
+        registry.register(_module(tmp_path, "dup"))
+
+
+def test_virtual_agent_event_must_be_registered() -> None:
+    """The §8.4 event contract applies to virtual agents too."""
+    registry = ModuleRegistry()
+    with pytest.raises(
+        ModuleLoadError, match="declared event type 'NoSuchType' is not registered"
+    ):
+        registry.register_virtual(_virtual("ghost", events=["NoSuchType"]))
 
 
 @pytest.fixture

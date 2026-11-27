@@ -757,10 +757,9 @@ class Session:
         return self.config.model
 
     def _orchestrator_prompt(self) -> str:
-        """Assemble the orchestrator prompt over the loaded modules (§9.6)."""
+        """Assemble the orchestrator prompt over loaded modules + virtual agents (§9.6)."""
         modules = self._require(self.modules)
-        roster = {module.manifest.name: module.manifest.description for module in modules.modules()}
-        return build_orchestrator_prompt(roster)
+        return build_orchestrator_prompt(modules.descriptions())
 
     def _orchestrator_pipeline(self) -> GuardrailPipeline:
         """The orchestrator pipeline: invariants + engine + judge (§9.1)."""
